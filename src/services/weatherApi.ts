@@ -1,0 +1,1786 @@
+import type {
+  AirQuality,
+  CityLocation,
+  EarthquakeEvent,
+  GdacsAlert,
+  LocalSignal,
+  LocalWeather,
+  RainViewerState,
+  Severity,
+  WeatherGridPoint
+} from "../types";
+import { weatherCodeLabel } from "../utils/weatherCodes";
+
+const OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast";
+const OPEN_METEO_GEOCODING = "https://geocoding-api.open-meteo.com/v1/search";
+const OPEN_METEO_AIR = "https://air-quality-api.open-meteo.com/v1/air-quality";
+const USGS_EARTHQUAKES = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.geojson";
+const EMSC_EARTHQUAKES = "https://www.seismicportal.eu/fdsnws/event/1/query";
+const GEONET_EARTHQUAKES = "https://api.geonet.org.nz/quake?MMI=-1";
+const BMKG_M5_EARTHQUAKES = "https://data.bmkg.go.id/DataMKG/TEWS/gempaterkini.json";
+const BMKG_FELT_EARTHQUAKES = "https://data.bmkg.go.id/DataMKG/TEWS/gempadirasakan.json";
+const INGV_EARTHQUAKES = "https://webservices.ingv.it/fdsnws/event/1/query";
+const TAIWAN_CWA_EARTHQUAKES = "https://sta.ci.taiwan.gov.tw/STA_Earthquake_v2/v1.0/Things";
+const RAINVIEWER = "https://api.rainviewer.com/public/weather-maps.json";
+const GDACS_RSS = "https://www.gdacs.org/xml/rss.xml";
+const SMHI_WARNINGS = "https://opendata-download-warnings.smhi.se/ibww/api/version/1/warning.json";
+const NWS_ALERTS = "https://api.weather.gov/alerts/active?status=actual&message_type=alert,update";
+const MET_NORWAY_ALERTS = "https://api.met.no/weatherapi/metalerts/2.0/current.json";
+const DWD_WARNINGS = "https://www.dwd.de/DWD/warnungen/warnapp/json/warnings.json";
+const HKO_WARNING_SUMMARY = "https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataType=warnsum&lang=en";
+const HKO_WARNING_INFO = "https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataType=warningInfo&lang=en";
+const JMA_WARNING_MAP = "https://www.jma.go.jp/bosai/warning/data/warning/map.json";
+const JMA_AREA_METADATA = "https://www.jma.go.jp/bosai/common/const/area.json";
+const INMET_ACTIVE_WARNINGS = "https://apiprevmet3.inmet.gov.br/avisos/ativos";
+const WEATHER_GRID_CACHE_KEY = "weather-watch:weather-grid-cache";
+const WEATHER_GRID_FRESH_MS = 55 * 1000;
+const WEATHER_GRID_STALE_MS = 8 * 60 * 60 * 1000;
+const EARTHQUAKE_LOOKBACK_MS = 24 * 60 * 60 * 1000;
+const EARTHQUAKE_PROVIDER_TIMEOUT_MS = 9 * 1000;
+const LOCAL_WEATHER_CACHE_PREFIX = "weather-watch:local-weather-cache";
+const LOCAL_WEATHER_FRESH_MS = 55 * 1000;
+const LOCAL_WEATHER_STALE_MS = 6 * 60 * 60 * 1000;
+const PROVIDER_COOLDOWN_PREFIX = "weather-watch:provider-cooldown";
+const RATE_LIMIT_COOLDOWN_MS = 10 * 60 * 1000;
+
+class WeatherRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly url: string
+  ) {
+    super(message);
+    this.name = "WeatherRequestError";
+  }
+}
+
+async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
+  const response = await fetch(url, { signal });
+  if (!response.ok) {
+    throw new WeatherRequestError(`Request failed with ${response.status}`, response.status, url);
+  }
+  const data = await response.json();
+  if (data && typeof data === "object" && "error" in data && data.error === true) {
+    throw new Error(typeof data.reason === "string" ? data.reason : "Weather data request failed");
+  }
+  return data as T;
+}
+
+async function fetchJsonViaText<T>(url: string, signal?: AbortSignal): Promise<T> {
+  try {
+    return await fetchJson<T>(url, signal);
+  } catch (browserError) {
+    const text = await fetchText(url, signal);
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw browserError;
+    }
+  }
+}
+
+async function fetchBrowserText(url: string, signal?: AbortSignal): Promise<string> {
+  const response = await fetch(url, { signal });
+  if (!response.ok) {
+    throw new WeatherRequestError(`Request failed with ${response.status}`, response.status, url);
+  }
+  return response.text();
+}
+
+async function fetchText(url: string, signal?: AbortSignal, options: { preferBrowser?: boolean } = {}): Promise<string> {
+  if (options.preferBrowser) {
+    try {
+      return await fetchBrowserText(url, signal);
+    } catch (browserError) {
+      if (!window.weatherWatch?.fetchText) throw browserError;
+      return window.weatherWatch.fetchText(url);
+    }
+  }
+
+  if (window.weatherWatch?.fetchText) {
+    try {
+      return await window.weatherWatch.fetchText(url);
+    } catch (electronError) {
+      try {
+        return await fetchBrowserText(url, signal);
+      } catch {
+        throw electronError;
+      }
+    }
+  }
+
+  return fetchBrowserText(url, signal);
+}
+
+export async function searchCities(query: string, language = "en", signal?: AbortSignal): Promise<CityLocation[]> {
+  const url = new URL(OPEN_METEO_GEOCODING);
+  url.searchParams.set("name", query);
+  url.searchParams.set("count", "8");
+  url.searchParams.set("language", language);
+  url.searchParams.set("format", "json");
+
+  const data = await fetchJson<{ results?: CityLocation[] }>(url.toString(), signal);
+  return data.results ?? [];
+}
+
+export async function fetchLocalWeather(
+  location: CityLocation,
+  signal?: AbortSignal,
+  options: { freshMs?: number } = {}
+): Promise<LocalWeather> {
+  const freshCache = readLocalWeatherCache(location, options.freshMs ?? LOCAL_WEATHER_FRESH_MS);
+  if (freshCache) return freshCache;
+
+  const providers: Array<{ id: "met-no" | "open-meteo"; fetchWeather: () => Promise<LocalWeather> }> = [
+    {
+      id: "met-no",
+      fetchWeather: async () => {
+        const weather = await fetchMetNorwayLocalWeather(location, signal);
+        const airQuality = await fetchOpenMeteoAirQuality(location, signal).catch(() => undefined);
+        return { ...weather, airQuality };
+      }
+    },
+    {
+      id: "open-meteo",
+      fetchWeather: () => fetchOpenMeteoLocalWeather(location, signal)
+    }
+  ];
+
+  let lastError: unknown;
+  const cooledDownProviders: typeof providers = [];
+
+  for (const provider of providers) {
+    if (providerInCooldown(provider.id)) {
+      cooledDownProviders.push(provider);
+      continue;
+    }
+
+    try {
+      const weather = await provider.fetchWeather();
+      writeLocalWeatherCache(location, weather);
+      clearProviderCooldown(provider.id);
+      return weather;
+    } catch (error) {
+      lastError = error;
+      if (shouldCooldownProvider(error)) {
+        setProviderCooldown(provider.id, RATE_LIMIT_COOLDOWN_MS);
+      }
+    }
+  }
+
+  const staleCache = readLocalWeatherCache(location, LOCAL_WEATHER_STALE_MS);
+  if (staleCache) return staleCache;
+
+  for (const provider of cooledDownProviders) {
+    try {
+      const weather = await provider.fetchWeather();
+      writeLocalWeatherCache(location, weather);
+      clearProviderCooldown(provider.id);
+      return weather;
+    } catch (error) {
+      lastError = error;
+      if (shouldCooldownProvider(error)) {
+        setProviderCooldown(provider.id, RATE_LIMIT_COOLDOWN_MS);
+      }
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Unable to refresh local weather");
+}
+
+async function fetchOpenMeteoLocalWeather(location: CityLocation, signal?: AbortSignal): Promise<LocalWeather> {
+  const weatherUrl = new URL(OPEN_METEO_FORECAST);
+  weatherUrl.searchParams.set("latitude", String(location.latitude));
+  weatherUrl.searchParams.set("longitude", String(location.longitude));
+  weatherUrl.searchParams.set(
+    "current",
+    [
+      "temperature_2m",
+      "apparent_temperature",
+      "relative_humidity_2m",
+      "precipitation",
+      "rain",
+      "showers",
+      "snowfall",
+      "weather_code",
+      "cloud_cover",
+      "pressure_msl",
+      "wind_speed_10m",
+      "wind_gusts_10m",
+      "wind_direction_10m",
+      "visibility",
+      "uv_index"
+    ].join(",")
+  );
+  weatherUrl.searchParams.set(
+    "hourly",
+    ["temperature_2m", "precipitation_probability", "precipitation", "weather_code", "wind_gusts_10m", "uv_index"].join(",")
+  );
+  weatherUrl.searchParams.set("forecast_days", "2");
+  weatherUrl.searchParams.set("timezone", location.timezone || "auto");
+
+  const [weather, air] = await Promise.all([
+    fetchJson<Omit<LocalWeather, "fetchedAt" | "airQuality">>(weatherUrl.toString(), signal),
+    fetchOpenMeteoAirQuality(location, signal).catch(() => undefined)
+  ]);
+
+  return {
+    ...weather,
+    fetchedAt: new Date().toISOString(),
+    airQuality: air
+  };
+}
+
+async function fetchOpenMeteoAirQuality(location: CityLocation, signal?: AbortSignal) {
+  const airUrl = new URL(OPEN_METEO_AIR);
+  airUrl.searchParams.set("latitude", String(location.latitude));
+  airUrl.searchParams.set("longitude", String(location.longitude));
+  airUrl.searchParams.set("current", "us_aqi,european_aqi,pm2_5,pm10,ozone");
+  airUrl.searchParams.set("timezone", location.timezone || "auto");
+
+  const air = await fetchJson<{ current?: AirQuality }>(airUrl.toString(), signal);
+  return air.current;
+}
+
+function localWeatherCacheKey(location: CityLocation) {
+  return `${LOCAL_WEATHER_CACHE_PREFIX}:${location.id}:${location.latitude.toFixed(3)}:${location.longitude.toFixed(3)}`;
+}
+
+function readLocalWeatherCache(location: CityLocation, maxAgeMs: number) {
+  try {
+    const raw = localStorage.getItem(localWeatherCacheKey(location));
+    if (!raw) return undefined;
+    const cached = JSON.parse(raw) as { fetchedAt: number; weather: LocalWeather };
+    if (!cached.weather || Date.now() - cached.fetchedAt > maxAgeMs) return undefined;
+    return cached.weather;
+  } catch {
+    return undefined;
+  }
+}
+
+function writeLocalWeatherCache(location: CityLocation, weather: LocalWeather) {
+  try {
+    localStorage.setItem(localWeatherCacheKey(location), JSON.stringify({ fetchedAt: Date.now(), weather }));
+  } catch {
+    // A cached local forecast keeps the panel useful during provider rate limits.
+  }
+}
+
+function providerCooldownKey(provider: string) {
+  return `${PROVIDER_COOLDOWN_PREFIX}:${provider}`;
+}
+
+function providerInCooldown(provider: string) {
+  try {
+    const retryAt = Number(localStorage.getItem(providerCooldownKey(provider)));
+    if (!Number.isFinite(retryAt) || retryAt <= Date.now()) {
+      clearProviderCooldown(provider);
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function setProviderCooldown(provider: string, durationMs: number) {
+  try {
+    localStorage.setItem(providerCooldownKey(provider), String(Date.now() + durationMs));
+  } catch {
+    // Cooldown state is a best-effort guard against repeated 429s.
+  }
+}
+
+function clearProviderCooldown(provider: string) {
+  try {
+    localStorage.removeItem(providerCooldownKey(provider));
+  } catch {
+    // Ignore storage failures; the next request can still proceed normally.
+  }
+}
+
+function shouldCooldownProvider(error: unknown) {
+  if (error instanceof WeatherRequestError) return error.status === 429 || error.status === 403;
+  return error instanceof Error && (/\b(?:403|429)\b/.test(error.message) || /forbidden|rate limit|too many requests/i.test(error.message));
+}
+
+interface MetNorwayForecast {
+  properties?: {
+    timeseries?: Array<{
+      time: string;
+      data?: {
+        instant?: {
+          details?: {
+            air_temperature?: number;
+            relative_humidity?: number;
+            wind_speed?: number;
+            wind_speed_of_gust?: number;
+            wind_from_direction?: number;
+            air_pressure_at_sea_level?: number;
+            cloud_area_fraction?: number;
+            fog_area_fraction?: number;
+          };
+        };
+        next_1_hours?: {
+          summary?: { symbol_code?: string };
+          details?: { precipitation_amount?: number };
+        };
+      };
+    }>;
+  };
+}
+
+async function fetchMetNorwayLocalWeather(location: CityLocation, signal?: AbortSignal): Promise<LocalWeather> {
+  const url = new URL("https://api.met.no/weatherapi/locationforecast/2.0/compact");
+  url.searchParams.set("lat", location.latitude.toFixed(4));
+  url.searchParams.set("lon", location.longitude.toFixed(4));
+
+  const data = JSON.parse(await fetchText(url.toString(), signal, { preferBrowser: true })) as MetNorwayForecast;
+  const timeseries = data.properties?.timeseries ?? [];
+  const currentRow = timeseries[0];
+  const currentDetails = currentRow?.data?.instant?.details;
+  if (!currentRow || !currentDetails) {
+    throw new Error("Unable to refresh local weather");
+  }
+
+  const currentCode = symbolCodeToWeatherCode(currentRow.data?.next_1_hours?.summary?.symbol_code);
+  const currentPrecipitation = currentRow.data?.next_1_hours?.details?.precipitation_amount ?? 0;
+  const currentTemperature = currentDetails.air_temperature ?? 0;
+  const currentWind = msToKmh(currentDetails.wind_speed);
+  const currentGust = msToKmh(currentDetails.wind_speed_of_gust ?? currentDetails.wind_speed);
+
+  const hourlyRows = timeseries.slice(0, 48);
+  const hourlyCodes = hourlyRows.map((row) => symbolCodeToWeatherCode(row.data?.next_1_hours?.summary?.symbol_code));
+
+  return {
+    fetchedAt: new Date().toISOString(),
+    current: {
+      time: currentRow.time,
+      temperature_2m: currentTemperature,
+      apparent_temperature: currentTemperature,
+      relative_humidity_2m: currentDetails.relative_humidity ?? 0,
+      precipitation: currentPrecipitation,
+      rain: currentPrecipitation,
+      showers: 0,
+      snowfall: isSnowCode(currentCode) ? currentPrecipitation : 0,
+      weather_code: currentCode,
+      cloud_cover: currentDetails.cloud_area_fraction ?? 0,
+      pressure_msl: currentDetails.air_pressure_at_sea_level ?? 0,
+      wind_speed_10m: currentWind,
+      wind_gusts_10m: currentGust,
+      wind_direction_10m: currentDetails.wind_from_direction ?? 0,
+      visibility: (currentDetails.fog_area_fraction ?? 0) > 60 ? 1000 : 10000,
+      uv_index: 0
+    },
+    hourly: {
+      time: hourlyRows.map((row) => row.time),
+      temperature_2m: hourlyRows.map((row) => row.data?.instant?.details?.air_temperature ?? currentTemperature),
+      precipitation_probability: hourlyRows.map((row) => (row.data?.next_1_hours?.details?.precipitation_amount ?? 0) > 0 ? 70 : 0),
+      precipitation: hourlyRows.map((row) => row.data?.next_1_hours?.details?.precipitation_amount ?? 0),
+      weather_code: hourlyCodes,
+      wind_gusts_10m: hourlyRows.map((row) => {
+        const details = row.data?.instant?.details;
+        return msToKmh(details?.wind_speed_of_gust ?? details?.wind_speed);
+      }),
+      uv_index: hourlyRows.map(() => 0)
+    },
+    airQuality: undefined
+  };
+}
+
+function msToKmh(value?: number) {
+  return Math.round((value ?? 0) * 3.6);
+}
+
+function symbolCodeToWeatherCode(symbol?: string) {
+  const code = (symbol ?? "").toLowerCase();
+  if (code.includes("thunder")) return 95;
+  if (code.includes("fog")) return 45;
+  if (code.includes("heavyrain")) return 65;
+  if (code.includes("rainshowers")) return 80;
+  if (code.includes("lightrain")) return 51;
+  if (code.includes("rain")) return 61;
+  if (code.includes("heavysnow")) return 75;
+  if (code.includes("snowshowers")) return 85;
+  if (code.includes("lightsnow")) return 71;
+  if (code.includes("snow")) return 73;
+  if (code.includes("sleet")) return 85;
+  if (code.includes("cloudy")) return code.includes("partly") ? 2 : 3;
+  if (code.includes("fair")) return 1;
+  if (code.includes("clear")) return 0;
+  return 3;
+}
+
+function isSnowCode(code: number) {
+  return [71, 73, 75, 77, 85, 86].includes(code);
+}
+
+function makeGrid() {
+  const points: { lat: number; lon: number }[] = [];
+  for (let lat = -80; lat <= 80; lat += 10) {
+    for (let lon = -180; lon < 180; lon += 10) {
+      points.push({ lat, lon });
+    }
+  }
+  return points;
+}
+
+export async function fetchWeatherGrid(signal?: AbortSignal, options: { freshMs?: number } = {}): Promise<WeatherGridPoint[]> {
+  const freshCache = readWeatherGridCache(options.freshMs ?? WEATHER_GRID_FRESH_MS);
+  if (freshCache) return freshCache;
+
+  const grid = makeGrid();
+  const batchSize = 90;
+  const result: WeatherGridPoint[] = [];
+
+  try {
+    for (let index = 0; index < grid.length; index += batchSize) {
+      const batch = grid.slice(index, index + batchSize);
+      const url = new URL(OPEN_METEO_FORECAST);
+      url.searchParams.set("latitude", batch.map((point) => point.lat).join(","));
+      url.searchParams.set("longitude", batch.map((point) => point.lon).join(","));
+      url.searchParams.set(
+        "current",
+        ["temperature_2m", "weather_code", "wind_speed_10m", "wind_gusts_10m", "precipitation", "pressure_msl", "cloud_cover"].join(",")
+      );
+      url.searchParams.set("timezone", "UTC");
+      url.searchParams.set("forecast_days", "1");
+
+      const data = await fetchJson<Array<{ latitude: number; longitude: number; current: Record<string, number> }>>(url.toString(), signal);
+      const rows = Array.isArray(data) ? data : [data];
+
+      rows.forEach((row, rowIndex) => {
+        const source = batch[rowIndex] ?? { lat: row.latitude, lon: row.longitude };
+        result.push({
+          id: `${source.lat}:${source.lon}`,
+          lat: source.lat,
+          lon: source.lon,
+          temperature: row.current.temperature_2m,
+          weatherCode: row.current.weather_code,
+          windSpeed: row.current.wind_speed_10m,
+          windGust: row.current.wind_gusts_10m,
+          precipitation: row.current.precipitation,
+          pressure: row.current.pressure_msl,
+          cloudCover: row.current.cloud_cover
+        });
+      });
+    }
+
+    writeWeatherGridCache(result);
+    return result;
+  } catch (err) {
+    const staleCache = readWeatherGridCache(WEATHER_GRID_STALE_MS);
+    if (staleCache) return staleCache;
+    throw err;
+  }
+}
+
+function readWeatherGridCache(maxAgeMs: number) {
+  try {
+    const raw = localStorage.getItem(WEATHER_GRID_CACHE_KEY);
+    if (!raw) return undefined;
+    const cached = JSON.parse(raw) as { fetchedAt: number; points: WeatherGridPoint[] };
+    if (!Array.isArray(cached.points) || Date.now() - cached.fetchedAt > maxAgeMs) return undefined;
+    return cached.points;
+  } catch {
+    return undefined;
+  }
+}
+
+function writeWeatherGridCache(points: WeatherGridPoint[]) {
+  try {
+    localStorage.setItem(WEATHER_GRID_CACHE_KEY, JSON.stringify({ fetchedAt: Date.now(), points }));
+  } catch {
+    // Cache is only a resilience layer for provider rate limits.
+  }
+}
+
+interface EarthquakeProvider {
+  id: string;
+  fetchEvents: (signal?: AbortSignal) => Promise<EarthquakeEvent[]>;
+}
+
+const earthquakeProviders: EarthquakeProvider[] = [
+  { id: "usgs", fetchEvents: fetchUsgsEarthquakes },
+  { id: "emsc", fetchEvents: fetchEmscEarthquakes },
+  { id: "geonet", fetchEvents: fetchGeoNetEarthquakes },
+  { id: "bmkg", fetchEvents: fetchBmkgEarthquakes },
+  { id: "ingv", fetchEvents: fetchIngvEarthquakes },
+  { id: "taiwan-cwa", fetchEvents: fetchTaiwanCwaEarthquakes }
+];
+
+const earthquakeSourcePriority: Record<string, number> = {
+  usgs: 2,
+  emsc: 3,
+  ingv: 4,
+  geonet: 5,
+  bmkg: 5,
+  "taiwan-cwa": 5
+};
+
+export async function fetchEarthquakes(signal?: AbortSignal): Promise<EarthquakeEvent[]> {
+  const results = await Promise.allSettled(
+    earthquakeProviders.map((provider) =>
+      withTimeoutSignal(signal, EARTHQUAKE_PROVIDER_TIMEOUT_MS, (providerSignal) => provider.fetchEvents(providerSignal))
+    )
+  );
+
+  const events = results.flatMap((result) => result.status === "fulfilled" ? result.value : []);
+  if (events.length === 0) {
+    const failure = results.find((result) => result.status === "rejected");
+    throw failure?.status === "rejected" && failure.reason instanceof Error ? failure.reason : new Error("Unable to refresh earthquake feeds");
+  }
+
+  return dedupeEarthquakes(events)
+    .filter((event) => Date.now() - event.time <= EARTHQUAKE_LOOKBACK_MS || (event.magnitude ?? 0) >= 5)
+    .sort((a, b) => b.time - a.time);
+}
+
+async function fetchUsgsEarthquakes(signal?: AbortSignal): Promise<EarthquakeEvent[]> {
+  const data = await fetchJson<{
+    features: Array<{
+      id: string;
+      properties: {
+        mag?: number | null;
+        place: string;
+        time: number;
+        updated: number;
+        url: string;
+        alert?: string | null;
+        tsunami: number;
+        sig: number;
+        felt?: number | null;
+        cdi?: number | null;
+        mmi?: number | null;
+      };
+      geometry: { coordinates: [number, number, number | null] };
+    }>;
+  }>(USGS_EARTHQUAKES, signal);
+
+  return data.features
+    .filter((feature) => Array.isArray(feature.geometry.coordinates))
+    .map((feature) => ({
+      id: feature.id,
+      magnitude: numberOrUndefined(feature.properties.mag),
+      place: feature.properties.place,
+      time: feature.properties.time,
+      updated: feature.properties.updated,
+      url: feature.properties.url,
+      alert: feature.properties.alert,
+      tsunami: feature.properties.tsunami === 1,
+      significance: feature.properties.sig,
+      lon: feature.geometry.coordinates[0],
+      lat: feature.geometry.coordinates[1],
+      depth: numberOrUndefined(feature.geometry.coordinates[2]),
+      feltReports: numberOrUndefined(feature.properties.felt),
+      feltIntensity: numberOrUndefined(feature.properties.cdi),
+      instrumentalIntensity: numberOrUndefined(feature.properties.mmi),
+      source: "usgs",
+      sourceLabel: "USGS"
+    }));
+}
+
+async function fetchEmscEarthquakes(signal?: AbortSignal): Promise<EarthquakeEvent[]> {
+  const url = new URL(EMSC_EARTHQUAKES);
+  url.searchParams.set("format", "json");
+  url.searchParams.set("limit", "160");
+  url.searchParams.set("minmag", "2.5");
+  url.searchParams.set("starttime", new Date(Date.now() - EARTHQUAKE_LOOKBACK_MS).toISOString());
+
+  const data = await fetchJsonViaText<{
+    features?: Array<{
+      id?: string;
+      properties?: {
+        source_id?: string | number;
+        time?: string;
+        lastupdate?: string;
+        flynn_region?: string;
+        depth?: number | null;
+        mag?: number | null;
+        magtype?: string;
+        auth?: string;
+      };
+      geometry?: { coordinates?: [number, number, number | null] };
+    }>;
+  }>(url.toString(), signal);
+
+  return (data.features ?? [])
+    .map((feature): EarthquakeEvent | undefined => {
+      const coordinates = feature.geometry?.coordinates;
+      const properties = feature.properties;
+      const time = properties?.time ? Date.parse(properties.time) : NaN;
+      if (!coordinates || !properties || !Number.isFinite(time)) return undefined;
+
+      const id = String(feature.id ?? properties.source_id ?? `${properties.time}:${coordinates[1]}:${coordinates[0]}`);
+      const magnitude = numberOrUndefined(properties.mag);
+      return {
+        id: `emsc-${id}`,
+        magnitude,
+        place: properties.flynn_region ?? "EMSC earthquake",
+        time,
+        updated: properties.lastupdate ? Date.parse(properties.lastupdate) : time,
+        url: `https://www.emsc-csem.org/Earthquake_information/earthquake.php?id=${properties.source_id ?? id}`,
+        alert: null,
+        tsunami: false,
+        significance: earthquakeSignificance(magnitude),
+        lon: coordinates[0],
+        lat: coordinates[1],
+        depth: numberOrUndefined(properties.depth) ?? numberOrUndefined(coordinates[2]),
+        source: "emsc",
+        sourceLabel: properties.auth ? `EMSC/${properties.auth}` : "EMSC"
+      };
+    })
+    .filter(isDefined);
+}
+
+async function fetchGeoNetEarthquakes(signal?: AbortSignal): Promise<EarthquakeEvent[]> {
+  const data = await fetchJsonViaText<{
+    features?: Array<{
+      properties?: {
+        publicID?: string;
+        time?: string;
+        depth?: number | null;
+        magnitude?: number | null;
+        mmi?: number | null;
+        locality?: string;
+        quality?: string;
+      };
+      geometry?: { coordinates?: [number, number] };
+    }>;
+  }>(GEONET_EARTHQUAKES, signal);
+
+  return (data.features ?? [])
+    .map((feature): EarthquakeEvent | undefined => {
+      const properties = feature.properties;
+      const coordinates = feature.geometry?.coordinates;
+      const time = properties?.time ? Date.parse(properties.time) : NaN;
+      const magnitude = numberOrUndefined(properties?.magnitude);
+      const mmi = numberOrUndefined(properties?.mmi);
+      if (!properties || !coordinates || !Number.isFinite(time) || properties.quality === "deleted") return undefined;
+      if (Date.now() - time > EARTHQUAKE_LOOKBACK_MS || ((magnitude ?? 0) < 2.5 && (mmi ?? -1) < 3)) return undefined;
+
+      const id = properties.publicID ?? `${properties.time}:${coordinates[1]}:${coordinates[0]}`;
+      return {
+        id: `geonet-${id}`,
+        magnitude,
+        place: properties.locality ?? "New Zealand region",
+        time,
+        updated: time,
+        url: `https://www.geonet.org.nz/earthquake/${id}`,
+        alert: null,
+        tsunami: false,
+        significance: earthquakeSignificance(magnitude, mmi),
+        lon: coordinates[0],
+        lat: coordinates[1],
+        depth: numberOrUndefined(properties.depth),
+        instrumentalIntensity: mmi,
+        source: "geonet",
+        sourceLabel: "GeoNet"
+      };
+    })
+    .filter(isDefined);
+}
+
+async function fetchBmkgEarthquakes(signal?: AbortSignal): Promise<EarthquakeEvent[]> {
+  const [m5Result, feltResult] = await Promise.allSettled([
+    fetchBmkgEarthquakeFeed(BMKG_M5_EARTHQUAKES, signal),
+    fetchBmkgEarthquakeFeed(BMKG_FELT_EARTHQUAKES, signal)
+  ]);
+
+  return [m5Result, feltResult].flatMap((result) => result.status === "fulfilled" ? result.value : []);
+}
+
+async function fetchBmkgEarthquakeFeed(url: string, signal?: AbortSignal): Promise<EarthquakeEvent[]> {
+  const data = await fetchJsonViaText<{
+    Infogempa?: {
+      gempa?: BmkgEarthquakeRow | BmkgEarthquakeRow[];
+    };
+  }>(url, signal);
+
+  const rows = data.Infogempa?.gempa;
+  return (Array.isArray(rows) ? rows : rows ? [rows] : [])
+    .map((row) => bmkgEarthquakeRowToEvent(row))
+    .filter(isDefined);
+}
+
+interface BmkgEarthquakeRow {
+  DateTime?: string;
+  Coordinates?: string;
+  Magnitude?: string;
+  Kedalaman?: string;
+  Wilayah?: string;
+  Potensi?: string;
+  Dirasakan?: string;
+  Shakemap?: string;
+}
+
+function bmkgEarthquakeRowToEvent(row: BmkgEarthquakeRow): EarthquakeEvent | undefined {
+  const time = row.DateTime ? Date.parse(row.DateTime) : NaN;
+  const coordinates = parseBmkgCoordinates(row.Coordinates);
+  if (!Number.isFinite(time) || !coordinates) return undefined;
+
+  const magnitude = numberFromText(row.Magnitude);
+  const tsunami = Boolean(row.Potensi && !/tidak/i.test(row.Potensi));
+  return {
+    id: `bmkg-${row.DateTime}-${row.Coordinates}-${row.Magnitude}`,
+    magnitude,
+    place: row.Wilayah ?? "Indonesia region",
+    time,
+    updated: time,
+    url: row.Shakemap ? `https://static.bmkg.go.id/${row.Shakemap}` : "https://data.bmkg.go.id/gempabumi/",
+    alert: tsunami ? "tsunami" : null,
+    tsunami,
+    significance: earthquakeSignificance(magnitude, undefined, row.Dirasakan ? 80 : 0),
+    lat: coordinates.lat,
+    lon: coordinates.lon,
+    depth: numberFromText(row.Kedalaman?.replace(/[^\d.-]/g, "")),
+    feltIntensity: parseMmiFromText(row.Dirasakan),
+    source: "bmkg",
+    sourceLabel: "BMKG"
+  };
+}
+
+async function fetchIngvEarthquakes(signal?: AbortSignal): Promise<EarthquakeEvent[]> {
+  const url = new URL(INGV_EARTHQUAKES);
+  url.searchParams.set("format", "text");
+  url.searchParams.set("limit", "120");
+  url.searchParams.set("minmagnitude", "2.0");
+  url.searchParams.set("starttime", new Date(Date.now() - EARTHQUAKE_LOOKBACK_MS).toISOString());
+
+  const text = await fetchText(url.toString(), signal);
+  return parseIngvTextEvents(text);
+}
+
+function parseIngvTextEvents(text: string): EarthquakeEvent[] {
+  return text
+    .split(/\r?\n/)
+    .filter((line) => line && !line.startsWith("#"))
+    .map((line): EarthquakeEvent | undefined => {
+      const [
+        eventId,
+        timeText,
+        latText,
+        lonText,
+        depthText,
+        author,
+        ,
+        ,
+        ,
+        magType,
+        magText,
+        ,
+        place,
+        eventType
+      ] = line.split("|");
+      const time = parseProviderTime(timeText);
+      const lat = Number(latText);
+      const lon = Number(lonText);
+      const magnitude = numberFromText(magText);
+      if (!eventId || !Number.isFinite(time) || !Number.isFinite(lat) || !Number.isFinite(lon)) return undefined;
+
+      return {
+        id: `ingv-${eventId}`,
+        magnitude,
+        place: place || "INGV earthquake",
+        time,
+        updated: time,
+        url: `https://terremoti.ingv.it/event/${eventId}`,
+        alert: null,
+        tsunami: false,
+        significance: earthquakeSignificance(magnitude),
+        lat,
+        lon,
+        depth: numberFromText(depthText),
+        source: "ingv",
+        sourceLabel: author ? `INGV/${author}` : "INGV",
+        instrumentalIntensity: eventType && eventType !== "earthquake" ? 0 : undefined
+      };
+    })
+    .filter(isDefined);
+}
+
+async function fetchTaiwanCwaEarthquakes(signal?: AbortSignal): Promise<EarthquakeEvent[]> {
+  const url = new URL(TAIWAN_CWA_EARTHQUAKES);
+  url.searchParams.set("$top", "80");
+  url.searchParams.set("$orderby", "@iot.id desc");
+  url.searchParams.set("$filter", "substringof('號地震',name)");
+  url.searchParams.set("$select", "@iot.id,name,description,properties");
+  url.searchParams.set("$expand", "Locations($select=location,name),Datastreams($top=1;$select=phenomenonTime)");
+
+  const data = await fetchJsonViaText<{
+    value?: Array<{
+      "@iot.id"?: string | number;
+      "@iot.selfLink"?: string;
+      name?: string;
+      description?: string;
+      properties?: {
+        depth?: number | string | null;
+        authority?: string;
+        magnitude?: number | string | null;
+      };
+      Locations?: Array<{
+        name?: string;
+        location?: { coordinates?: [number, number] };
+      }>;
+      Datastreams?: Array<{
+        phenomenonTime?: string;
+      }>;
+    }>;
+  }>(url.toString(), signal);
+
+  return (data.value ?? [])
+    .map((thing): EarthquakeEvent | undefined => {
+      const coordinates = thing.Locations?.[0]?.location?.coordinates;
+      const phenomenonTime = thing.Datastreams?.[0]?.phenomenonTime?.split("/")[0];
+      const time = parseProviderTime(phenomenonTime);
+      const magnitude = numberFromText(thing.properties?.magnitude);
+      if (!coordinates || !Number.isFinite(time)) return undefined;
+      if (Date.now() - time > EARTHQUAKE_LOOKBACK_MS) return undefined;
+
+      const id = thing["@iot.id"] ?? `${phenomenonTime}:${coordinates[1]}:${coordinates[0]}`;
+      return {
+        id: `taiwan-cwa-${id}`,
+        magnitude,
+        place: thing.description ?? thing.name ?? "Taiwan region",
+        time,
+        updated: time,
+        url: thing["@iot.selfLink"] ?? "https://ci.taiwan.gov.tw/dsp/Views/_EN/dataset/earthquake.aspx",
+        alert: null,
+        tsunami: false,
+        significance: earthquakeSignificance(magnitude),
+        lon: coordinates[0],
+        lat: coordinates[1],
+        depth: numberFromText(thing.properties?.depth),
+        source: "taiwan-cwa",
+        sourceLabel: "Taiwan CWA"
+      };
+    })
+    .filter(isDefined);
+}
+
+async function withTimeoutSignal<T>(
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+  task: (signal: AbortSignal) => Promise<T>
+) {
+  const controller = new AbortController();
+  const timeout = globalThis.setTimeout(() => controller.abort(), timeoutMs);
+  const abort = () => controller.abort();
+  signal?.addEventListener("abort", abort, { once: true });
+
+  try {
+    return await task(controller.signal);
+  } finally {
+    globalThis.clearTimeout(timeout);
+    signal?.removeEventListener("abort", abort);
+  }
+}
+
+function dedupeEarthquakes(events: EarthquakeEvent[]) {
+  const merged: EarthquakeEvent[] = [];
+  events
+    .filter((event) => Number.isFinite(event.lat) && Number.isFinite(event.lon) && Number.isFinite(event.time))
+    .sort((a, b) => b.time - a.time)
+    .forEach((event) => {
+      const matchIndex = merged.findIndex((candidate) => isSameEarthquake(candidate, event));
+      if (matchIndex === -1) {
+        merged.push(event);
+        return;
+      }
+
+      merged[matchIndex] = mergeEarthquakeEvents(merged[matchIndex], event);
+    });
+
+  return merged;
+}
+
+function isSameEarthquake(a: EarthquakeEvent, b: EarthquakeEvent) {
+  const timeWindow = Math.abs(a.time - b.time) <= 10 * 60 * 1000;
+  if (!timeWindow) return false;
+  const magnitudeGap = a.magnitude !== undefined && b.magnitude !== undefined ? Math.abs(a.magnitude - b.magnitude) : 0;
+  if (magnitudeGap > 0.9) return false;
+  const distance = distanceKm(a.lat, a.lon, b.lat, b.lon);
+  const maxDistance = Math.max(70, ((a.magnitude ?? b.magnitude ?? 0) >= 6 ? 140 : 90));
+  return distance <= maxDistance;
+}
+
+function mergeEarthquakeEvents(current: EarthquakeEvent, next: EarthquakeEvent): EarthquakeEvent {
+  const preferred = earthquakeEventPriority(next) >= earthquakeEventPriority(current) ? next : current;
+  const other = preferred === next ? current : next;
+
+  return {
+    ...preferred,
+    id: preferred.id,
+    updated: Math.max(current.updated, next.updated),
+    alert: preferred.alert ?? other.alert,
+    tsunami: current.tsunami || next.tsunami,
+    significance: Math.max(current.significance, next.significance),
+    depth: preferred.depth ?? other.depth,
+    feltReports: maxDefined(current.feltReports, next.feltReports),
+    feltIntensity: maxDefined(current.feltIntensity, next.feltIntensity),
+    instrumentalIntensity: maxDefined(current.instrumentalIntensity, next.instrumentalIntensity),
+    sourceLabel: mergeSourceLabels(current.sourceLabel, next.sourceLabel),
+    source: mergeSourceLabels(current.source, next.source)
+  };
+}
+
+function earthquakeEventPriority(event: EarthquakeEvent) {
+  return event.source?.split(", ").reduce((max, source) => Math.max(max, earthquakeSourcePriority[source] ?? 0), 0) ?? 0;
+}
+
+function mergeSourceLabels(a?: string, b?: string) {
+  return [...new Set([...(a?.split(", ") ?? []), ...(b?.split(", ") ?? [])].filter(Boolean))].join(", ");
+}
+
+function maxDefined(a?: number, b?: number) {
+  if (a === undefined) return b;
+  if (b === undefined) return a;
+  return Math.max(a, b);
+}
+
+function earthquakeSignificance(magnitude?: number, intensity?: number, bonus = 0) {
+  return Math.round((magnitude ?? 0) * 100 + (intensity ?? 0) * 15 + bonus);
+}
+
+function parseBmkgCoordinates(value?: string) {
+  if (!value) return undefined;
+  const [latText, lonText] = value.split(",");
+  const lat = Number(latText);
+  const lon = Number(lonText);
+  return Number.isFinite(lat) && Number.isFinite(lon) ? { lat, lon } : undefined;
+}
+
+function parseMmiFromText(value?: string) {
+  if (!value) return undefined;
+  const match = value.match(/(?:MMI\s+([IVXLCDM]+)|([IVXLCDM]+)\s+MMI)/i);
+  return match ? romanToNumber(match[1] ?? match[2]) : undefined;
+}
+
+function parseProviderTime(value?: string) {
+  if (!value) return NaN;
+  const normalized = value
+    .trim()
+    .replace(/\.(\d{3})\d+/, ".$1");
+  return Date.parse(/[zZ]|[+-]\d{2}:?\d{2}$/.test(normalized) ? normalized : `${normalized}Z`);
+}
+
+function romanToNumber(value: string) {
+  const digits: Record<string, number> = { I: 1, V: 5, X: 10, L: 50, C: 100, D: 500, M: 1000 };
+  return value.toUpperCase().split("").reduce((total, char, index, chars) => {
+    const current = digits[char] ?? 0;
+    const next = digits[chars[index + 1]] ?? 0;
+    return total + (current < next ? -current : current);
+  }, 0);
+}
+
+function distanceKm(latA: number, lonA: number, latB: number, lonB: number) {
+  const rad = Math.PI / 180;
+  const dLat = (latB - latA) * rad;
+  const dLon = (lonB - lonA) * rad;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(latA * rad) * Math.cos(latB * rad) * Math.sin(dLon / 2) ** 2;
+  return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function isDefined<T>(value: T | undefined): value is T {
+  return value !== undefined;
+}
+
+function numberOrUndefined(value: number | null | undefined) {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+export async function fetchRainViewer(signal?: AbortSignal): Promise<RainViewerState> {
+  const data = await fetchJson<{
+    generated: number;
+    host: string;
+    radar?: { past?: Array<{ time: number; path: string }>; nowcast?: Array<{ time: number; path: string }> };
+  }>(RAINVIEWER, signal);
+
+  return {
+    generated: data.generated,
+    host: data.host,
+    past: data.radar?.past ?? [],
+    nowcast: data.radar?.nowcast ?? []
+  };
+}
+
+function firstTextByLocalName(element: Element, localName: string) {
+  const match = Array.from(element.getElementsByTagName("*")).find((child) => child.localName.toLowerCase() === localName.toLowerCase());
+  return match?.textContent?.trim();
+}
+
+function numberFromText(value?: string | number | null) {
+  if (value === undefined || value === null || value === "") return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+interface WarningProvider {
+  id: string;
+  fetchWarnings: (signal?: AbortSignal) => Promise<GdacsAlert[]>;
+}
+
+const warningProviders: WarningProvider[] = [
+  { id: "gdacs", fetchWarnings: fetchGdacsRssAlerts },
+  { id: "smhi", fetchWarnings: fetchSmhiWarnings },
+  { id: "nws", fetchWarnings: fetchNwsWarnings },
+  { id: "met-norway", fetchWarnings: fetchMetNorwayWarnings },
+  { id: "dwd", fetchWarnings: fetchDwdWarnings },
+  { id: "hko", fetchWarnings: fetchHkoWarnings },
+  { id: "jma", fetchWarnings: fetchJmaWarnings },
+  { id: "inmet", fetchWarnings: fetchInmetWarnings }
+];
+
+export async function fetchGdacsAlerts(signal?: AbortSignal): Promise<GdacsAlert[]> {
+  const results = await Promise.allSettled(warningProviders.map((provider) => provider.fetchWarnings(signal)));
+  const alerts = results.flatMap((result) => result.status === "fulfilled" ? result.value : []);
+  const fulfilled = results.some((result) => result.status === "fulfilled");
+
+  if (alerts.length > 0 || fulfilled) {
+    return dedupeAlerts(alerts).sort(sortAlertsByDate).slice(0, 1200);
+  }
+
+  const reason = results.find((result) => result.status === "rejected")?.reason;
+  throw reason instanceof Error ? reason : new Error("Unable to refresh weather warnings");
+}
+
+function dedupeAlerts(alerts: GdacsAlert[]) {
+  const seen = new Set<string>();
+  return alerts.filter((alert) => {
+    const key = `${alert.source ?? "unknown"}:${alert.id}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function sortAlertsByDate(left: GdacsAlert, right: GdacsAlert) {
+  return alertTime(right) - alertTime(left);
+}
+
+function alertTime(alert: GdacsAlert) {
+  const value = alert.startsAt ?? alert.date ?? alert.endsAt;
+  const time = value ? new Date(value).getTime() : 0;
+  return Number.isFinite(time) ? time : 0;
+}
+
+async function fetchGdacsRssAlerts(signal?: AbortSignal): Promise<GdacsAlert[]> {
+  const text = await fetchText(GDACS_RSS, signal);
+  const doc = new DOMParser().parseFromString(text, "application/xml");
+  const items = Array.from(doc.getElementsByTagName("item"));
+
+  return items.slice(0, 80).map((item, index) => {
+    const title = item.getElementsByTagName("title")[0]?.textContent?.trim() ?? "GDACS alert";
+    const link = item.getElementsByTagName("link")[0]?.textContent?.trim() ?? "https://www.gdacs.org/";
+    const date = item.getElementsByTagName("pubDate")[0]?.textContent?.trim();
+    const description = item.getElementsByTagName("description")[0]?.textContent?.trim();
+    const lat = numberFromText(firstTextByLocalName(item, "lat"));
+    const lon = numberFromText(firstTextByLocalName(item, "long") ?? firstTextByLocalName(item, "lon"));
+    const alertLevel = firstTextByLocalName(item, "alertlevel") ?? title.match(/\b(Red|Orange|Green)\b/i)?.[1];
+    const eventType = firstTextByLocalName(item, "eventtype") ?? title.split(" ")[0];
+
+    return {
+      id: `${link}-${index}`,
+      title,
+      link,
+      source: "gdacs",
+      sourceLabel: "GDACS",
+      sourceLanguage: "en",
+      date,
+      description,
+      lat,
+      lon,
+      alertLevel,
+      eventType
+    };
+  });
+}
+
+interface SmhiWarning {
+  id: number;
+  event?: LocalizedWarningText & {
+    mhoClassification?: LocalizedWarningText;
+  };
+  warningAreas?: SmhiWarningArea[];
+}
+
+interface SmhiWarningArea {
+  id: number;
+  approximateStart?: string;
+  approximateEnd?: string;
+  published?: string;
+  areaName?: LocalizedWarningText;
+  warningLevel?: LocalizedWarningText;
+  eventDescription?: LocalizedWarningText;
+  affectedAreas?: Array<{ sv?: string; en?: string }>;
+  descriptions?: Array<{ title?: LocalizedWarningText; text?: LocalizedWarningText }>;
+  area?: {
+    geometry?: GdacsAlert["geometry"];
+  };
+}
+
+interface LocalizedWarningText {
+  sv?: string;
+  en?: string;
+  code?: string;
+}
+
+async function fetchSmhiWarnings(signal?: AbortSignal): Promise<GdacsAlert[]> {
+  const data = JSON.parse(await fetchText(SMHI_WARNINGS, signal)) as SmhiWarning[];
+  return data.flatMap((warning) =>
+    (warning.warningAreas ?? []).map((area) => {
+      const title = localized(area.eventDescription) ?? localized(warning.event) ?? "SMHI weather warning";
+      const level = localized(area.warningLevel);
+      const areaName = localized(area.areaName);
+      const description = warningDescription(area);
+
+      return {
+        id: `smhi-${warning.id}-${area.id}`,
+        title,
+        link: "https://www.smhi.se/vader/varningar-och-risker/varningar-och-meddelanden",
+        source: "smhi",
+        sourceLabel: "SMHI",
+        sourceLanguage: "en",
+        date: area.published,
+        startsAt: area.approximateStart,
+        endsAt: area.approximateEnd,
+        description,
+        eventType: localized(warning.event?.mhoClassification) ?? localized(warning.event),
+        alertLevel: level,
+        levelCode: area.warningLevel?.code,
+        areaName,
+        geometry: area.area?.geometry
+      } satisfies GdacsAlert;
+    })
+  );
+}
+
+interface GeoJsonWarningFeature {
+  id?: string;
+  geometry?: GdacsAlert["geometry"] | null;
+  properties?: Record<string, unknown>;
+}
+
+interface GeoJsonWarningCollection {
+  features?: GeoJsonWarningFeature[];
+}
+
+async function fetchJsonText<T>(url: string, signal?: AbortSignal): Promise<T> {
+  return JSON.parse(await fetchText(url, signal)) as T;
+}
+
+async function fetchNwsWarnings(signal?: AbortSignal): Promise<GdacsAlert[]> {
+  const data = await fetchJsonText<GeoJsonWarningCollection>(NWS_ALERTS, signal);
+  return (data.features ?? []).slice(0, 500).map((feature, index) => {
+    const properties = feature.properties ?? {};
+    const id = stringValue(properties.id) ?? stringValue(properties["@id"]) ?? feature.id ?? `nws-${index}`;
+    const event = stringValue(properties.event);
+    const headline = stringValue(properties.headline);
+    const severity = stringValue(properties.severity);
+    const certainty = stringValue(properties.certainty);
+    const urgency = stringValue(properties.urgency);
+    const description = [stringValue(properties.description), stringValue(properties.instruction)].filter(Boolean).join("\n\n") || undefined;
+
+    return {
+      id,
+      title: headline ?? event ?? "NOAA/NWS weather alert",
+      link: stringValue(properties["@id"]) ?? "https://www.weather.gov/alerts",
+      source: "nws",
+      sourceLabel: "NOAA/NWS",
+      sourceLanguage: "en",
+      date: stringValue(properties.sent),
+      startsAt: stringValue(properties.onset) ?? stringValue(properties.effective),
+      endsAt: stringValue(properties.ends) ?? stringValue(properties.expires),
+      description,
+      eventType: event,
+      alertLevel: [severity, urgency, certainty].filter(Boolean).join(" / ") || severity,
+      levelCode: severity,
+      areaName: stringValue(properties.areaDesc),
+      geometry: isGeometry(feature.geometry) ? feature.geometry : undefined
+    } satisfies GdacsAlert;
+  });
+}
+
+async function fetchMetNorwayWarnings(signal?: AbortSignal): Promise<GdacsAlert[]> {
+  const data = await fetchJsonText<GeoJsonWarningCollection>(MET_NORWAY_ALERTS, signal);
+  return (data.features ?? []).map((feature, index) => {
+    const properties = feature.properties ?? {};
+    const title = stringValue(properties.title) ?? stringValue(properties.eventAwarenessName) ?? "MET Norway weather warning";
+    const dates = title.match(/\d{4}-\d{2}-\d{2}T[\d:.+-]+/g) ?? [];
+    const color = stringValue(properties.riskMatrixColor) ?? metAwarenessColor(stringValue(properties.awareness_level));
+    const description = [
+      stringValue(properties.description),
+      stringValue(properties.consequences),
+      stringValue(properties.instruction)
+    ].filter(Boolean).join("\n\n") || undefined;
+
+    return {
+      id: stringValue(properties.id) ?? `met-norway-${index}`,
+      title,
+      link: stringValue(properties.web) ?? "https://www.met.no/vaer-og-klima/ekstremvaervarsler-og-andre-farevarsler",
+      source: "met-norway",
+      sourceLabel: "MET Norway",
+      sourceLanguage: "no",
+      startsAt: dates[0],
+      endsAt: dates[1],
+      description,
+      eventType: stringValue(properties.eventAwarenessName) ?? stringValue(properties.event) ?? stringValue(properties.awareness_type),
+      alertLevel: [color, stringValue(properties.severity), stringValue(properties.awarenessSeriousness)].filter(Boolean).join(" / "),
+      levelCode: color ?? stringValue(properties.severity),
+      areaName: stringValue(properties.area),
+      geometry: isGeometry(feature.geometry) ? feature.geometry : undefined
+    } satisfies GdacsAlert;
+  });
+}
+
+interface DwdWarningPayload {
+  time?: number;
+  warnings?: Record<string, DwdWarning[]>;
+  vorabInformation?: Record<string, DwdWarning[]>;
+}
+
+interface DwdWarning {
+  identifier?: string;
+  event?: string;
+  headline?: string;
+  description?: string;
+  instruction?: string;
+  level?: number;
+  type?: number;
+  start?: number;
+  end?: number;
+  regionName?: string;
+  state?: string;
+}
+
+async function fetchDwdWarnings(signal?: AbortSignal): Promise<GdacsAlert[]> {
+  const text = await fetchText(DWD_WARNINGS, signal);
+  const data = parseDwdWarnings(text);
+  const warnings = [
+    ...Object.entries(data.warnings ?? {}).flatMap(([regionId, entries]) => entries.map((entry) => ({ regionId, entry, preliminary: false }))),
+    ...Object.entries(data.vorabInformation ?? {}).flatMap(([regionId, entries]) => entries.map((entry) => ({ regionId, entry, preliminary: true })))
+  ];
+
+  return warnings.slice(0, 400).map(({ regionId, entry, preliminary }, index) => {
+    const point = dwdPoint(entry.state);
+    const level = dwdLevel(entry.level);
+    return {
+      id: `dwd-${regionId}-${entry.identifier ?? entry.start ?? index}`,
+      title: entry.headline ?? entry.event ?? "DWD weather warning",
+      link: "https://www.dwd.de/DE/wetter/warnungen_gemeinden/warnWetter_node.html",
+      source: "dwd",
+      sourceLabel: "DWD",
+      sourceLanguage: "de",
+      date: dwdDate(data.time),
+      startsAt: dwdDate(entry.start),
+      endsAt: dwdDate(entry.end),
+      description: [entry.description, entry.instruction].filter(Boolean).join("\n\n") || undefined,
+      eventType: entry.event ?? (preliminary ? "Preliminary weather information" : undefined),
+      alertLevel: level.label,
+      levelCode: level.code,
+      areaName: entry.regionName ?? entry.state ?? regionId,
+      lat: point.lat,
+      lon: point.lon
+    } satisfies GdacsAlert;
+  });
+}
+
+interface HkoWarningSummary {
+  name?: string;
+  code?: string;
+  actionCode?: string;
+  issueTime?: string;
+  expireTime?: string;
+  updateTime?: string;
+}
+
+interface HkoWarningInfo {
+  details?: Array<{
+    contents?: string[];
+    warningStatementCode?: string;
+    updateTime?: string;
+  }>;
+}
+
+async function fetchHkoWarnings(signal?: AbortSignal): Promise<GdacsAlert[]> {
+  const [summary, info] = await Promise.all([
+    fetchJsonText<Record<string, HkoWarningSummary>>(HKO_WARNING_SUMMARY, signal),
+    fetchJsonText<HkoWarningInfo>(HKO_WARNING_INFO, signal).catch(() => undefined)
+  ]);
+  const detailsByCode = new Map((info?.details ?? []).map((detail) => [detail.warningStatementCode, detail]));
+
+  return Object.entries(summary).map(([key, warning]) => {
+    const code = warning.code ?? key;
+    const detail = detailsByCode.get(code);
+    const level = hkoLevel(code, warning.name);
+
+    return {
+      id: `hko-${code}-${warning.updateTime ?? warning.issueTime ?? key}`,
+      title: warning.name ?? "Hong Kong Observatory weather warning",
+      link: "https://www.hko.gov.hk/en/wxinfo/dailywx/wxwarntoday.htm",
+      source: "hko",
+      sourceLabel: "Hong Kong Observatory",
+      sourceLanguage: "en",
+      date: detail?.updateTime ?? warning.updateTime ?? warning.issueTime,
+      startsAt: warning.issueTime,
+      endsAt: warning.expireTime,
+      description: detail?.contents?.join("\n") ?? warning.actionCode,
+      eventType: code,
+      alertLevel: level.label,
+      levelCode: level.code,
+      areaName: "Hong Kong",
+      lat: 22.3193,
+      lon: 114.1694
+    } satisfies GdacsAlert;
+  });
+}
+
+interface JmaWarningMapItem {
+  reportDatetime?: string;
+  areaTypes?: Array<{
+    areas?: Array<{
+      code?: string;
+      warnings?: Array<{ code?: string; status?: string }>;
+    }>;
+  }>;
+}
+
+interface JmaAreaMetadata {
+  offices?: Record<string, { enName?: string; name?: string; children?: string[]; parent?: string }>;
+  class10s?: Record<string, { enName?: string; name?: string; parent?: string }>;
+  class15s?: Record<string, { enName?: string; name?: string; parent?: string }>;
+  class20s?: Record<string, { enName?: string; name?: string; parent?: string }>;
+}
+
+let jmaAreaMetadataPromise: Promise<JmaAreaMetadata> | undefined;
+
+async function fetchJmaWarnings(signal?: AbortSignal): Promise<GdacsAlert[]> {
+  const [items, metadata] = await Promise.all([fetchJsonText<JmaWarningMapItem[]>(JMA_WARNING_MAP, signal), fetchJmaAreaMetadata(signal)]);
+
+  return items.flatMap((item, itemIndex) => {
+    const active = new Map<string, { code: string; statuses: Set<string>; areas: Set<string>; firstAreaCode?: string }>();
+    (item.areaTypes ?? []).forEach((areaType) => {
+      (areaType.areas ?? []).forEach((area) => {
+        const areaCode = area.code;
+        (area.warnings ?? []).forEach((warning) => {
+          if (!warning.code || isJmaInactiveStatus(warning.status)) return;
+          const entry = active.get(warning.code) ?? { code: warning.code, statuses: new Set(), areas: new Set(), firstAreaCode: areaCode };
+          if (warning.status) entry.statuses.add(warning.status);
+          if (areaCode) entry.areas.add(jmaAreaName(areaCode, metadata));
+          if (!entry.firstAreaCode) entry.firstAreaCode = areaCode;
+          active.set(warning.code, entry);
+        });
+      });
+    });
+
+    return Array.from(active.values()).map((entry) => {
+      const warningName = jmaWarningName(entry.code);
+      const point = jmaPoint(entry.firstAreaCode);
+      const areaNames = Array.from(entry.areas).slice(0, 5);
+      const areaNote = entry.areas.size > areaNames.length ? `${areaNames.join(", ")} and ${entry.areas.size - areaNames.length} more` : areaNames.join(", ");
+      const level = jmaLevel(entry.code);
+
+      return {
+        id: `jma-${itemIndex}-${entry.code}-${entry.firstAreaCode ?? "area"}`,
+        title: `${warningName} - ${areaNames[0] ?? "Japan"}`,
+        link: "https://www.jma.go.jp/bosai/warning/",
+        source: "jma",
+        sourceLabel: "Japan Meteorological Agency",
+        sourceLanguage: "ja",
+        date: item.reportDatetime,
+        description: [`Status: ${Array.from(entry.statuses).join(", ") || "Active"}`, areaNote ? `Areas: ${areaNote}` : undefined].filter(Boolean).join("\n"),
+        eventType: warningName,
+        alertLevel: level.label,
+        levelCode: level.code,
+        areaName: areaNames[0] ?? "Japan",
+        lat: point.lat,
+        lon: point.lon
+      } satisfies GdacsAlert;
+    });
+  });
+}
+
+async function fetchJmaAreaMetadata(signal?: AbortSignal) {
+  jmaAreaMetadataPromise ??= fetchJsonText<JmaAreaMetadata>(JMA_AREA_METADATA, signal);
+  return jmaAreaMetadataPromise;
+}
+
+async function fetchInmetWarnings(signal?: AbortSignal): Promise<GdacsAlert[]> {
+  const data = await fetchJsonText<unknown>(INMET_ACTIVE_WARNINGS, signal);
+  const items = normalizeInmetItems(data);
+
+  return items.slice(0, 300).map((item, index) => {
+    const state = stringValue(item.sigla_uf) ?? stringValue(item.uf) ?? stringValue(item.estado);
+    const point = brazilPoint(state);
+    const levelText = stringValue(item.severidade) ?? stringValue(item.nivel) ?? stringValue(item.risco);
+    const level = inmetLevel(levelText);
+
+    return {
+      id: `inmet-${stringValue(item.id) ?? stringValue(item.codigo) ?? index}`,
+      title: stringValue(item.titulo) ?? stringValue(item.evento) ?? stringValue(item.descricao) ?? "INMET weather alert",
+      link: "https://alert-as.inmet.gov.br/cv/?lang=en",
+      source: "inmet",
+      sourceLabel: "INMET Brazil",
+      sourceLanguage: "pt",
+      date: stringValue(item.data_publicacao) ?? stringValue(item.publicado_em),
+      startsAt: stringValue(item.data_inicio) ?? stringValue(item.inicio),
+      endsAt: stringValue(item.data_fim) ?? stringValue(item.fim),
+      description: stringValue(item.descricao) ?? stringValue(item.instrucoes) ?? stringValue(item.recomendacoes),
+      eventType: stringValue(item.evento) ?? stringValue(item.tipo),
+      alertLevel: level.label,
+      levelCode: level.code,
+      areaName: [stringValue(item.area), stringValue(item.municipio), state].filter(Boolean).join(", ") || "Brazil",
+      lat: numberValue(item.lat) ?? numberValue(item.latitude) ?? point.lat,
+      lon: numberValue(item.lon) ?? numberValue(item.lng) ?? numberValue(item.longitude) ?? point.lon,
+      geometry: isGeometry(item.geometry) ? item.geometry : undefined
+    } satisfies GdacsAlert;
+  });
+}
+
+function stringValue(value: unknown) {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function numberValue(value: unknown) {
+  const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function isGeometry(value: unknown): value is NonNullable<GdacsAlert["geometry"]> {
+  if (!value || typeof value !== "object") return false;
+  const type = (value as { type?: unknown }).type;
+  return typeof type === "string" && ["Point", "MultiPoint", "LineString", "MultiLineString", "Polygon", "MultiPolygon", "GeometryCollection"].includes(type);
+}
+
+function metAwarenessColor(value?: string) {
+  return value?.split(";").map((part) => part.trim()).find((part) => /^(?:red|orange|yellow|green)$/i.test(part));
+}
+
+function parseDwdWarnings(text: string): DwdWarningPayload {
+  const trimmed = text.trim();
+  const json = trimmed.startsWith("warnWetter.loadWarnings(")
+    ? trimmed.replace(/^warnWetter\.loadWarnings\(/, "").replace(/\);?$/, "")
+    : trimmed;
+  return JSON.parse(json) as DwdWarningPayload;
+}
+
+const GERMANY_POINT = { lat: 51.1657, lon: 10.4515 };
+const DWD_STATE_POINTS: Record<string, { lat: number; lon: number }> = {
+  BB: { lat: 52.4125, lon: 12.5316 },
+  BE: { lat: 52.52, lon: 13.405 },
+  BW: { lat: 48.6616, lon: 9.3501 },
+  BY: { lat: 48.7904, lon: 11.4979 },
+  HB: { lat: 53.0793, lon: 8.8017 },
+  HE: { lat: 50.6521, lon: 9.1624 },
+  HH: { lat: 53.5511, lon: 9.9937 },
+  MV: { lat: 53.6127, lon: 12.4296 },
+  NI: { lat: 52.6367, lon: 9.8451 },
+  NW: { lat: 51.4332, lon: 7.6616 },
+  RP: { lat: 50.1183, lon: 7.309 },
+  SH: { lat: 54.2194, lon: 9.6961 },
+  SL: { lat: 49.3964, lon: 7.023 },
+  SN: { lat: 51.1045, lon: 13.2017 },
+  ST: { lat: 51.9503, lon: 11.6923 },
+  TH: { lat: 50.9848, lon: 11.0299 }
+};
+
+function dwdPoint(state?: string) {
+  const key = state?.toUpperCase();
+  return key ? DWD_STATE_POINTS[key] ?? GERMANY_POINT : GERMANY_POINT;
+}
+
+function dwdLevel(level?: number) {
+  if ((level ?? 0) >= 4) return { label: "Extreme", code: "red" };
+  if ((level ?? 0) >= 3) return { label: "Severe", code: "orange" };
+  if ((level ?? 0) >= 2) return { label: "Moderate", code: "yellow" };
+  return { label: "Information", code: "green" };
+}
+
+function dwdDate(value?: number) {
+  if (!Number.isFinite(value)) return undefined;
+  const milliseconds = (value ?? 0) < 1_000_000_000_000 ? (value ?? 0) * 1000 : value ?? 0;
+  return new Date(milliseconds).toISOString();
+}
+
+function hkoLevel(code?: string, name?: string) {
+  const text = `${code ?? ""} ${name ?? ""}`.toLowerCase();
+  if (text.includes("black") || text.includes("hurricane") || text.includes("no. 10") || text.includes("no.10")) {
+    return { label: "Extreme", code: "red" };
+  }
+  if (text.includes("red") || text.includes("no. 8") || text.includes("no.8") || text.includes("no. 9") || text.includes("no.9")) {
+    return { label: "Severe", code: "orange" };
+  }
+  if (text.includes("amber") || text.includes("yellow") || text.includes("thunderstorm")) {
+    return { label: "Advisory", code: "yellow" };
+  }
+  return { label: "Warning", code: "orange" };
+}
+
+function isJmaInactiveStatus(status?: string) {
+  return !status || status.includes("\u89e3\u9664") || status.includes("\u306a\u3057");
+}
+
+const JMA_WARNING_NAMES: Record<string, string> = {
+  "02": "Snowstorm warning",
+  "03": "Heavy rain warning",
+  "04": "Flood warning",
+  "05": "Storm warning",
+  "06": "Heavy snow warning",
+  "07": "High wave warning",
+  "08": "Storm surge warning",
+  "10": "Heavy rain advisory",
+  "12": "Heavy snow advisory",
+  "13": "Snowstorm advisory",
+  "14": "Thunderstorm advisory",
+  "15": "Strong wind advisory",
+  "16": "High wave advisory",
+  "17": "Snowmelt advisory",
+  "18": "Flood advisory",
+  "19": "Storm surge advisory",
+  "20": "Dense fog advisory",
+  "21": "Dry air advisory",
+  "22": "Avalanche advisory",
+  "23": "Low temperature advisory",
+  "24": "Frost advisory",
+  "25": "Ice accretion advisory",
+  "26": "Snow accretion advisory",
+  "32": "Heavy snow emergency warning",
+  "33": "Heavy rain emergency warning",
+  "35": "Storm emergency warning",
+  "36": "Snowstorm emergency warning",
+  "37": "High wave emergency warning",
+  "38": "Storm surge emergency warning"
+};
+
+function jmaWarningName(code: string) {
+  return JMA_WARNING_NAMES[code.padStart(2, "0")] ?? `JMA warning ${code}`;
+}
+
+function jmaLevel(code: string) {
+  const normalized = code.padStart(2, "0");
+  if (["32", "33", "35", "36", "37", "38"].includes(normalized)) return { label: "Emergency", code: "red" };
+  if (["02", "03", "04", "05", "06", "07", "08"].includes(normalized)) return { label: "Warning", code: "orange" };
+  return { label: "Advisory", code: "yellow" };
+}
+
+const JMA_POINTS: Record<string, { lat: number; lon: number }> = {
+  "011": { lat: 45.25, lon: 141.85 },
+  "012": { lat: 43.77, lon: 142.36 },
+  "013": { lat: 44.02, lon: 144.27 },
+  "014030": { lat: 42.92, lon: 143.2 },
+  "014100": { lat: 43.25, lon: 144.39 },
+  "015": { lat: 42.72, lon: 141.61 },
+  "016": { lat: 43.06, lon: 141.35 },
+  "017": { lat: 41.78, lon: 140.74 },
+  "02": { lat: 40.82, lon: 140.75 },
+  "03": { lat: 39.7, lon: 141.15 },
+  "04": { lat: 38.27, lon: 140.87 },
+  "05": { lat: 39.72, lon: 140.1 },
+  "06": { lat: 38.24, lon: 140.36 },
+  "07": { lat: 37.75, lon: 140.47 },
+  "08": { lat: 36.34, lon: 140.45 },
+  "09": { lat: 36.57, lon: 139.88 },
+  "10": { lat: 36.39, lon: 139.06 },
+  "11": { lat: 35.86, lon: 139.65 },
+  "12": { lat: 35.6, lon: 140.12 },
+  "13": { lat: 35.68, lon: 139.76 },
+  "14": { lat: 35.45, lon: 139.64 },
+  "15": { lat: 37.9, lon: 139.02 },
+  "16": { lat: 36.7, lon: 137.21 },
+  "17": { lat: 36.59, lon: 136.63 },
+  "18": { lat: 36.07, lon: 136.22 },
+  "19": { lat: 35.66, lon: 138.57 },
+  "20": { lat: 36.65, lon: 138.18 },
+  "21": { lat: 35.39, lon: 136.72 },
+  "22": { lat: 34.98, lon: 138.38 },
+  "23": { lat: 35.18, lon: 136.91 },
+  "24": { lat: 34.73, lon: 136.51 },
+  "25": { lat: 35.0, lon: 135.87 },
+  "26": { lat: 35.02, lon: 135.76 },
+  "27": { lat: 34.69, lon: 135.5 },
+  "28": { lat: 34.69, lon: 135.18 },
+  "29": { lat: 34.69, lon: 135.83 },
+  "30": { lat: 34.23, lon: 135.17 },
+  "31": { lat: 35.5, lon: 134.24 },
+  "32": { lat: 35.47, lon: 133.05 },
+  "33": { lat: 34.66, lon: 133.93 },
+  "34": { lat: 34.39, lon: 132.46 },
+  "35": { lat: 34.19, lon: 131.47 },
+  "36": { lat: 34.07, lon: 134.56 },
+  "37": { lat: 34.34, lon: 134.04 },
+  "38": { lat: 33.84, lon: 132.77 },
+  "39": { lat: 33.56, lon: 133.53 },
+  "40": { lat: 33.59, lon: 130.4 },
+  "41": { lat: 33.25, lon: 130.3 },
+  "42": { lat: 32.75, lon: 129.87 },
+  "43": { lat: 32.79, lon: 130.74 },
+  "44": { lat: 33.24, lon: 131.61 },
+  "45": { lat: 31.91, lon: 131.42 },
+  "460040": { lat: 28.38, lon: 129.49 },
+  "46": { lat: 31.6, lon: 130.56 },
+  "471": { lat: 26.21, lon: 127.68 },
+  "472": { lat: 25.85, lon: 131.24 },
+  "473": { lat: 24.8, lon: 125.28 },
+  "474": { lat: 24.34, lon: 124.16 },
+  "47": { lat: 26.21, lon: 127.68 }
+};
+
+function jmaPoint(areaCode?: string) {
+  if (!areaCode) return { lat: 36.2, lon: 138.25 };
+  const candidates = [areaCode, areaCode.slice(0, 6), areaCode.slice(0, 3), areaCode.slice(0, 2)];
+  return candidates.map((candidate) => JMA_POINTS[candidate]).find(Boolean) ?? { lat: 36.2, lon: 138.25 };
+}
+
+function jmaAreaName(code: string, metadata: JmaAreaMetadata) {
+  const entry = metadata.class20s?.[code] ?? metadata.class15s?.[code] ?? metadata.class10s?.[code] ?? metadata.offices?.[code];
+  if (entry) return entry.enName ?? entry.name ?? code;
+  return code;
+}
+
+function normalizeInmetItems(data: unknown): Array<Record<string, unknown>> {
+  if (Array.isArray(data)) return data.filter(isRecord);
+  if (!isRecord(data)) return [];
+  const object = data as Record<string, unknown>;
+  const direct = object.data ?? object.avisos ?? object.alerts ?? object.items;
+  if (Array.isArray(direct)) return direct.filter(isRecord);
+  return Object.values(object).flatMap((value) => Array.isArray(value) ? value.filter(isRecord) : isRecord(value) ? [value] : []);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+const BRAZIL_POINT = { lat: -14.235, lon: -51.9253 };
+const BRAZIL_STATE_POINTS: Record<string, { lat: number; lon: number }> = {
+  AC: { lat: -9.02, lon: -70.81 },
+  AL: { lat: -9.62, lon: -36.82 },
+  AM: { lat: -3.47, lon: -65.1 },
+  AP: { lat: 1.41, lon: -51.77 },
+  BA: { lat: -12.58, lon: -41.7 },
+  CE: { lat: -5.2, lon: -39.53 },
+  DF: { lat: -15.79, lon: -47.86 },
+  ES: { lat: -19.19, lon: -40.34 },
+  GO: { lat: -15.98, lon: -49.86 },
+  MA: { lat: -5.42, lon: -45.44 },
+  MG: { lat: -18.51, lon: -44.56 },
+  MS: { lat: -20.51, lon: -54.54 },
+  MT: { lat: -12.64, lon: -55.42 },
+  PA: { lat: -3.79, lon: -52.48 },
+  PB: { lat: -7.24, lon: -36.78 },
+  PE: { lat: -8.28, lon: -35.07 },
+  PI: { lat: -6.6, lon: -42.28 },
+  PR: { lat: -24.89, lon: -51.55 },
+  RJ: { lat: -22.25, lon: -42.66 },
+  RN: { lat: -5.81, lon: -36.59 },
+  RO: { lat: -10.83, lon: -63.34 },
+  RR: { lat: 1.99, lon: -61.33 },
+  RS: { lat: -30.03, lon: -51.23 },
+  SC: { lat: -27.33, lon: -49.44 },
+  SE: { lat: -10.57, lon: -37.45 },
+  SP: { lat: -22.19, lon: -48.79 },
+  TO: { lat: -10.25, lon: -48.25 }
+};
+
+function brazilPoint(state?: string) {
+  const key = state?.toUpperCase();
+  return key ? BRAZIL_STATE_POINTS[key] ?? BRAZIL_POINT : BRAZIL_POINT;
+}
+
+function inmetLevel(level?: string) {
+  const normalized = (level ?? "").toLowerCase();
+  if (normalized.includes("grande") || normalized.includes("extremo") || normalized.includes("extreme")) return { label: level ?? "Extreme", code: "red" };
+  if (normalized.includes("perigo") || normalized.includes("danger")) return { label: level ?? "Danger", code: "orange" };
+  if (normalized.includes("potencial") || normalized.includes("potential")) return { label: level ?? "Potential danger", code: "yellow" };
+  return { label: level ?? "Alert", code: "yellow" };
+}
+
+function localized(value?: LocalizedWarningText) {
+  return value?.en ?? value?.sv ?? value?.code;
+}
+
+function warningDescription(area: SmhiWarningArea) {
+  const incident =
+    area.descriptions?.find((description) => description.title?.code === "INCIDENT") ??
+    area.descriptions?.find((description) => description.text?.en || description.text?.sv);
+  return localized(incident?.text);
+}
+
+function maxInNext(hours: number, times: string[], values: number[]) {
+  const now = Date.now();
+  const cutoff = now + hours * 60 * 60 * 1000;
+  return values.reduce<number | undefined>((max, value, index) => {
+    const time = new Date(times[index]).getTime();
+    if (Number.isNaN(time) || time < now || time > cutoff) return max;
+    return max === undefined ? value : Math.max(max, value);
+  }, undefined);
+}
+
+function includesCodeInNext(hours: number, times: string[], codes: number[], matcher: (code: number) => boolean) {
+  const now = Date.now();
+  const cutoff = now + hours * 60 * 60 * 1000;
+  return codes.find((code, index) => {
+    const time = new Date(times[index]).getTime();
+    return !Number.isNaN(time) && time >= now && time <= cutoff && matcher(code);
+  });
+}
+
+function pushSignal(signals: LocalSignal[], id: string, title: string, detail: string, severity: Severity) {
+  signals.push({ id, title, detail, severity });
+}
+
+export function deriveLocalSignals(weather?: LocalWeather): LocalSignal[] {
+  if (!weather) return [];
+
+  const signals: LocalSignal[] = [];
+  const current = weather.current;
+  const nextWind = maxInNext(18, weather.hourly.time, weather.hourly.wind_gusts_10m);
+  const nextPrecip = maxInNext(18, weather.hourly.time, weather.hourly.precipitation);
+  const nextPop = maxInNext(18, weather.hourly.time, weather.hourly.precipitation_probability);
+  const nextUv = maxInNext(18, weather.hourly.time, weather.hourly.uv_index);
+  const stormCode = includesCodeInNext(18, weather.hourly.time, weather.hourly.weather_code, (code) => code >= 95);
+  const snowCode = includesCodeInNext(18, weather.hourly.time, weather.hourly.weather_code, (code) => [71, 73, 75, 77, 85, 86].includes(code));
+
+  if (current.wind_gusts_10m >= 80 || (nextWind ?? 0) >= 80) {
+    pushSignal(signals, "wind-danger", "Severe gusts", `Gusts near ${Math.round(Math.max(current.wind_gusts_10m, nextWind ?? 0))} km/h`, "danger");
+  } else if (current.wind_gusts_10m >= 55 || (nextWind ?? 0) >= 55) {
+    pushSignal(signals, "wind-watch", "Strong gusts", `Gusts near ${Math.round(Math.max(current.wind_gusts_10m, nextWind ?? 0))} km/h`, "warning");
+  }
+
+  if (current.precipitation >= 8 || (nextPrecip ?? 0) >= 8) {
+    pushSignal(signals, "rain-danger", "Heavy precipitation", `Peak hourly amount near ${Math.round(Math.max(current.precipitation, nextPrecip ?? 0))} mm`, "danger");
+  } else if (current.precipitation >= 3 || (nextPrecip ?? 0) >= 3 || (nextPop ?? 0) >= 80) {
+    pushSignal(signals, "rain-watch", "Wet conditions", `${Math.round(nextPop ?? 0)}% precipitation chance ahead`, "watch");
+  }
+
+  if (stormCode) {
+    pushSignal(signals, "storm", "Thunderstorm risk", weatherCodeLabel(stormCode), "warning");
+  }
+
+  if (current.snowfall > 0 || snowCode) {
+    pushSignal(signals, "snow", "Snow nearby", snowCode ? weatherCodeLabel(snowCode) : "Snowfall reported now", "watch");
+  }
+
+  if (current.apparent_temperature >= 38) {
+    pushSignal(signals, "heat", "Dangerous heat", `Feels like ${Math.round(current.apparent_temperature)}\u00b0C`, "danger");
+  } else if (current.apparent_temperature <= -15) {
+    pushSignal(signals, "cold", "Severe cold", `Feels like ${Math.round(current.apparent_temperature)}\u00b0C`, "warning");
+  }
+
+  if (current.visibility <= 1000) {
+    pushSignal(signals, "visibility", "Low visibility", `${Math.round(current.visibility)} m`, "warning");
+  }
+
+  if ((nextUv ?? current.uv_index) >= 8) {
+    pushSignal(signals, "uv", "High UV", `UV index ${Math.round(nextUv ?? current.uv_index)}`, "watch");
+  }
+
+  if ((weather.airQuality?.us_aqi ?? 0) >= 151) {
+    pushSignal(signals, "aqi-danger", "Poor air quality", `US AQI ${Math.round(weather.airQuality?.us_aqi ?? 0)}`, "warning");
+  } else if ((weather.airQuality?.us_aqi ?? 0) >= 101) {
+    pushSignal(signals, "aqi-watch", "Sensitive air quality", `US AQI ${Math.round(weather.airQuality?.us_aqi ?? 0)}`, "watch");
+  }
+
+  return signals;
+}
