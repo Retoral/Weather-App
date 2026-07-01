@@ -563,6 +563,9 @@ function makeTemperatureLayer(
       this._weatherMap?.off("moveend zoomend resize", (this as unknown as { _reset: () => void })._reset, this);
       this._weatherMap?.off("mousemove", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
       this._weatherMap?.off("mouseout movestart zoomstart", (this as unknown as { _hideHover: () => void })._hideHover, this);
+      this._canvas = undefined;
+      this._tooltip = undefined;
+      this._weatherMap = undefined;
     },
     _hideHover(this: TemperatureLayerInternal) {
       if (this._tooltip) this._tooltip.classList.remove("visible");
@@ -668,6 +671,9 @@ function makeWindLayer(
       this._weatherMap?.off("moveend zoomend resize", (this as unknown as { _reset: () => void })._reset, this);
       this._weatherMap?.off("mousemove", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
       this._weatherMap?.off("mouseout movestart zoomstart", (this as unknown as { _hideHover: () => void })._hideHover, this);
+      this._canvas = undefined;
+      this._tooltip = undefined;
+      this._weatherMap = undefined;
     },
     _hideHover(this: WindLayerInternal) {
       hideHoverReadout(this._tooltip);
@@ -1208,6 +1214,7 @@ function makeRainRadarLayer(
     _weatherMap?: L.Map;
     _tileCache?: Map<string, Promise<ImageData | undefined>>;
     _hoverSerial?: number;
+    _removed?: boolean;
     _hideHover: () => void;
     _moveHover: (event: L.LeafletMouseEvent) => void;
     updateRainRadar: RainRadarLayerInstance["updateRainRadar"];
@@ -1215,6 +1222,7 @@ function makeRainRadarLayer(
 
   const RainRadarLayer = L.Layer.extend({
     onAdd(this: RainRadarLayerInternal, map: L.Map) {
+      this._removed = false;
       this._weatherMap = map;
       this._tileLayer = tileLayer.addTo(map);
       this._tileCache = new Map();
@@ -1225,12 +1233,17 @@ function makeRainRadarLayer(
       map.on("mouseout movestart zoomstart", this._hideHover, this);
     },
     onRemove(this: RainRadarLayerInternal) {
+      this._removed = true;
       if (this._tileLayer && this._weatherMap) this._weatherMap.removeLayer(this._tileLayer);
       if (this._pendingTileLayer && this._weatherMap) this._weatherMap.removeLayer(this._pendingTileLayer);
       if (this._tooltip?.parentNode) this._tooltip.parentNode.removeChild(this._tooltip);
       this._weatherMap?.off("mousemove", this._moveHover, this);
       this._weatherMap?.off("mouseout movestart zoomstart", this._hideHover, this);
       this._tileCache?.clear();
+      this._tileLayer = undefined;
+      this._pendingTileLayer = undefined;
+      this._tooltip = undefined;
+      this._weatherMap = undefined;
     },
     updateRainRadar(
       this: RainRadarLayerInternal,
@@ -1251,7 +1264,7 @@ function makeRainRadarLayer(
       currentLanguage = nextLanguage;
 
       const nextUrlKey = initialUrlKey(nextRainViewer, nextFrame);
-      if (!this._weatherMap || nextUrlKey === currentUrlKey) return;
+      if (this._removed || !this._weatherMap || nextUrlKey === currentUrlKey) return;
 
       currentUrlKey = nextUrlKey;
       this._tileCache?.clear();
@@ -1264,7 +1277,7 @@ function makeRainRadarLayer(
       const nextTileLayer = makeTileLayer(nextRainViewer, nextFrame, 0);
       this._pendingTileLayer = nextTileLayer.addTo(this._weatherMap);
       nextTileLayer.once("load", () => {
-        if (!this._weatherMap || this._pendingTileLayer !== nextTileLayer) return;
+        if (this._removed || !this._weatherMap || this._pendingTileLayer !== nextTileLayer) return;
         nextTileLayer.setOpacity(0.78);
         if (previousTileLayer) this._weatherMap.removeLayer(previousTileLayer);
         this._tileLayer = nextTileLayer;
@@ -2834,6 +2847,7 @@ export function WeatherMap({
   const mapRef = useRef<L.Map | null>(null);
   const baseLayerRef = useRef<L.MaplibreGL | null>(null);
   const activeLayerRef = useRef<L.Layer | null>(null);
+  const activeLayerKindRef = useRef<PrimaryLayer>("normal");
   const earthquakeLayerRef = useRef<L.Layer | null>(null);
   const warningLayerRef = useRef<L.Layer | null>(null);
   const aviationLayerRef = useRef<L.Layer | null>(null);
@@ -2899,7 +2913,7 @@ export function WeatherMap({
     const map = mapRef.current;
     if (!map) return;
 
-    if (activeLayer === "radar" && rainViewer && selectedRainFrame && isRainRadarLayer(activeLayerRef.current)) {
+    if (activeLayer === "radar" && activeLayerKindRef.current === "radar" && rainViewer && selectedRainFrame && isRainRadarLayer(activeLayerRef.current)) {
       activeLayerRef.current.updateRainRadar(rainViewer, selectedRainFrame, weatherGrid, liveWeatherPoints, showDayNight, unitSettings, appLanguage);
       return;
     }
@@ -2907,6 +2921,7 @@ export function WeatherMap({
     if (activeLayerRef.current) {
       map.removeLayer(activeLayerRef.current);
       activeLayerRef.current = null;
+      activeLayerKindRef.current = "normal";
     }
 
     let nextLayer: L.Layer | undefined;
@@ -2934,6 +2949,7 @@ export function WeatherMap({
     if (nextLayer) {
       nextLayer.addTo(map);
       activeLayerRef.current = nextLayer;
+      activeLayerKindRef.current = activeLayer;
     }
   }, [activeLayer, weatherGrid, liveWeatherPoints, rainViewer, selectedRainFrame, earthquakes, riskEvents, showDayNight, unitSettings, appLanguage]);
 
