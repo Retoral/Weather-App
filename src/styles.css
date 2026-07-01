@@ -65,6 +65,7 @@ button {
 }
 
 .map-filter-bar,
+.forecast-time-panel,
 .floating-panel,
 .local-dock,
 .legend,
@@ -86,6 +87,55 @@ button {
   max-width: 100%;
   padding: 6px;
   pointer-events: auto;
+}
+
+.forecast-time-panel {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  max-width: min(760px, 100%);
+  padding: 6px;
+  pointer-events: auto;
+}
+
+.forecast-time-panel > div:first-child {
+  display: grid;
+  min-width: 142px;
+  padding: 0 6px;
+}
+
+.forecast-time-panel strong {
+  font-size: 0.78rem;
+}
+
+.forecast-time-panel span {
+  color: rgba(255, 250, 241, 0.68);
+  font-size: 0.68rem;
+  font-weight: 760;
+  white-space: nowrap;
+}
+
+.forecast-time-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.forecast-time-options button {
+  min-height: 28px;
+  padding: 0 8px;
+  border-radius: 6px;
+  background: rgba(255, 250, 241, 0.1);
+  color: rgba(255, 250, 241, 0.78);
+  cursor: pointer;
+  font-size: 0.74rem;
+  font-weight: 850;
+}
+
+.forecast-time-options button.active {
+  background: #0f766e;
+  color: #ffffff;
 }
 
 .map-view-select,
@@ -216,6 +266,11 @@ button {
 
 .settings-select option {
   color: #171615;
+}
+
+.compact-select {
+  min-height: 34px;
+  padding: 0 9px;
 }
 
 .toolbar-button {
@@ -393,6 +448,21 @@ button {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 7px;
+}
+
+.filter-category {
+  display: grid;
+  gap: 7px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.filter-note {
+  color: rgba(255, 250, 241, 0.62);
+  font-size: 0.72rem;
+  font-weight: 760;
+  line-height: 1.25;
 }
 
 .filter-grid label {
@@ -895,6 +965,13 @@ button {
   box-shadow: inset 0 0 0 1px rgba(255, 250, 241, 0.18);
 }
 
+.rain-forecast-gradient {
+  height: 9px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #7dd3fc 0%, #0ea5e9 24%, #2563eb 46%, #facc15 66%, #f97316 82%, #ef4444 100%);
+  box-shadow: inset 0 0 0 1px rgba(255, 250, 241, 0.18);
+}
+
 .radar-scale-values {
   color: rgba(255, 250, 241, 0.7);
   font-size: 0.66rem;
@@ -1038,6 +1115,191 @@ button {
   font-weight: 800;
 }
 
+.tracked-flight-dock {
+  position: absolute;
+  z-index: 845;
+  right: 370px;
+  bottom: 14px;
+  left: 410px;
+  display: grid;
+  gap: 8px;
+  pointer-events: auto;
+}
+
+.tracked-flight-toggle,
+.tracked-flight-list,
+.tracked-flight-card,
+.tracked-flight-focus {
+  display: flex;
+  align-items: center;
+}
+
+.tracked-flight-toggle {
+  justify-self: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 0 10px;
+  border-radius: 7px;
+  background: rgba(25, 27, 26, 0.9);
+  color: #fffaf1;
+  box-shadow: 0 14px 32px rgba(0, 0, 0, 0.24);
+  backdrop-filter: blur(14px);
+  cursor: pointer;
+  font-size: 0.78rem;
+}
+
+.tracked-flight-toggle span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: #0f766e;
+  color: #ffffff;
+  font-size: 0.68rem;
+  font-weight: 850;
+}
+
+.tracked-flight-dock.open .tracked-flight-toggle > svg:last-child {
+  transform: rotate(180deg);
+}
+
+.tracked-flight-list {
+  gap: 7px;
+  min-height: 42px;
+  padding: 7px;
+  border-radius: 8px;
+  overflow-x: auto;
+  background: rgba(25, 27, 26, 0.9);
+  box-shadow: 0 14px 32px rgba(0, 0, 0, 0.24);
+  backdrop-filter: blur(14px);
+}
+
+.tracked-flight-list.compact {
+  justify-self: center;
+  max-width: min(100%, 560px);
+  min-height: 36px;
+  padding: 5px;
+}
+
+.tracked-flight-empty {
+  padding: 0 8px;
+  color: rgba(255, 250, 241, 0.62);
+  font-size: 0.76rem;
+  font-weight: 780;
+  white-space: nowrap;
+}
+
+.tracked-flight-card {
+  position: relative;
+  gap: 4px;
+  flex: 0 0 178px;
+  min-width: 0;
+  min-height: 44px;
+  padding: 5px;
+  border-radius: 7px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(45, 49, 47, 0.94);
+}
+
+.tracked-flight-list.compact .tracked-flight-card {
+  flex-basis: 132px;
+  min-height: 38px;
+  padding: 5px 6px;
+}
+
+.tracked-flight-card.warning {
+  border-color: rgba(251, 113, 133, 0.72);
+  background: rgba(79, 39, 45, 0.94);
+}
+
+.tracked-flight-focus {
+  gap: 5px;
+  min-width: 0;
+  flex: 1 1 auto;
+  padding: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #fffaf1;
+  cursor: pointer;
+  text-align: left;
+}
+
+.tracked-flight-focus:hover {
+  color: #ffffff;
+}
+
+.tracked-flight-focus:disabled {
+  cursor: default;
+  opacity: 0.62;
+}
+
+.tracked-flight-focus span {
+  display: grid;
+  min-width: 0;
+}
+
+.tracked-flight-focus strong,
+.tracked-flight-focus em {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tracked-flight-focus strong {
+  font-size: 0.78rem;
+}
+
+.tracked-flight-focus em {
+  color: rgba(255, 250, 241, 0.62);
+  font-size: 0.68rem;
+  font-style: normal;
+  font-weight: 760;
+}
+
+.tracked-flight-list.compact .tracked-flight-focus strong {
+  font-size: 0.74rem;
+}
+
+.tracked-flight-remove {
+  position: absolute;
+  z-index: 2;
+  top: 3px;
+  right: 3px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+  border-radius: 999px;
+  background: rgba(25, 27, 26, 0.86);
+  color: #fffaf1;
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 140ms ease, background 140ms ease;
+}
+
+.tracked-flight-remove svg {
+  width: 14px;
+  height: 14px;
+  stroke-width: 3;
+}
+
+.tracked-flight-card:hover .tracked-flight-remove,
+.tracked-flight-card:focus-within .tracked-flight-remove {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.tracked-flight-remove:hover {
+  background: rgba(239, 68, 68, 0.42);
+}
+
 .error-box {
   position: absolute;
   z-index: 920;
@@ -1162,7 +1424,8 @@ button {
 }
 
 .temperature-canvas,
-.wind-canvas {
+.wind-canvas,
+.rain-forecast-canvas {
   mix-blend-mode: multiply;
 }
 
@@ -1333,6 +1596,37 @@ button {
   transform: rotate(45deg);
 }
 
+.aircraft-marker {
+  pointer-events: auto;
+}
+
+.aircraft-marker span {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 1px solid rgba(15, 23, 42, 0.82);
+  border-radius: 999px;
+  background: rgba(20, 184, 166, 0.92);
+  box-shadow: 0 0 0 4px rgba(20, 184, 166, 0.2), 0 8px 18px rgba(0, 0, 0, 0.24);
+  transform: rotate(var(--aircraft-heading, 0deg));
+}
+
+.aircraft-marker svg {
+  width: 16px;
+  height: 16px;
+  fill: #ffffff;
+  stroke: #ffffff;
+  stroke-linejoin: round;
+  stroke-width: 1.5;
+}
+
+.aircraft-marker-warning span {
+  background: rgba(244, 63, 94, 0.95);
+  box-shadow: 0 0 0 5px rgba(244, 63, 94, 0.24), 0 8px 18px rgba(0, 0, 0, 0.28);
+}
+
 .map-popup {
   display: grid;
   gap: 5px;
@@ -1374,6 +1668,82 @@ button {
 .map-popup a {
   color: #99f6e4;
   font-weight: 850;
+}
+
+.map-popup-action {
+  width: calc(100% - 18px);
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 7px;
+  background: #0f766e;
+  color: #ffffff;
+  cursor: pointer;
+  font-size: 0.78rem;
+  font-weight: 850;
+}
+
+.map-popup-action:hover {
+  background: #0d9488;
+}
+
+.selector-popup .leaflet-popup-content-wrapper {
+  padding: 0;
+}
+
+.map-overlap-selector {
+  display: grid;
+  gap: 6px;
+  min-width: 220px;
+}
+
+.map-overlap-selector > strong {
+  color: #fffaf1;
+  font-size: 0.82rem;
+}
+
+.map-overlap-selector button {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 2px 8px;
+  width: 100%;
+  padding: 7px 8px;
+  border-radius: 6px;
+  background: rgba(255, 250, 241, 0.09);
+  color: #fffaf1;
+  text-align: left;
+  cursor: pointer;
+}
+
+.map-overlap-selector button:hover {
+  background: rgba(20, 184, 166, 0.22);
+}
+
+.map-overlap-selector span {
+  grid-row: span 2;
+  align-self: center;
+  color: #99f6e4;
+  font-size: 0.66rem;
+  font-weight: 850;
+  text-transform: uppercase;
+}
+
+.map-overlap-selector b {
+  min-width: 0;
+  overflow: hidden;
+  color: #fffaf1;
+  font-size: 0.78rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.map-overlap-selector em {
+  min-width: 0;
+  overflow: hidden;
+  color: rgba(255, 250, 241, 0.62);
+  font-size: 0.68rem;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .spin {
@@ -1433,6 +1803,12 @@ button {
 
   .legend.radar-legend {
     bottom: 46px;
+  }
+
+  .tracked-flight-dock {
+    right: 10px;
+    bottom: 84px;
+    left: 10px;
   }
 }
 

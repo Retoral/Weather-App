@@ -3,7 +3,20 @@ import L from "leaflet";
 import "@maplibre/maplibre-gl-leaflet";
 import type { Geometry } from "geojson";
 import type { Map as MapLibreMap } from "maplibre-gl";
-import type { EarthquakeEvent, GdacsAlert, LocalWeather, PrimaryLayer, RainFrame, RainViewerState, RiskSignalEvent, WeatherGridPoint } from "../types";
+import type {
+  AircraftState,
+  AircraftTrack,
+  AviationBounds,
+  AviationIncident,
+  EarthquakeEvent,
+  GdacsAlert,
+  LocalWeather,
+  PrimaryLayer,
+  RainFrame,
+  RainViewerState,
+  RiskSignalEvent,
+  WeatherGridPoint
+} from "../types";
 import { temperatureRgb, weatherCodeLabel } from "../utils/weatherCodes";
 
 interface MapLocationDetails {
@@ -21,6 +34,9 @@ interface MapLocationDetails {
 interface WeatherMapProps {
   activeLayer: PrimaryLayer;
   showEarthquakes: boolean;
+  showAircraftLocations: boolean;
+  showAircraftTrails: boolean;
+  showAviationIncidents: boolean;
   showTimezones: boolean;
   showWarnings: boolean;
   showDayNight: boolean;
@@ -30,13 +46,20 @@ interface WeatherMapProps {
   earthquakes: EarthquakeEvent[];
   warnings: GdacsAlert[];
   riskEvents: RiskSignalEvent[];
+  aircraft: AircraftState[];
+  aviationIncidents: AviationIncident[];
+  trackedAircraftIds: string[];
+  aircraftTracks: Record<string, AircraftTrack | undefined>;
   rainViewer?: RainViewerState;
   mapLanguage: string;
   appLanguage: string;
   homeFocusRequest?: number;
   inspectedFocusRequest?: number;
+  aircraftFocusRequest?: { id: string; request: number };
   selectedLocation?: MapLocationDetails;
   inspectedLocation?: MapLocationDetails;
+  onViewportChange?: (bounds: AviationBounds) => void;
+  onToggleAircraftTrack?: (id: string) => void;
 }
 
 const MAX_MERCATOR_LAT = 85.05112878;
@@ -45,6 +68,7 @@ const WORLD_COPY_OFFSETS = [-720, -360, 0, 360, 720];
 const OPENFREEMAP_STYLE_URL = "https://tiles.openfreemap.org/styles/liberty";
 const HOME_MARKER_ICON = `<span aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><path d="M9 22V12h6v10"></path></svg></span>`;
 const PLACE_MARKER_ICON = `<span aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M20 10c0 5.25-8 12-8 12S4 15.25 4 10a8 8 0 1 1 16 0Z"></path><circle cx="12" cy="10" r="3"></circle></svg></span>`;
+const AIRCRAFT_MARKER_ICON = `<svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path d="M10.18 9"></path><path d="m21 16-8-5-8 5V8l8-5 8 5Z"></path><path d="m13 11 4 9h-8Z"></path></svg>`;
 const SURFACE_GRID_STEP = 10;
 const SURFACE_GRID_MIN_LAT = -80;
 const SURFACE_GRID_MAX_LAT = 80;
@@ -267,7 +291,7 @@ function makeWindLayer(points: WeatherGridPoint[], includeLocalTime = false) {
       }
 
       positionHoverReadout(this._weatherMap, event, this._tooltip);
-      this._tooltip.innerHTML = windHoverContent(sample, event.latlng.lat, event.latlng.lng, includeLocalTime ? Date.now() : undefined);
+      this._tooltip.innerHTML = windHoverContent(sample, event.latlng.lat, event.latlng.lng, includeLocalTime ? forecastSampleTimestamp(sample) : undefined);
       showHoverReadout(this._tooltip);
     },
     _reset(this: WindLayerInternal) {
@@ -313,6 +337,97 @@ function makeWindLayer(points: WeatherGridPoint[], includeLocalTime = false) {
   return new CanvasLayer();
 }
 
+function makeRainForecastLayer(points: WeatherGridPoint[], includeLocalTime = false) {
+  const surfaceGrid = makeSurfaceGrid(points);
+
+  interface RainForecastLayerInternal extends L.Layer {
+    _canvas?: HTMLCanvasElement;
+    _tooltip?: HTMLDivElement;
+    _weatherMap?: L.Map;
+    _hideHover: () => void;
+    _moveHover: (event: L.LeafletMouseEvent) => void;
+    _reset: () => void;
+  }
+
+  const CanvasLayer = L.Layer.extend({
+    onAdd(this: RainForecastLayerInternal, map: L.Map) {
+      this._weatherMap = map;
+      this._canvas = L.DomUtil.create("canvas", "rain-forecast-canvas") as HTMLCanvasElement;
+      this._canvas.style.pointerEvents = "none";
+      this._tooltip = L.DomUtil.create("div", "map-hover-tooltip rain-forecast") as HTMLDivElement;
+      map.getPanes().overlayPane.appendChild(this._canvas);
+      map.getPanes().tooltipPane.appendChild(this._tooltip);
+      map.on("moveend zoomend resize", (this as unknown as { _reset: () => void })._reset, this);
+      map.on("mousemove", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
+      map.on("mouseout movestart zoomstart", (this as unknown as { _hideHover: () => void })._hideHover, this);
+      (this as unknown as { _reset: () => void })._reset();
+    },
+    onRemove(this: RainForecastLayerInternal) {
+      if (this._canvas?.parentNode) this._canvas.parentNode.removeChild(this._canvas);
+      if (this._tooltip?.parentNode) this._tooltip.parentNode.removeChild(this._tooltip);
+      this._weatherMap?.off("moveend zoomend resize", (this as unknown as { _reset: () => void })._reset, this);
+      this._weatherMap?.off("mousemove", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
+      this._weatherMap?.off("mouseout movestart zoomstart", (this as unknown as { _hideHover: () => void })._hideHover, this);
+    },
+    _hideHover(this: RainForecastLayerInternal) {
+      hideHoverReadout(this._tooltip);
+    },
+    _moveHover(this: RainForecastLayerInternal, event: L.LeafletMouseEvent) {
+      if (!this._weatherMap || !this._tooltip || surfaceGrid.size === 0) return;
+      const sample = interpolatedSurfaceSample(surfaceGrid, event.latlng.lat, event.latlng.lng);
+      if (!sample) {
+        this._hideHover();
+        return;
+      }
+
+      positionHoverReadout(this._weatherMap, event, this._tooltip);
+      this._tooltip.innerHTML = rainForecastHoverContent(sample, event.latlng.lat, event.latlng.lng, includeLocalTime ? forecastSampleTimestamp(sample) : undefined);
+      showHoverReadout(this._tooltip);
+    },
+    _reset(this: RainForecastLayerInternal) {
+      if (!this._weatherMap || !this._canvas) return;
+      const map = this._weatherMap;
+      const canvas = this._canvas;
+      const size = map.getSize();
+      const topLeft = map.containerPointToLayerPoint([0, 0]);
+      const scale = surfaceRasterScale(size, map.getZoom());
+      const width = Math.max(1, Math.ceil(size.x * scale));
+      const height = Math.max(1, Math.ceil(size.y * scale));
+      L.DomUtil.setPosition(canvas, topLeft);
+      canvas.width = width;
+      canvas.height = height;
+      canvas.style.width = `${size.x}px`;
+      canvas.style.height = `${size.y}px`;
+
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.imageSmoothingEnabled = true;
+      ctx.clearRect(0, 0, width, height);
+
+      if (surfaceGrid.size === 0) return;
+
+      const image = ctx.createImageData(width, height);
+      for (let y = 0; y < height; y += 1) {
+        for (let x = 0; x < width; x += 1) {
+          const latLng = map.containerPointToLatLng([(x + 0.5) / scale, (y + 0.5) / scale]);
+          const sample = interpolatedSurfaceSample(surfaceGrid, latLng.lat, latLng.lng);
+          const precipitation = sample?.precipitation ?? 0;
+          const rgb = rainForecastRgb(precipitation);
+          const index = (y * width + x) * 4;
+          image.data[index] = rgb[0];
+          image.data[index + 1] = rgb[1];
+          image.data[index + 2] = rgb[2];
+          image.data[index + 3] = precipitation <= 0.05 ? 0 : Math.max(58, Math.min(154, 68 + precipitation * 10));
+        }
+      }
+
+      ctx.putImageData(image, 0, 0);
+    }
+  });
+
+  return new CanvasLayer();
+}
+
 function windHoverContent(sample: SurfaceSample, lat: number, lon: number, timestamp?: number) {
   const localTimeRow = timestamp !== undefined ? `<span>Local time</span><b>${localTimeSummary(lat, lon, timestamp)}</b>` : "";
   const fromDirection = normalizeBearing(sample.windDirection);
@@ -328,6 +443,55 @@ function windHoverContent(sample: SurfaceSample, lat: number, lon: number, times
     <span>Pressure</span><b>${Math.round(sample.pressure)} hPa</b>
     ${localTimeRow}
   </div><em>Blowing from ${fromLabel} · ${lat.toFixed(1)}°, ${normalizeLongitude(lon).toFixed(1)}°</em>`;
+}
+
+function rainForecastHoverContent(sample: SurfaceSample, lat: number, lon: number, timestamp?: number) {
+  const localTimeRow = timestamp !== undefined ? `<span>Forecast time</span><b>${localTimeSummary(lat, lon, timestamp)}</b>` : "";
+  const precipitation = Math.max(0, sample.precipitation);
+  const level = rainForecastLevel(precipitation);
+  const windRows = `<span>Wind</span><b>${Math.round(sample.windSpeed)} km/h</b><span>Gust</span><b>${Math.round(sample.windGust)} km/h</b>`;
+
+  return `<strong>${level}</strong><div class="hover-metrics">
+    <span>Rain</span><b>${precipitation.toFixed(1)} mm/h</b>
+    <span>Weather</span><b>${escapeHtml(weatherCodeLabel(sample.weatherCode))}</b>
+    ${windRows}
+    ${localTimeRow}
+  </div><em>${lat.toFixed(1)}°, ${normalizeLongitude(lon).toFixed(1)}°</em>`;
+}
+
+function rainForecastLevel(precipitation: number) {
+  if (precipitation < 0.1) return "No rain expected";
+  if (precipitation < 1) return "Light rain forecast";
+  if (precipitation < 3) return "Moderate rain forecast";
+  if (precipitation < 8) return "Heavy rain forecast";
+  return "Very heavy rain forecast";
+}
+
+function rainForecastRgb(precipitation: number): [number, number, number] {
+  const stops: Array<[number, [number, number, number]]> = [
+    [0, [148, 163, 184]],
+    [0.2, [125, 211, 252]],
+    [1, [14, 165, 233]],
+    [3, [37, 99, 235]],
+    [8, [250, 204, 21]],
+    [18, [249, 115, 22]],
+    [30, [239, 68, 68]]
+  ];
+  const value = Math.max(0, precipitation);
+  for (let index = 0; index < stops.length - 1; index += 1) {
+    const [startValue, startColor] = stops[index];
+    const [endValue, endColor] = stops[index + 1];
+    if (value <= endValue) {
+      const ratio = Math.max(0, Math.min(1, (value - startValue) / (endValue - startValue)));
+      return [
+        Math.round(lerp(startColor[0], endColor[0], ratio)),
+        Math.round(lerp(startColor[1], endColor[1], ratio)),
+        Math.round(lerp(startColor[2], endColor[2], ratio))
+      ];
+    }
+  }
+
+  return stops[stops.length - 1][1];
 }
 
 function windStrengthLabel(windSpeed: number) {
@@ -377,6 +541,7 @@ function windRgb(windSpeed: number): [number, number, number] {
 }
 
 interface SurfaceSample {
+  time?: string;
   temperature: number;
   weatherCode: number;
   windSpeed: number;
@@ -392,6 +557,7 @@ function makeSurfaceGrid(points: WeatherGridPoint[]) {
   points.forEach((point) => {
     grid.set(surfaceGridKey(point.lat, point.lon), {
       temperature: point.temperature,
+      time: point.time,
       weatherCode: point.weatherCode,
       windSpeed: point.windSpeed,
       windGust: point.windGust,
@@ -441,7 +607,7 @@ function interpolatedSurfaceSample(grid: Map<string, SurfaceSample>, lat: number
 
   if (!southwest || !southeast || !northwest || !northeast) return nearestSurfaceSample(grid, lat, lon);
 
-  const interpolate = (key: keyof Omit<SurfaceSample, "weatherCode" | "windDirection">) => {
+  const interpolate = (key: keyof Omit<SurfaceSample, "time" | "weatherCode" | "windDirection">) => {
     const southValue = lerp(southwest[key], southeast[key], lonRatio);
     const northValue = lerp(northwest[key], northeast[key], lonRatio);
     return lerp(southValue, northValue, latRatio);
@@ -449,6 +615,7 @@ function interpolatedSurfaceSample(grid: Map<string, SurfaceSample>, lat: number
 
   return {
     temperature: interpolate("temperature"),
+    time: nearestSurfaceSample(grid, lat, lon)?.time ?? southwest.time,
     weatherCode: nearestSurfaceSample(grid, lat, lon)?.weatherCode ?? southwest.weatherCode,
     windSpeed: interpolate("windSpeed"),
     windGust: interpolate("windGust"),
@@ -457,6 +624,10 @@ function interpolatedSurfaceSample(grid: Map<string, SurfaceSample>, lat: number
     pressure: interpolate("pressure"),
     cloudCover: interpolate("cloudCover")
   };
+}
+
+function forecastSampleTimestamp(sample: SurfaceSample) {
+  return sample.time ? Date.parse(`${sample.time}Z`) : Date.now();
 }
 
 function interpolatedWindDirection(
@@ -1179,34 +1350,37 @@ function makeEarthquakeLayer(earthquakes: EarthquakeEvent[]) {
     WORLD_COPY_OFFSETS.forEach((copyOffset) => {
       L.circleMarker([quake.lat, quake.lon + copyOffset], {
         radius: Math.max(4, magnitude * 2.4),
+        bubblingMouseEvents: true,
         color: "#0f172a",
         weight: 1,
         fillColor: color,
         fillOpacity: 0.86,
         opacity: 0.95
       })
-        .bindPopup(
-          popupTable([
-            ["Actual magnitude", quake.magnitude !== undefined ? quake.magnitude.toFixed(1) : "Unavailable"],
-            ["Place", quake.place],
-            ["Depth", quake.depth !== undefined ? `${quake.depth.toFixed(1)} km` : "Unavailable"],
-            ["Perceived shaking", quake.feltIntensity !== undefined ? `${quake.feltIntensity.toFixed(1)} CDI` : undefined],
-            [
-              "Estimated shaking",
-              quake.instrumentalIntensity !== undefined ? `${quake.instrumentalIntensity.toFixed(1)} MMI` : undefined
-            ],
-            ["Felt reports", quake.feltReports !== undefined ? Math.round(quake.feltReports).toLocaleString() : undefined],
-            ["Time", new Date(quake.time).toLocaleString()],
-            ["Tsunami", quake.tsunami ? "Yes" : "No"],
-            ["Source", escapeHtml(quake.sourceLabel ?? "Earthquake feed")],
-            ["Details", `<a href="${quake.url}" target="_blank" rel="noreferrer">Open report</a>`]
-          ])
-        )
+        .bindPopup(earthquakePopup(quake))
         .addTo(group);
     });
   });
 
   return group;
+}
+
+function earthquakePopup(quake: EarthquakeEvent) {
+  return popupTable([
+    ["Actual magnitude", quake.magnitude !== undefined ? quake.magnitude.toFixed(1) : "Unavailable"],
+    ["Place", quake.place],
+    ["Depth", quake.depth !== undefined ? `${quake.depth.toFixed(1)} km` : "Unavailable"],
+    ["Perceived shaking", quake.feltIntensity !== undefined ? `${quake.feltIntensity.toFixed(1)} CDI` : undefined],
+    [
+      "Estimated shaking",
+      quake.instrumentalIntensity !== undefined ? `${quake.instrumentalIntensity.toFixed(1)} MMI` : undefined
+    ],
+    ["Felt reports", quake.feltReports !== undefined ? Math.round(quake.feltReports).toLocaleString() : undefined],
+    ["Time", new Date(quake.time).toLocaleString()],
+    ["Tsunami", quake.tsunami ? "Yes" : "No"],
+    ["Source", escapeHtml(quake.sourceLabel ?? "Earthquake feed")],
+    ["Details", `<a href="${quake.url}" target="_blank" rel="noreferrer">Open report</a>`]
+  ]);
 }
 
 interface SeismicHoverTarget {
@@ -1546,6 +1720,185 @@ function riskKindLabel(kind: RiskSignalEvent["kind"]) {
   return labels[kind];
 }
 
+interface AircraftTrailPoint {
+  lat: number;
+  lon: number;
+  time: number;
+}
+
+function makeAviationLayer({
+  aircraft,
+  incidents,
+  showAircraftLocations,
+  showAircraftTrails,
+  showAviationIncidents,
+  trackedAircraftIds,
+  aircraftTracks,
+  onToggleAircraftTrack,
+  trails
+}: {
+  aircraft: AircraftState[];
+  incidents: AviationIncident[];
+  showAircraftLocations: boolean;
+  showAircraftTrails: boolean;
+  showAviationIncidents: boolean;
+  trackedAircraftIds: string[];
+  aircraftTracks: Record<string, AircraftTrack | undefined>;
+  onToggleAircraftTrack?: (id: string) => void;
+  trails: Map<string, AircraftTrailPoint[]>;
+}) {
+  const group = L.layerGroup();
+  const trackedIds = new Set(trackedAircraftIds);
+  updateAircraftTrails(aircraft, trails, trackedIds, aircraftTracks);
+
+  if (showAircraftTrails) {
+    trails.forEach((points) => {
+      if (points.length < 2) return;
+      WORLD_COPY_OFFSETS.forEach((copyOffset) => {
+        L.polyline(points.map((point) => [point.lat, point.lon + copyOffset] as L.LatLngExpression), {
+          color: "#38bdf8",
+          opacity: 0.42,
+          weight: 2,
+          interactive: false
+        }).addTo(group);
+      });
+    });
+  }
+
+  if (showAircraftLocations) {
+    aircraft.forEach((plane) => {
+      WORLD_COPY_OFFSETS.forEach((copyOffset) => {
+        L.marker([plane.lat, plane.lon + copyOffset], {
+          title: plane.callsign ?? plane.id.toUpperCase(),
+          bubblingMouseEvents: true,
+          icon: L.divIcon({
+            className: plane.flightStatusWarning ? "aircraft-marker aircraft-marker-warning" : "aircraft-marker",
+            html: `<span style="--aircraft-heading: ${plane.heading ?? 0}deg">${AIRCRAFT_MARKER_ICON}</span>`,
+            iconSize: [26, 26],
+            iconAnchor: [13, 13]
+          })
+        })
+          .bindPopup(aircraftPopup(plane, trackedIds.has(plane.id)))
+          .on("popupopen", (event) => bindAircraftPopupActions((event as L.PopupEvent).popup, plane, onToggleAircraftTrack))
+          .addTo(group);
+      });
+    });
+  }
+
+  if (showAviationIncidents) {
+    incidents.forEach((incident) => {
+      WORLD_COPY_OFFSETS.forEach((copyOffset) => {
+        L.circleMarker([incident.lat, incident.lon + copyOffset], {
+          radius: 9,
+          bubblingMouseEvents: true,
+          color: "#111827",
+          weight: 1,
+          fillColor: "#f43f5e",
+          fillOpacity: 0.9,
+          opacity: 0.96
+        })
+          .bindPopup(aviationIncidentPopup(incident))
+          .addTo(group);
+      });
+    });
+  }
+
+  return group;
+}
+
+function updateAircraftTrails(
+  aircraft: AircraftState[],
+  trails: Map<string, AircraftTrailPoint[]>,
+  trackedIds: Set<string>,
+  aircraftTracks: Record<string, AircraftTrack | undefined>
+) {
+  const now = Date.now();
+
+  aircraft.forEach((plane) => {
+    if (!trackedIds.has(plane.id)) return;
+    const historicalPoints =
+      aircraftTracks[plane.id]?.path
+        .filter((point) => !point.onGround)
+        .map((point) => ({ lat: point.lat, lon: point.lon, time: point.time })) ?? [];
+    const existingPoints = trails.get(plane.id) ?? [];
+    const points = mergeAircraftTrailPoints(historicalPoints, existingPoints);
+    const latest = points[points.length - 1];
+    if (!latest || latest.lat !== plane.lat || latest.lon !== plane.lon) {
+      points.push({ lat: plane.lat, lon: plane.lon, time: plane.lastContact });
+    }
+    const freshPoints = points.filter((point) => now - point.time < 36 * 60 * 60 * 1000).slice(-160);
+    trails.set(plane.id, freshPoints);
+  });
+
+  Array.from(trails.keys()).forEach((id) => {
+    if (!trackedIds.has(id)) {
+      trails.delete(id);
+    }
+  });
+}
+
+function mergeAircraftTrailPoints(left: AircraftTrailPoint[], right: AircraftTrailPoint[]) {
+  const byTimeAndPosition = new Map<string, AircraftTrailPoint>();
+  [...left, ...right].forEach((point) => {
+    byTimeAndPosition.set(`${point.time}:${point.lat.toFixed(4)}:${point.lon.toFixed(4)}`, point);
+  });
+  return Array.from(byTimeAndPosition.values()).sort((a, b) => a.time - b.time);
+}
+
+function aircraftPopup(plane: AircraftState, isTracked = false) {
+  const label = plane.callsign || plane.id.toUpperCase();
+  const altitude = plane.altitude !== undefined ? `${Math.round(plane.altitude).toLocaleString()} m` : undefined;
+  const heading = plane.heading !== undefined ? `${Math.round(plane.heading)}° ${compassLabel(plane.heading)}` : undefined;
+  const vertical = plane.verticalRate !== undefined ? `${plane.verticalRate.toFixed(1)} m/s` : undefined;
+  const speed =
+    plane.flightStatus && (plane.onGround || (plane.velocity !== undefined && plane.velocity <= 8))
+      ? plane.flightStatus
+      : plane.velocity !== undefined
+        ? `${Math.round(plane.velocity)} km/h`
+        : undefined;
+  return `${popupTable([
+    ["Aircraft", escapeHtml(label)],
+    ["Type", plane.categoryLabel],
+    ["Origin", plane.originCountry],
+    ["Altitude", altitude],
+    ["Speed", speed],
+    ["Status", plane.flightStatusDetail],
+    ["Heading", heading],
+    ["Vertical rate", vertical],
+    ["Squawk", plane.squawk],
+    ["Last contact", new Date(plane.lastContact).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })],
+    ["Source", plane.sourceLabel]
+  ])}<button class="map-popup-action" type="button" data-aircraft-track="${escapeHtml(plane.id)}">${isTracked ? "Untrack trail" : "Track trail"}</button>`;
+}
+
+function bindAircraftPopupActions(popup: L.Popup, plane: AircraftState, onToggleAircraftTrack?: (id: string) => void) {
+  if (!onToggleAircraftTrack) return;
+  const element = popup.getElement();
+  const button = element?.querySelector<HTMLButtonElement>("[data-aircraft-track]");
+  if (!button) return;
+  L.DomEvent.disableClickPropagation(button);
+  button.addEventListener("click", () => {
+    onToggleAircraftTrack(plane.id);
+    popup.close();
+  });
+}
+
+function aviationIncidentPopup(incident: AviationIncident) {
+  return popupTable([
+    ["Report", escapeHtml(incident.title)],
+    ["Status", incident.confidence === "official" ? "Official" : "Reported"],
+    ["Place", escapeHtml(incident.place)],
+    ["Time", new Date(incident.time).toLocaleString()],
+    ["Source", `<a href="${escapeHtml(incident.sourceUrl)}" target="_blank" rel="noreferrer">${escapeHtml(incident.sourceDomain ?? incident.sourceLabel)}</a>`],
+    ["Details", escapeHtml(incident.summary)]
+  ]);
+}
+
+function compassLabel(direction: number) {
+  const labels = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
+  return labels[Math.round((((direction % 360) + 360) % 360) / 22.5) % labels.length];
+}
+
 function warningColor(warning: GdacsAlert) {
   const level = `${warning.levelCode ?? warning.alertLevel ?? ""}`.toLowerCase();
   if (level.includes("red") || level.includes("extreme")) return "#ef4444";
@@ -1724,9 +2077,285 @@ function nearestWrappedLongitude(longitude: number, referenceLongitude: number) 
   return longitude + Math.round((referenceLongitude - longitude) / 360) * 360;
 }
 
+interface OverlapSelectableItem {
+  id: string;
+  kind: string;
+  label: string;
+  detail?: string;
+  lat: number;
+  lon: number;
+  radiusPx: number;
+  popupHtml: string;
+  bindPopup?: (popup: L.Popup) => void;
+}
+
+function makeOverlapSelectorLayer(getItems: () => OverlapSelectableItem[]) {
+  interface OverlapSelectorInternal extends L.Layer {
+    _weatherMap?: L.Map;
+    _click: (event: L.LeafletMouseEvent) => void;
+    _popupOpen: (event: L.PopupEvent) => void;
+  }
+
+  const SelectorLayer = L.Layer.extend({
+    onAdd(this: OverlapSelectorInternal, map: L.Map) {
+      this._weatherMap = map;
+      map.on("click", this._click, this);
+      map.on("popupopen", this._popupOpen, this);
+    },
+    onRemove(this: OverlapSelectorInternal) {
+      this._weatherMap?.off("click", this._click, this);
+      this._weatherMap?.off("popupopen", this._popupOpen, this);
+    },
+    _click(this: OverlapSelectorInternal, event: L.LeafletMouseEvent) {
+      if (!this._weatherMap) return;
+      const candidates = overlappingItemsAtPoint(this._weatherMap, event.containerPoint, event.latlng.lng, getItems());
+      if (candidates.length < 2) return;
+
+      const popup = L.popup({ className: "selector-popup", closeButton: true, autoPan: true })
+        .setLatLng(event.latlng)
+        .setContent(overlapSelectorContent(candidates))
+        .openOn(this._weatherMap);
+
+      window.setTimeout(() => bindOverlapSelectorButtons(popup, candidates), 0);
+    },
+    _popupOpen(this: OverlapSelectorInternal, event: L.PopupEvent) {
+      if (!this._weatherMap) return;
+      const element = event.popup.getElement();
+      if (element?.querySelector(".map-overlap-selector")) return;
+      const latlng = event.popup.getLatLng();
+      if (!latlng) return;
+      const point = this._weatherMap.latLngToContainerPoint(latlng);
+      const candidates = overlappingItemsAtPoint(this._weatherMap, point, latlng.lng, getItems());
+      if (candidates.length < 2) return;
+
+      event.popup.setContent(overlapSelectorContent(candidates));
+      window.setTimeout(() => {
+        event.popup.getElement()?.classList.add("selector-popup");
+        bindOverlapSelectorButtons(event.popup, candidates);
+      }, 0);
+    }
+  });
+
+  return new SelectorLayer();
+}
+
+function overlappingItemsAtPoint(map: L.Map, point: L.Point, referenceLongitude: number, items: OverlapSelectableItem[]) {
+  const candidates = items
+    .map((item) => {
+      const itemPoint = map.latLngToContainerPoint([item.lat, nearestWrappedLongitude(item.lon, referenceLongitude)]);
+      return {
+        item,
+        distance: point.distanceTo(itemPoint)
+      };
+    })
+    .filter(({ item, distance }) => distance <= item.radiusPx)
+    .sort((left, right) => left.distance - right.distance)
+    .map(({ item }) => item);
+  const seen = new Set<string>();
+  return candidates
+    .filter((item) => {
+      if (seen.has(item.id)) return false;
+      seen.add(item.id);
+      return true;
+    })
+    .slice(0, 10);
+}
+
+function overlapSelectorContent(items: OverlapSelectableItem[]) {
+  return `<div class="map-overlap-selector">
+    <strong>Choose item</strong>
+    ${items
+      .map(
+        (item, index) =>
+          `<button type="button" data-overlap-index="${index}"><span>${escapeHtml(item.kind)}</span><b>${escapeHtml(
+            truncateText(item.label, 42)
+          )}</b>${item.detail ? `<em>${escapeHtml(truncateText(item.detail, 54))}</em>` : ""}</button>`
+      )
+      .join("")}
+  </div>`;
+}
+
+function bindOverlapSelectorButtons(popup: L.Popup, items: OverlapSelectableItem[]) {
+  const element = popup.getElement();
+  if (!element) return;
+  L.DomEvent.disableClickPropagation(element);
+  element.querySelectorAll<HTMLButtonElement>("[data-overlap-index]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const index = Number(button.dataset.overlapIndex);
+      const item = items[index];
+      if (!item) return;
+      popup.setContent(item.popupHtml);
+      window.setTimeout(() => item.bindPopup?.(popup), 0);
+    });
+  });
+}
+
+function selectableItemsForMap({
+  activeLayer,
+  showEarthquakes,
+  showWarnings,
+  showAircraftLocations,
+  showAircraftTrails,
+  showAviationIncidents,
+  showHomeMarker,
+  trackedAircraftIds,
+  earthquakes,
+  warnings,
+  riskEvents,
+  aircraft,
+  aviationIncidents,
+  selectedLocation,
+  inspectedLocation,
+  appLanguage,
+  onToggleAircraftTrack
+}: {
+  activeLayer: PrimaryLayer;
+  showEarthquakes: boolean;
+  showWarnings: boolean;
+  showAircraftLocations: boolean;
+  showAircraftTrails: boolean;
+  showAviationIncidents: boolean;
+  showHomeMarker: boolean;
+  trackedAircraftIds: string[];
+  earthquakes: EarthquakeEvent[];
+  warnings: GdacsAlert[];
+  riskEvents: RiskSignalEvent[];
+  aircraft: AircraftState[];
+  aviationIncidents: AviationIncident[];
+  selectedLocation?: MapLocationDetails;
+  inspectedLocation?: MapLocationDetails;
+  appLanguage: string;
+  onToggleAircraftTrack?: (id: string) => void;
+}): OverlapSelectableItem[] {
+  const items: OverlapSelectableItem[] = [];
+  const trackedIds = new Set(trackedAircraftIds);
+
+  if (showEarthquakes || activeLayer === "seismic") {
+    earthquakes.forEach((quake) => items.push(earthquakeSelectableItem(quake)));
+  }
+
+  if (showWarnings) {
+    warnings.forEach((warning) => {
+      if (typeof warning.lat !== "number" || typeof warning.lon !== "number") return;
+      items.push({
+        id: `warning-${warning.id}`,
+        kind: "Warning",
+        label: warning.title,
+        detail: warning.areaName,
+        lat: warning.lat,
+        lon: warning.lon,
+        radiusPx: 24,
+        popupHtml: warningPopup(warning, appLanguage),
+        bindPopup: (popup) => {
+          void translateWarningPopup(popup.getElement(), warning, appLanguage);
+        }
+      });
+    });
+  }
+
+  if (activeLayer === "risk") {
+    riskEvents.forEach((event) =>
+      items.push({
+        id: `risk-${event.id}`,
+        kind: "Risk",
+        label: event.eventLabel,
+        detail: event.place,
+        lat: event.lat,
+        lon: event.lon,
+        radiusPx: 26,
+        popupHtml: riskPopup(event)
+      })
+    );
+  }
+
+  if (showAircraftLocations || showAircraftTrails) {
+    aircraft.forEach((plane) =>
+      items.push({
+        id: `aircraft-${plane.id}`,
+        kind: "Aircraft",
+        label: plane.callsign || plane.id.toUpperCase(),
+        detail: [plane.originCountry, plane.flightStatus].filter(Boolean).join(" · "),
+        lat: plane.lat,
+        lon: plane.lon,
+        radiusPx: 22,
+        popupHtml: aircraftPopup(plane, trackedIds.has(plane.id)),
+        bindPopup: (popup) => bindAircraftPopupActions(popup, plane, onToggleAircraftTrack)
+      })
+    );
+  }
+
+  if (showAviationIncidents) {
+    aviationIncidents.forEach((incident) =>
+      items.push({
+        id: `aviation-${incident.id}`,
+        kind: "Aviation incident",
+        label: incident.title,
+        detail: incident.place,
+        lat: incident.lat,
+        lon: incident.lon,
+        radiusPx: 24,
+        popupHtml: aviationIncidentPopup(incident)
+      })
+    );
+  }
+
+  if (selectedLocation && showHomeMarker) {
+    items.push({
+      id: "home-location",
+      kind: selectedLocation.popupLabel ?? "Home",
+      label: selectedLocation.name,
+      detail: selectedLocation.label,
+      lat: selectedLocation.latitude,
+      lon: selectedLocation.longitude,
+      radiusPx: 26,
+      popupHtml: locationPopup(selectedLocation)
+    });
+  }
+
+  if (inspectedLocation) {
+    items.push({
+      id: "inspected-location",
+      kind: inspectedLocation.popupLabel ?? "Location",
+      label: inspectedLocation.name,
+      detail: inspectedLocation.label,
+      lat: inspectedLocation.latitude,
+      lon: inspectedLocation.longitude,
+      radiusPx: 26,
+      popupHtml: locationPopup(inspectedLocation)
+    });
+  }
+
+  return items;
+}
+
+function earthquakeSelectableItem(quake: EarthquakeEvent): OverlapSelectableItem {
+  return {
+    id: `quake-${quake.id}`,
+    kind: "Earthquake",
+    label: quake.magnitude !== undefined ? `M${quake.magnitude.toFixed(1)}` : "Earthquake",
+    detail: quake.place,
+    lat: quake.lat,
+    lon: quake.lon,
+    radiusPx: Math.max(18, Math.min(32, (quake.magnitude ?? 2.5) * 4.2)),
+    popupHtml: earthquakePopup(quake)
+  };
+}
+
+function leafletBoundsToAviationBounds(bounds: L.LatLngBounds): AviationBounds {
+  return {
+    south: bounds.getSouth(),
+    west: bounds.getWest(),
+    north: bounds.getNorth(),
+    east: bounds.getEast()
+  };
+}
+
 export function WeatherMap({
   activeLayer,
   showEarthquakes,
+  showAircraftLocations,
+  showAircraftTrails,
+  showAviationIncidents,
   showTimezones,
   showWarnings,
   showDayNight,
@@ -1736,13 +2365,20 @@ export function WeatherMap({
   earthquakes,
   warnings,
   riskEvents,
+  aircraft,
+  aviationIncidents,
+  trackedAircraftIds,
+  aircraftTracks,
   rainViewer,
   mapLanguage,
   appLanguage,
   homeFocusRequest = 0,
   inspectedFocusRequest = 0,
+  aircraftFocusRequest,
   selectedLocation,
-  inspectedLocation
+  inspectedLocation,
+  onViewportChange,
+  onToggleAircraftTrack
 }: WeatherMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<L.Map | null>(null);
@@ -1750,12 +2386,16 @@ export function WeatherMap({
   const activeLayerRef = useRef<L.Layer | null>(null);
   const earthquakeLayerRef = useRef<L.Layer | null>(null);
   const warningLayerRef = useRef<L.Layer | null>(null);
+  const aviationLayerRef = useRef<L.Layer | null>(null);
+  const overlapSelectorLayerRef = useRef<L.Layer | null>(null);
+  const aircraftTrailsRef = useRef<Map<string, AircraftTrailPoint[]>>(new Map());
   const timezoneLayerRef = useRef<L.Layer | null>(null);
   const dayNightLayerRef = useRef<L.Layer | null>(null);
   const localTimeHoverLayerRef = useRef<L.Layer | null>(null);
   const locationLayerRef = useRef<L.Layer | null>(null);
   const lastHomeFocusRequestRef = useRef(0);
   const lastInspectedFocusRequestRef = useRef(0);
+  const lastAircraftFocusRequestRef = useRef(0);
 
   const latestRainFrame = useMemo(() => {
     if (!rainViewer) return undefined;
@@ -1798,6 +2438,18 @@ export function WeatherMap({
 
   useEffect(() => {
     const map = mapRef.current;
+    if (!map || !onViewportChange) return;
+
+    const publishBounds = () => onViewportChange(leafletBoundsToAviationBounds(map.getBounds()));
+    publishBounds();
+    map.on("moveend zoomend", publishBounds);
+    return () => {
+      map.off("moveend zoomend", publishBounds);
+    };
+  }, [onViewportChange]);
+
+  useEffect(() => {
+    const map = mapRef.current;
     if (!map) return;
 
     if (activeLayer === "radar" && rainViewer && latestRainFrame && isRainRadarLayer(activeLayerRef.current)) {
@@ -1818,6 +2470,10 @@ export function WeatherMap({
 
     if (activeLayer === "wind") {
       nextLayer = makeWindLayer(weatherGrid, showDayNight);
+    }
+
+    if (activeLayer === "rainForecast") {
+      nextLayer = makeRainForecastLayer(weatherGrid, showDayNight);
     }
 
     if (activeLayer === "radar" && rainViewer && latestRainFrame) {
@@ -1885,6 +2541,7 @@ export function WeatherMap({
 
           bindWarningPopup(L.circleMarker([warning.lat, warning.lon + copyOffset], {
             radius: color === "#ef4444" ? 11 : 8,
+            bubblingMouseEvents: true,
             color: "#111827",
             weight: 1,
             fillColor: color,
@@ -1896,6 +2553,30 @@ export function WeatherMap({
     group.addTo(map);
     warningLayerRef.current = group;
   }, [showWarnings, warnings, appLanguage]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    if (aviationLayerRef.current) {
+      map.removeLayer(aviationLayerRef.current);
+      aviationLayerRef.current = null;
+    }
+
+    if (showAircraftLocations || showAircraftTrails || showAviationIncidents) {
+      aviationLayerRef.current = makeAviationLayer({
+        aircraft,
+        incidents: aviationIncidents,
+        showAircraftLocations,
+        showAircraftTrails,
+        showAviationIncidents,
+        trackedAircraftIds,
+        aircraftTracks,
+        onToggleAircraftTrack,
+        trails: aircraftTrailsRef.current
+      }).addTo(map);
+    }
+  }, [aircraft, aviationIncidents, showAircraftLocations, showAircraftTrails, showAviationIncidents, trackedAircraftIds, aircraftTracks, onToggleAircraftTrack]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -1963,6 +2644,21 @@ export function WeatherMap({
 
   useEffect(() => {
     const map = mapRef.current;
+    if (!map || !aircraftFocusRequest || aircraftFocusRequest.request === lastAircraftFocusRequestRef.current) return;
+    lastAircraftFocusRequestRef.current = aircraftFocusRequest.request;
+
+    const plane = aircraft.find((item) => item.id === aircraftFocusRequest.id);
+    if (!plane) return;
+    const center = map.getCenter();
+    const longitude = nearestWrappedLongitude(plane.lon, center.lng);
+    map.flyTo([plane.lat, longitude], Math.max(map.getZoom(), 7), {
+      duration: 0.85,
+      easeLinearity: 0.2
+    });
+  }, [aircraftFocusRequest, aircraft]);
+
+  useEffect(() => {
+    const map = mapRef.current;
     if (!map) return;
 
     if (locationLayerRef.current) {
@@ -1989,6 +2685,56 @@ export function WeatherMap({
     }
   }, [selectedLocation, inspectedLocation, showHomeMarker]);
 
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    if (overlapSelectorLayerRef.current) {
+      map.removeLayer(overlapSelectorLayerRef.current);
+      overlapSelectorLayerRef.current = null;
+    }
+
+    overlapSelectorLayerRef.current = makeOverlapSelectorLayer(() =>
+      selectableItemsForMap({
+        activeLayer,
+        showEarthquakes,
+        showWarnings,
+        showAircraftLocations,
+        showAircraftTrails,
+        showAviationIncidents,
+        showHomeMarker,
+        trackedAircraftIds,
+        earthquakes,
+        warnings,
+        riskEvents,
+        aircraft,
+        aviationIncidents,
+        selectedLocation,
+        inspectedLocation,
+        appLanguage,
+        onToggleAircraftTrack
+      })
+    ).addTo(map);
+  }, [
+    activeLayer,
+    showEarthquakes,
+    showWarnings,
+    showAircraftLocations,
+    showAircraftTrails,
+    showAviationIncidents,
+    showHomeMarker,
+    trackedAircraftIds,
+    earthquakes,
+    warnings,
+    riskEvents,
+    aircraft,
+    aviationIncidents,
+    selectedLocation,
+    inspectedLocation,
+    appLanguage,
+    onToggleAircraftTrack
+  ]);
+
   return <div className="map-root" ref={containerRef} />;
 }
 
@@ -2006,6 +2752,7 @@ function addLocationMarkers(group: L.LayerGroup, location: MapLocationDetails, c
   WORLD_COPY_OFFSETS.forEach((copyOffset) => {
     L.marker([location.latitude, location.longitude + copyOffset], {
       title: location.name,
+      bubblingMouseEvents: true,
       icon: L.divIcon({
         className,
         html: iconHtml,

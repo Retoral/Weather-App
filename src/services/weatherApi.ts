@@ -1,5 +1,10 @@
 import type {
   AirQuality,
+  AircraftState,
+  AircraftTrack,
+  AircraftTrackPoint,
+  AviationBounds,
+  AviationIncident,
   CityLocation,
   EarthquakeEvent,
   GdacsAlert,
@@ -34,12 +39,23 @@ const JMA_WARNING_MAP = "https://www.jma.go.jp/bosai/warning/data/warning/map.js
 const JMA_AREA_METADATA = "https://www.jma.go.jp/bosai/common/const/area.json";
 const INMET_ACTIVE_WARNINGS = "https://apiprevmet3.inmet.gov.br/avisos/ativos";
 const GDELT_LAST_UPDATE = "http://data.gdeltproject.org/gdeltv2/lastupdate.txt";
+const OPENSKY_STATES = "https://opensky-network.org/api/states/all";
+const OPENSKY_TRACKS = "https://opensky-network.org/api/tracks/all";
 const WEATHER_GRID_CACHE_KEY = "weather-watch:weather-grid-cache:v2";
 const RISK_EVENTS_CACHE_KEY = "weather-watch:risk-events-cache:v3";
+const AIRCRAFT_CACHE_PREFIX = "weather-watch:aircraft-cache:v1";
+const AIRCRAFT_TRACK_CACHE_PREFIX = "weather-watch:aircraft-track-cache:v1";
+const AVIATION_INCIDENTS_CACHE_KEY = "weather-watch:aviation-incidents-cache:v1";
 const WEATHER_GRID_FRESH_MS = 55 * 1000;
 const WEATHER_GRID_STALE_MS = 8 * 60 * 60 * 1000;
 const RISK_EVENTS_FRESH_MS = 55 * 1000;
 const RISK_EVENTS_STALE_MS = 45 * 60 * 1000;
+const AIRCRAFT_FRESH_MS = 22 * 1000;
+const AIRCRAFT_STALE_MS = 3 * 60 * 1000;
+const AIRCRAFT_TRACK_FRESH_MS = 2 * 60 * 1000;
+const AIRCRAFT_TRACK_STALE_MS = 20 * 60 * 1000;
+const AVIATION_INCIDENTS_FRESH_MS = 10 * 60 * 1000;
+const AVIATION_INCIDENTS_STALE_MS = 8 * 60 * 60 * 1000;
 const EARTHQUAKE_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 const EARTHQUAKE_PROVIDER_TIMEOUT_MS = 9 * 1000;
 const LOCAL_WEATHER_CACHE_PREFIX = "weather-watch:local-weather-cache";
@@ -438,8 +454,9 @@ function makeGrid() {
   return points;
 }
 
-export async function fetchWeatherGrid(signal?: AbortSignal, options: { freshMs?: number } = {}): Promise<WeatherGridPoint[]> {
-  const freshCache = readWeatherGridCache(options.freshMs ?? WEATHER_GRID_FRESH_MS);
+export async function fetchWeatherGrid(signal?: AbortSignal, options: { freshMs?: number; forecastHourOffset?: number } = {}): Promise<WeatherGridPoint[]> {
+  const forecastHourOffset = Math.max(0, Math.round(options.forecastHourOffset ?? 0));
+  const freshCache = readWeatherGridCache(options.freshMs ?? WEATHER_GRID_FRESH_MS, forecastHourOffset);
   if (freshCache) return freshCache;
 
   const grid = makeGrid();
@@ -452,55 +469,110 @@ export async function fetchWeatherGrid(signal?: AbortSignal, options: { freshMs?
       const url = new URL(OPEN_METEO_FORECAST);
       url.searchParams.set("latitude", batch.map((point) => point.lat).join(","));
       url.searchParams.set("longitude", batch.map((point) => point.lon).join(","));
-      url.searchParams.set(
-        "current",
-        [
-          "temperature_2m",
-          "weather_code",
-          "wind_speed_10m",
-          "wind_gusts_10m",
-          "wind_direction_10m",
-          "precipitation",
-          "pressure_msl",
-          "cloud_cover"
-        ].join(",")
-      );
       url.searchParams.set("timezone", "UTC");
-      url.searchParams.set("forecast_days", "1");
 
-      const data = await fetchJson<Array<{ latitude: number; longitude: number; current: Record<string, number> }>>(url.toString(), signal);
+      if (forecastHourOffset <= 0) {
+        url.searchParams.set(
+          "current",
+          [
+            "temperature_2m",
+            "weather_code",
+            "wind_speed_10m",
+            "wind_gusts_10m",
+            "wind_direction_10m",
+            "precipitation",
+            "pressure_msl",
+            "cloud_cover"
+          ].join(",")
+        );
+        url.searchParams.set("forecast_days", "1");
+      } else {
+        url.searchParams.set(
+          "hourly",
+          [
+            "temperature_2m",
+            "weather_code",
+            "wind_speed_10m",
+            "wind_gusts_10m",
+            "wind_direction_10m",
+            "precipitation",
+            "rain",
+            "showers",
+            "precipitation_probability",
+            "pressure_msl",
+            "cloud_cover"
+          ].join(",")
+        );
+        url.searchParams.set("forecast_days", String(Math.min(7, Math.max(1, Math.ceil((forecastHourOffset + 6) / 24)))));
+        url.searchParams.set("forecast_hours", String(Math.max(2, forecastHourOffset + 3)));
+      }
+
+      const data = await fetchJson<
+        Array<{
+          latitude: number;
+          longitude: number;
+          current?: Record<string, number>;
+          hourly?: Record<string, Array<number | string>>;
+        }>
+      >(url.toString(), signal);
       const rows = Array.isArray(data) ? data : [data];
 
       rows.forEach((row, rowIndex) => {
         const source = batch[rowIndex] ?? { lat: row.latitude, lon: row.longitude };
+        const sample = forecastHourOffset <= 0 ? row.current : forecastGridSample(row.hourly, forecastHourOffset);
+        if (!sample) return;
         result.push({
-          id: `${source.lat}:${source.lon}`,
+          id: `${source.lat}:${source.lon}:${forecastHourOffset}`,
           lat: source.lat,
           lon: source.lon,
-          temperature: row.current.temperature_2m,
-          weatherCode: row.current.weather_code,
-          windSpeed: row.current.wind_speed_10m,
-          windGust: row.current.wind_gusts_10m,
-          windDirection: row.current.wind_direction_10m ?? 0,
-          precipitation: row.current.precipitation,
-          pressure: row.current.pressure_msl,
-          cloudCover: row.current.cloud_cover
+          time: typeof sample.time === "string" ? sample.time : undefined,
+          temperature: numberValue(sample.temperature_2m) ?? 0,
+          weatherCode: numberValue(sample.weather_code) ?? 0,
+          windSpeed: numberValue(sample.wind_speed_10m) ?? 0,
+          windGust: numberValue(sample.wind_gusts_10m) ?? 0,
+          windDirection: numberValue(sample.wind_direction_10m) ?? 0,
+          precipitation: numberValue(sample.precipitation) ?? 0,
+          pressure: numberValue(sample.pressure_msl) ?? 0,
+          cloudCover: numberValue(sample.cloud_cover) ?? 0
         });
       });
     }
 
-    writeWeatherGridCache(result);
+    writeWeatherGridCache(result, forecastHourOffset);
     return result;
   } catch (err) {
-    const staleCache = readWeatherGridCache(WEATHER_GRID_STALE_MS);
+    const staleCache = readWeatherGridCache(WEATHER_GRID_STALE_MS, forecastHourOffset);
     if (staleCache) return staleCache;
     throw err;
   }
 }
 
-function readWeatherGridCache(maxAgeMs: number) {
+function forecastGridSample(hourly: Record<string, Array<number | string>> | undefined, forecastHourOffset: number) {
+  const times = hourly?.time;
+  if (!hourly || !Array.isArray(times) || times.length === 0) return undefined;
+
+  const target = Date.now() + forecastHourOffset * 60 * 60 * 1000;
+  let bestIndex = 0;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  times.forEach((time, index) => {
+    const parsed = typeof time === "string" ? Date.parse(time.endsWith("Z") ? time : `${time}Z`) : Number.NaN;
+    const distance = Math.abs(parsed - target);
+    if (Number.isFinite(distance) && distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  });
+
+  return Object.fromEntries(Object.entries(hourly).map(([key, values]) => [key, values[bestIndex]])) as Record<string, number | string>;
+}
+
+function weatherGridCacheKey(forecastHourOffset: number) {
+  return `${WEATHER_GRID_CACHE_KEY}:${forecastHourOffset}`;
+}
+
+function readWeatherGridCache(maxAgeMs: number, forecastHourOffset = 0) {
   try {
-    const raw = localStorage.getItem(WEATHER_GRID_CACHE_KEY);
+    const raw = localStorage.getItem(weatherGridCacheKey(forecastHourOffset));
     if (!raw) return undefined;
     const cached = JSON.parse(raw) as { fetchedAt: number; points: WeatherGridPoint[] };
     if (!Array.isArray(cached.points) || Date.now() - cached.fetchedAt > maxAgeMs) return undefined;
@@ -510,12 +582,466 @@ function readWeatherGridCache(maxAgeMs: number) {
   }
 }
 
-function writeWeatherGridCache(points: WeatherGridPoint[]) {
+function writeWeatherGridCache(points: WeatherGridPoint[], forecastHourOffset = 0) {
   try {
-    localStorage.setItem(WEATHER_GRID_CACHE_KEY, JSON.stringify({ fetchedAt: Date.now(), points }));
+    localStorage.setItem(weatherGridCacheKey(forecastHourOffset), JSON.stringify({ fetchedAt: Date.now(), points }));
   } catch {
     // Cache is only a resilience layer for provider rate limits.
   }
+}
+
+export async function fetchAircraftStates(
+  bounds?: AviationBounds,
+  signal?: AbortSignal,
+  options: { freshMs?: number } = {}
+): Promise<AircraftState[]> {
+  const cacheKey = aircraftCacheKey(bounds);
+  const freshCache = readAircraftCache(cacheKey, options.freshMs ?? AIRCRAFT_FRESH_MS);
+  if (freshCache) return freshCache.aircraft;
+
+  try {
+    const urls = openskyStateUrls(bounds);
+    const responses = await Promise.allSettled(urls.map((url) => fetchText(url, signal)));
+    const aircraft = dedupeAircraft(
+      responses.flatMap((response) => response.status === "fulfilled" ? parseOpenSkyStates(response.value) : [])
+    )
+      .sort((left, right) => right.lastContact - left.lastContact)
+      .slice(0, 1_200);
+
+    writeAircraftCache(cacheKey, aircraft);
+    return aircraft;
+  } catch (err) {
+    const staleCache = readAircraftCache(cacheKey, AIRCRAFT_STALE_MS);
+    if (staleCache) return staleCache.aircraft;
+    throw err;
+  }
+}
+
+export async function fetchAircraftStatesByIds(
+  aircraftIds: string[],
+  signal?: AbortSignal,
+  options: { freshMs?: number } = {}
+): Promise<AircraftState[]> {
+  const normalizedIds = Array.from(new Set(aircraftIds.map((id) => id.toLowerCase()).filter(Boolean))).slice(0, 12);
+  if (normalizedIds.length === 0) return [];
+
+  const cacheKey = `${AIRCRAFT_CACHE_PREFIX}:tracked:${normalizedIds.sort().join(",")}`;
+  const freshCache = readAircraftCache(cacheKey, options.freshMs ?? AIRCRAFT_FRESH_MS);
+  if (freshCache) return freshCache.aircraft;
+
+  try {
+    const aircraft = dedupeAircraft(parseOpenSkyStates(await fetchText(openSkyTrackedStateUrl(normalizedIds), signal), { includeGround: true }))
+      .sort((left, right) => right.lastContact - left.lastContact)
+      .slice(0, normalizedIds.length);
+    writeAircraftCache(cacheKey, aircraft);
+    return aircraft;
+  } catch (err) {
+    const staleCache = readAircraftCache(cacheKey, AIRCRAFT_STALE_MS);
+    if (staleCache) return staleCache.aircraft;
+    return [];
+  }
+}
+
+function readAircraftCache(cacheKey: string, maxAgeMs: number) {
+  try {
+    const raw = localStorage.getItem(cacheKey);
+    if (!raw) return undefined;
+    const cached = JSON.parse(raw) as { fetchedAt: number; aircraft: AircraftState[] };
+    if (!Array.isArray(cached.aircraft) || Date.now() - cached.fetchedAt > maxAgeMs) return undefined;
+    return cached;
+  } catch {
+    return undefined;
+  }
+}
+
+function writeAircraftCache(cacheKey: string, aircraft: AircraftState[]) {
+  try {
+    localStorage.setItem(cacheKey, JSON.stringify({ fetchedAt: Date.now(), aircraft }));
+  } catch {
+    // Flight data updates frequently; cache is best-effort only.
+  }
+}
+
+function aircraftCacheKey(bounds?: AviationBounds) {
+  const normalized = normalizedAviationBounds(bounds);
+  if (!normalized) return `${AIRCRAFT_CACHE_PREFIX}:global`;
+  return [
+    AIRCRAFT_CACHE_PREFIX,
+    normalized.south.toFixed(1),
+    normalized.west.toFixed(1),
+    normalized.north.toFixed(1),
+    normalized.east.toFixed(1)
+  ].join(":");
+}
+
+function openskyStateUrls(bounds?: AviationBounds) {
+  const normalized = normalizedAviationBounds(bounds);
+  if (!normalized) return [openSkyStateUrl()];
+
+  if (normalized.west <= normalized.east) {
+    return [openSkyStateUrl(normalized)];
+  }
+
+  return [
+    openSkyStateUrl({ ...normalized, east: 180 }),
+    openSkyStateUrl({ ...normalized, west: -180 })
+  ];
+}
+
+function openSkyStateUrl(bounds?: AviationBounds) {
+  const url = new URL(OPENSKY_STATES);
+  url.searchParams.set("extended", "1");
+  if (bounds) {
+    url.searchParams.set("lamin", bounds.south.toFixed(4));
+    url.searchParams.set("lomin", bounds.west.toFixed(4));
+    url.searchParams.set("lamax", bounds.north.toFixed(4));
+    url.searchParams.set("lomax", bounds.east.toFixed(4));
+  }
+  return url.toString();
+}
+
+function openSkyTrackedStateUrl(aircraftIds: string[]) {
+  const url = new URL(OPENSKY_STATES);
+  url.searchParams.set("extended", "1");
+  aircraftIds.forEach((id) => url.searchParams.append("icao24", id));
+  return url.toString();
+}
+
+function normalizedAviationBounds(bounds?: AviationBounds): AviationBounds | undefined {
+  if (!bounds) return undefined;
+  const south = Math.max(-85, Math.min(85, Math.min(bounds.south, bounds.north)));
+  const north = Math.max(-85, Math.min(85, Math.max(bounds.south, bounds.north)));
+  if (north - south < 0.05) return undefined;
+
+  const rawSpan = Math.abs(bounds.east - bounds.west);
+  if (rawSpan >= 340) return undefined;
+
+  return {
+    south,
+    north,
+    west: normalizeApiLongitude(bounds.west),
+    east: normalizeApiLongitude(bounds.east)
+  };
+}
+
+function normalizeApiLongitude(longitude: number) {
+  return ((longitude + 180) % 360 + 360) % 360 - 180;
+}
+
+function parseOpenSkyStates(text: string, options: { includeGround?: boolean } = {}): AircraftState[] {
+  const payload = JSON.parse(text) as { states?: unknown[][] };
+  const now = Date.now();
+  return (payload.states ?? [])
+    .map((row): AircraftState | undefined => {
+      const id = stringValue(row[0])?.toLowerCase();
+      const lat = numberValue(row[6]);
+      const lon = numberValue(row[5]);
+      const lastContactSeconds = numberValue(row[4]);
+      const onGround = row[8] === true;
+      if (!id || lat === undefined || lon === undefined || !lastContactSeconds || (!options.includeGround && onGround)) return undefined;
+
+      const lastContact = lastContactSeconds * 1000;
+      if (now - lastContact > 3 * 60 * 1000) return undefined;
+
+      const category = numberValue(row[17]);
+      return {
+        id,
+        callsign: stringValue(row[1]) || undefined,
+        originCountry: stringValue(row[2]) || undefined,
+        lat,
+        lon,
+        altitude: numberValue(row[7]) ?? undefined,
+        velocity: numberValue(row[9]) !== undefined ? Math.round((numberValue(row[9]) ?? 0) * 3.6) : undefined,
+        heading: numberValue(row[10]) ?? undefined,
+        verticalRate: numberValue(row[11]) ?? undefined,
+        onGround,
+        geoAltitude: numberValue(row[13]) ?? undefined,
+        squawk: stringValue(row[14]) || undefined,
+        category,
+        categoryLabel: aircraftCategoryLabel(category),
+        lastContact,
+        sourceLabel: "OpenSky"
+      };
+    })
+    .filter(isDefined);
+}
+
+function dedupeAircraft(aircraft: AircraftState[]) {
+  const seen = new Map<string, AircraftState>();
+  aircraft.forEach((item) => {
+    const existing = seen.get(item.id);
+    if (!existing || item.lastContact > existing.lastContact) seen.set(item.id, item);
+  });
+  return Array.from(seen.values());
+}
+
+function aircraftCategoryLabel(category?: number) {
+  const labels: Record<number, string> = {
+    2: "Light aircraft",
+    3: "Small aircraft",
+    4: "Large aircraft",
+    5: "High-vortex large",
+    6: "Heavy aircraft",
+    7: "High performance",
+    8: "Rotorcraft",
+    9: "Glider",
+    10: "Lighter-than-air",
+    11: "Parachutist",
+    12: "Ultralight",
+    14: "Unmanned aircraft"
+  };
+  return category !== undefined ? labels[category] ?? "Aircraft" : undefined;
+}
+
+export async function fetchAircraftTrack(
+  aircraftId: string,
+  signal?: AbortSignal,
+  options: { freshMs?: number } = {}
+): Promise<AircraftTrack | undefined> {
+  const normalizedId = aircraftId.toLowerCase();
+  const cacheKey = aircraftTrackCacheKey(normalizedId);
+  const freshCache = readAircraftTrackCache(cacheKey, options.freshMs ?? AIRCRAFT_TRACK_FRESH_MS);
+  if (freshCache) return freshCache.track;
+
+  try {
+    const url = new URL(OPENSKY_TRACKS);
+    url.searchParams.set("icao24", normalizedId);
+    url.searchParams.set("time", "0");
+
+    const track = parseOpenSkyTrack(await fetchText(url.toString(), signal), normalizedId);
+    writeAircraftTrackCache(cacheKey, track);
+    return track;
+  } catch (err) {
+    const staleCache = readAircraftTrackCache(cacheKey, AIRCRAFT_TRACK_STALE_MS);
+    if (staleCache) return staleCache.track;
+    return undefined;
+  }
+}
+
+function aircraftTrackCacheKey(aircraftId: string) {
+  return `${AIRCRAFT_TRACK_CACHE_PREFIX}:${aircraftId}`;
+}
+
+function readAircraftTrackCache(cacheKey: string, maxAgeMs: number) {
+  try {
+    const raw = localStorage.getItem(cacheKey);
+    if (!raw) return undefined;
+    const cached = JSON.parse(raw) as { fetchedAt: number; track?: AircraftTrack };
+    if (!cached.track || Date.now() - cached.fetchedAt > maxAgeMs) return undefined;
+    return cached;
+  } catch {
+    return undefined;
+  }
+}
+
+function writeAircraftTrackCache(cacheKey: string, track?: AircraftTrack) {
+  try {
+    localStorage.setItem(cacheKey, JSON.stringify({ fetchedAt: Date.now(), track }));
+  } catch {
+    // Track cache only avoids repeated per-aircraft requests.
+  }
+}
+
+function parseOpenSkyTrack(text: string, aircraftId: string): AircraftTrack | undefined {
+  const payload = JSON.parse(text) as {
+    icao24?: string;
+    callsign?: string | null;
+    startTime?: number;
+    endTime?: number;
+    path?: unknown[][];
+  };
+  const path = (payload.path ?? [])
+    .map((row): AircraftTrackPoint | undefined => {
+      const timeSeconds = numberValue(row[0]);
+      const lat = numberValue(row[1]);
+      const lon = numberValue(row[2]);
+      if (!timeSeconds || lat === undefined || lon === undefined) return undefined;
+      return {
+        time: timeSeconds * 1000,
+        lat,
+        lon,
+        altitude: numberValue(row[3]) ?? undefined,
+        heading: numberValue(row[4]) ?? undefined,
+        onGround: typeof row[5] === "boolean" ? row[5] : undefined
+      };
+    })
+    .filter(isDefined);
+
+  if (path.length < 2) return undefined;
+
+  return {
+    aircraftId: (payload.icao24 ?? aircraftId).toLowerCase(),
+    callsign: stringValue(payload.callsign) ?? undefined,
+    startTime: payload.startTime ? payload.startTime * 1000 : undefined,
+    endTime: payload.endTime ? payload.endTime * 1000 : undefined,
+    path,
+    sourceLabel: "OpenSky"
+  };
+}
+
+export async function fetchAviationIncidents(signal?: AbortSignal, options: { freshMs?: number } = {}): Promise<AviationIncident[]> {
+  const freshCache = readAviationIncidentsCache(options.freshMs ?? AVIATION_INCIDENTS_FRESH_MS);
+  if (freshCache) return freshCache.incidents;
+
+  try {
+    const manifest = await fetchText(GDELT_LAST_UPDATE, signal);
+    const gkgUrl = gdeltGkgUrl(manifest);
+    if (!gkgUrl) throw new Error("GDELT GKG feed unavailable");
+
+    const exportUrls = gdeltExportUrls(gkgUrl, 12);
+    const exports = await Promise.allSettled(exportUrls.map((url) => fetchZipText(url)));
+    const fetchedAt = new Date().toISOString();
+    const incidents = dedupeAviationIncidents(
+      exports.flatMap((result, index) =>
+        result.status === "fulfilled" ? parseGdeltAviationIncidents(result.value, exportUrls[index], fetchedAt) : []
+      )
+    )
+      .sort((left, right) => right.time - left.time)
+      .slice(0, 120);
+
+    writeAviationIncidentsCache(incidents);
+    return incidents;
+  } catch (err) {
+    const staleCache = readAviationIncidentsCache(AVIATION_INCIDENTS_STALE_MS);
+    if (staleCache) return staleCache.incidents;
+    throw err;
+  }
+}
+
+function readAviationIncidentsCache(maxAgeMs: number) {
+  try {
+    const raw = localStorage.getItem(AVIATION_INCIDENTS_CACHE_KEY);
+    if (!raw) return undefined;
+    const cached = JSON.parse(raw) as { fetchedAt: number; incidents: AviationIncident[] };
+    if (!Array.isArray(cached.incidents) || Date.now() - cached.fetchedAt > maxAgeMs) return undefined;
+    return cached;
+  } catch {
+    return undefined;
+  }
+}
+
+function writeAviationIncidentsCache(incidents: AviationIncident[]) {
+  try {
+    localStorage.setItem(AVIATION_INCIDENTS_CACHE_KEY, JSON.stringify({ fetchedAt: Date.now(), incidents }));
+  } catch {
+    // Incident reports are useful if cached, but never required.
+  }
+}
+
+function gdeltGkgUrl(manifest: string) {
+  return manifest
+    .split(/\r?\n/)
+    .map((line) => line.trim().split(/\s+/)[2])
+    .find((url) => url?.endsWith(".gkg.csv.zip"));
+}
+
+function parseGdeltAviationIncidents(text: string, exportUrl: string, fetchedAt: string): AviationIncident[] {
+  return text
+    .split(/\r?\n/)
+    .flatMap((line): AviationIncident[] => {
+      if (!line) return [];
+      const columns = line.split("\t");
+      if (columns.length < 9) return [];
+
+      const sourceUrl = columns[4] || exportUrl;
+      const sourceLabel = columns[3] || "GDELT";
+      const themes = `${columns[6] ?? ""} ${columns[7] ?? ""}`;
+      const names = columns[22] ?? "";
+      if (!isAviationIncidentRecord(sourceUrl, themes, names)) return [];
+
+      const locations = parseGdeltGkgLocations(`${columns[8] ?? ""};${columns[9] ?? ""}`);
+      if (locations.length === 0) return [];
+
+      const time = parseGdeltTimestamp(columns[1]) || Date.now();
+      const title = aviationIncidentTitle(sourceUrl, names);
+      const sourceDomain = gdeltSourceDomain(sourceUrl);
+
+      return locations.slice(0, 2).map((location, index) => ({
+        id: `gdelt-aviation-${columns[0]}-${index}`,
+        title,
+        summary: `${title} reported near ${location.place}.`,
+        lat: location.lat,
+        lon: location.lon,
+        place: location.place,
+        time,
+        sourceUrl,
+        sourceLabel,
+        sourceDomain,
+        confidence: "reported",
+        fetchedAt
+      }));
+    });
+}
+
+function isAviationIncidentRecord(sourceUrl: string, themes: string, names: string) {
+  const haystack = `${sourceUrl} ${themes} ${names}`.toLowerCase().replace(/[_-]+/g, " ");
+  const aviation = /\b(aircraft|airplane|plane|aviation|airline|flight|helicopter|jet|air force|airport|runway)\b/.test(haystack);
+  const incident = /\b(crash|crashes|crashed|accident|incident|collision|emergency landing|wreckage|fatal|downed|forced landing|runway excursion)\b/.test(haystack);
+  return aviation && incident && !/\b(stock|market|share|shares|index|indexes|crypto)\b.{0,30}\bcrash/.test(haystack);
+}
+
+function parseGdeltGkgLocations(value: string) {
+  const locations = value
+    .split(";")
+    .map((entry) => {
+      const parts = entry.split("#");
+      const lat = numberFromText(parts[4]);
+      const lon = numberFromText(parts[5]);
+      if (!parts[1] || lat === undefined || lon === undefined || (lat === 0 && lon === 0)) return undefined;
+      return {
+        type: Math.round(numberFromText(parts[0]) ?? 0),
+        place: parts[1],
+        lat,
+        lon
+      };
+    })
+    .filter(isDefined);
+
+  return locations.sort((left, right) => gkgLocationScore(right.type) - gkgLocationScore(left.type));
+}
+
+function gkgLocationScore(type: number) {
+  if (type === 3 || type === 4) return 4;
+  if (type === 2 || type === 5) return 3;
+  if (type === 1) return 1;
+  return 2;
+}
+
+function aviationIncidentTitle(sourceUrl: string, names: string) {
+  const primaryName = names
+    .split(";")
+    .map((entry) => entry.split(",")[0]?.trim())
+    .find((name) => name && /\b(air|flight|plane|aircraft|helicopter|airport|runway|crash|accident)\b/i.test(name));
+  if (primaryName) return primaryName;
+
+  try {
+    const url = new URL(sourceUrl);
+    const slug = decodeURIComponent(url.pathname.split("/").filter(Boolean).pop() ?? "");
+    const cleaned = slug
+      .replace(/\.[a-z0-9]+$/i, "")
+      .replace(/[-_]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (cleaned.length > 8) return titleCase(cleaned.slice(0, 96));
+  } catch {
+    // Fall through to a generic but honest label.
+  }
+
+  return "Reported aviation incident";
+}
+
+function dedupeAviationIncidents(incidents: AviationIncident[]) {
+  const seen = new Map<string, AviationIncident>();
+  incidents.forEach((incident) => {
+    const key = [
+      incident.sourceUrl,
+      Math.round(incident.lat * 10) / 10,
+      Math.round(incident.lon * 10) / 10
+    ].join(":");
+    const existing = seen.get(key);
+    if (!existing || incident.time > existing.time) seen.set(key, incident);
+  });
+  return Array.from(seen.values());
 }
 
 export async function fetchRiskEvents(signal?: AbortSignal, options: { freshMs?: number } = {}): Promise<RiskSignalEvent[]> {
@@ -578,7 +1104,7 @@ function gdeltExportUrl(manifest: string) {
 }
 
 function gdeltExportUrls(latestUrl: string, count: number) {
-  const match = latestUrl.match(/(\d{14})\.export\.CSV\.zip$/);
+  const match = latestUrl.match(/(\d{14})\.(?:export\.CSV|gkg\.csv)\.zip$/i);
   if (!match) return [latestUrl];
 
   const latestTimestamp = parseGdeltTimestamp(match[1]);
@@ -1842,6 +2368,10 @@ function stringValue(value: unknown) {
 function numberValue(value: unknown) {
   const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function titleCase(value: string) {
+  return value.replace(/\b[a-z]/g, (letter) => letter.toUpperCase());
 }
 
 function isGeometry(value: unknown): value is NonNullable<GdacsAlert["geometry"]> {

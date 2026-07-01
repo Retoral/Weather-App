@@ -1,6 +1,6 @@
 import type { Geometry } from "geojson";
 
-export type PrimaryLayer = "normal" | "temperature" | "wind" | "radar" | "seismic" | "risk";
+export type PrimaryLayer = "normal" | "temperature" | "wind" | "radar" | "rainForecast" | "seismic" | "risk";
 
 export type Severity = "quiet" | "watch" | "warning" | "danger";
 
@@ -65,6 +65,7 @@ export interface WeatherGridPoint {
   id: string;
   lat: number;
   lon: number;
+  time?: string;
   temperature: number;
   weatherCode: number;
   windSpeed: number;
@@ -73,6 +74,68 @@ export interface WeatherGridPoint {
   precipitation: number;
   pressure: number;
   cloudCover: number;
+}
+
+export interface AviationBounds {
+  south: number;
+  west: number;
+  north: number;
+  east: number;
+}
+
+export interface AircraftState {
+  id: string;
+  callsign?: string;
+  originCountry?: string;
+  lat: number;
+  lon: number;
+  altitude?: number;
+  geoAltitude?: number;
+  velocity?: number;
+  heading?: number;
+  verticalRate?: number;
+  onGround?: boolean;
+  squawk?: string;
+  category?: number;
+  categoryLabel?: string;
+  flightStatus?: string;
+  flightStatusDetail?: string;
+  flightStatusWarning?: boolean;
+  lastContact: number;
+  sourceLabel: string;
+}
+
+export interface AircraftTrackPoint {
+  lat: number;
+  lon: number;
+  altitude?: number;
+  heading?: number;
+  onGround?: boolean;
+  time: number;
+}
+
+export interface AircraftTrack {
+  aircraftId: string;
+  callsign?: string;
+  startTime?: number;
+  endTime?: number;
+  path: AircraftTrackPoint[];
+  sourceLabel: string;
+}
+
+export interface AviationIncident {
+  id: string;
+  title: string;
+  summary: string;
+  lat: number;
+  lon: number;
+  place: string;
+  time: number;
+  sourceUrl: string;
+  sourceLabel: string;
+  sourceDomain?: string;
+  confidence: "reported" | "official";
+  fetchedAt: string;
 }
 
 export interface EarthquakeEvent {
