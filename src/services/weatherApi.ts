@@ -6,6 +6,7 @@ import type {
   LocalSignal,
   LocalWeather,
   RainViewerState,
+  RiskSignalEvent,
   Severity,
   WeatherGridPoint
 } from "../types";
@@ -32,9 +33,13 @@ const HKO_WARNING_INFO = "https://data.weather.gov.hk/weatherAPI/opendata/weathe
 const JMA_WARNING_MAP = "https://www.jma.go.jp/bosai/warning/data/warning/map.json";
 const JMA_AREA_METADATA = "https://www.jma.go.jp/bosai/common/const/area.json";
 const INMET_ACTIVE_WARNINGS = "https://apiprevmet3.inmet.gov.br/avisos/ativos";
-const WEATHER_GRID_CACHE_KEY = "weather-watch:weather-grid-cache";
+const GDELT_LAST_UPDATE = "http://data.gdeltproject.org/gdeltv2/lastupdate.txt";
+const WEATHER_GRID_CACHE_KEY = "weather-watch:weather-grid-cache:v2";
+const RISK_EVENTS_CACHE_KEY = "weather-watch:risk-events-cache:v3";
 const WEATHER_GRID_FRESH_MS = 55 * 1000;
 const WEATHER_GRID_STALE_MS = 8 * 60 * 60 * 1000;
+const RISK_EVENTS_FRESH_MS = 55 * 1000;
+const RISK_EVENTS_STALE_MS = 45 * 60 * 1000;
 const EARTHQUAKE_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 const EARTHQUAKE_PROVIDER_TIMEOUT_MS = 9 * 1000;
 const LOCAL_WEATHER_CACHE_PREFIX = "weather-watch:local-weather-cache";
@@ -110,6 +115,14 @@ async function fetchText(url: string, signal?: AbortSignal, options: { preferBro
   }
 
   return fetchBrowserText(url, signal);
+}
+
+async function fetchZipText(url: string): Promise<string> {
+  if (!window.weatherWatch?.fetchZipText) {
+    throw new Error("Compressed live feed requires the desktop app");
+  }
+
+  return window.weatherWatch.fetchZipText(url);
 }
 
 export async function searchCities(query: string, language = "en", signal?: AbortSignal): Promise<CityLocation[]> {
@@ -441,7 +454,16 @@ export async function fetchWeatherGrid(signal?: AbortSignal, options: { freshMs?
       url.searchParams.set("longitude", batch.map((point) => point.lon).join(","));
       url.searchParams.set(
         "current",
-        ["temperature_2m", "weather_code", "wind_speed_10m", "wind_gusts_10m", "precipitation", "pressure_msl", "cloud_cover"].join(",")
+        [
+          "temperature_2m",
+          "weather_code",
+          "wind_speed_10m",
+          "wind_gusts_10m",
+          "wind_direction_10m",
+          "precipitation",
+          "pressure_msl",
+          "cloud_cover"
+        ].join(",")
       );
       url.searchParams.set("timezone", "UTC");
       url.searchParams.set("forecast_days", "1");
@@ -459,6 +481,7 @@ export async function fetchWeatherGrid(signal?: AbortSignal, options: { freshMs?
           weatherCode: row.current.weather_code,
           windSpeed: row.current.wind_speed_10m,
           windGust: row.current.wind_gusts_10m,
+          windDirection: row.current.wind_direction_10m ?? 0,
           precipitation: row.current.precipitation,
           pressure: row.current.pressure_msl,
           cloudCover: row.current.cloud_cover
@@ -493,6 +516,379 @@ function writeWeatherGridCache(points: WeatherGridPoint[]) {
   } catch {
     // Cache is only a resilience layer for provider rate limits.
   }
+}
+
+export async function fetchRiskEvents(signal?: AbortSignal, options: { freshMs?: number } = {}): Promise<RiskSignalEvent[]> {
+  const freshCache = readRiskEventsCache(options.freshMs ?? RISK_EVENTS_FRESH_MS);
+  if (freshCache) return freshCache.events;
+
+  try {
+    const manifest = await fetchText(GDELT_LAST_UPDATE, signal);
+    const exportUrl = gdeltExportUrl(manifest);
+    if (!exportUrl) throw new Error("GDELT export URL unavailable");
+
+    const staleCache = readRiskEventsCache(RISK_EVENTS_STALE_MS);
+    if (staleCache?.exportUrl === exportUrl) return staleCache.events;
+
+    const exportUrls = gdeltExportUrls(exportUrl, 5);
+    const exports = await Promise.allSettled(exportUrls.map((url) => fetchZipText(url)));
+    const fetchedAt = new Date().toISOString();
+    const events = dedupeRiskEvents(
+      exports.flatMap((result, index) =>
+        result.status === "fulfilled" ? parseGdeltRiskEvents(result.value, exportUrls[index], fetchedAt) : []
+      )
+    )
+      .sort(sortRiskEvents)
+      .slice(0, 450);
+
+    writeRiskEventsCache(exportUrl, events);
+    return events;
+  } catch (err) {
+    const staleCache = readRiskEventsCache(RISK_EVENTS_STALE_MS);
+    if (staleCache) return staleCache.events;
+    throw err;
+  }
+}
+
+function readRiskEventsCache(maxAgeMs: number) {
+  try {
+    const raw = localStorage.getItem(RISK_EVENTS_CACHE_KEY);
+    if (!raw) return undefined;
+    const cached = JSON.parse(raw) as { fetchedAt: number; exportUrl: string; events: RiskSignalEvent[] };
+    if (!Array.isArray(cached.events) || Date.now() - cached.fetchedAt > maxAgeMs) return undefined;
+    return cached;
+  } catch {
+    return undefined;
+  }
+}
+
+function writeRiskEventsCache(exportUrl: string, events: RiskSignalEvent[]) {
+  try {
+    localStorage.setItem(RISK_EVENTS_CACHE_KEY, JSON.stringify({ fetchedAt: Date.now(), exportUrl, events }));
+  } catch {
+    // Risk feeds are high-churn data; cache only improves resilience.
+  }
+}
+
+function gdeltExportUrl(manifest: string) {
+  return manifest
+    .split(/\r?\n/)
+    .map((line) => line.trim().split(/\s+/)[2])
+    .find((url) => url?.endsWith(".export.CSV.zip"));
+}
+
+function gdeltExportUrls(latestUrl: string, count: number) {
+  const match = latestUrl.match(/(\d{14})\.export\.CSV\.zip$/);
+  if (!match) return [latestUrl];
+
+  const latestTimestamp = parseGdeltTimestamp(match[1]);
+  const urls: string[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const timestamp = latestTimestamp - index * 15 * 60 * 1000;
+    urls.push(latestUrl.replace(match[1], formatGdeltTimestamp(timestamp)));
+  }
+
+  return urls;
+}
+
+function parseGdeltRiskEvents(text: string, exportUrl: string, fetchedAt: string): RiskSignalEvent[] {
+  return text
+    .split(/\r?\n/)
+    .map((line): RiskSignalEvent | undefined => {
+      if (!line) return undefined;
+      const columns = line.split("\t");
+      if (columns.length < 61 || !isRiskRootCode(columns[28])) return undefined;
+
+      const lat = numberFromText(columns[56]);
+      const lon = numberFromText(columns[57]);
+      if (lat === undefined || lon === undefined || (lat === 0 && lon === 0)) return undefined;
+
+      const eventCode = columns[26] || columns[27] || columns[28];
+      const eventRootCode = columns[28];
+      const eventLabel = gdeltEventLabel(eventCode, eventRootCode);
+      const kind = gdeltRiskKind(eventRootCode, eventCode);
+      const goldsteinScale = numberFromText(columns[30]);
+      const avgTone = numberFromText(columns[34]);
+      const mentions = Math.max(1, Math.round(numberFromText(columns[31]) ?? 1));
+      const sources = Math.max(1, Math.round(numberFromText(columns[32]) ?? 1));
+      const articles = Math.max(1, Math.round(numberFromText(columns[33]) ?? 1));
+      const geoType = Math.round(numberFromText(columns[51]) ?? 0) || undefined;
+      const place = columns[52] || columns[36] || columns[44] || "Reported location";
+      const actor1 = columns[6] || undefined;
+      const actor2 = columns[16] || undefined;
+      const actor1Type = gdeltActorTypeSummary(columns[12], columns[13], columns[14]);
+      const actor2Type = gdeltActorTypeSummary(columns[22], columns[23], columns[24]);
+      const actors = [actor1, actor2].filter(Boolean).join(" / ") || undefined;
+      const time = parseGdeltTimestamp(columns[59]) || parseGdeltDate(columns[1]) || Date.now();
+      const sourceUrl = columns[60] || exportUrl;
+      const severity = gdeltRiskSeverity(eventRootCode, goldsteinScale, avgTone, mentions, articles);
+
+      return {
+        id: `gdelt-${columns[0]}`,
+        title: gdeltRiskTitle(eventLabel, place),
+        summary: gdeltRiskSummary(eventLabel, place, actor1, actor2),
+        kind,
+        severity,
+        lat,
+        lon,
+        place,
+        country: columns[53] || columns[37] || columns[45] || undefined,
+        time,
+        sourceUrl,
+        sourceLabel: "GDELT",
+        eventCode,
+        eventRootCode,
+        eventLabel,
+        geoType,
+        geoPrecision: gdeltGeoPrecisionLabel(geoType),
+        goldsteinScale,
+        avgTone,
+        mentions,
+        sources,
+        articles,
+        actors,
+        actor1,
+        actor2,
+        actor1Type,
+        actor2Type,
+        sourceDomain: gdeltSourceDomain(sourceUrl),
+        fetchedAt
+      };
+    })
+    .filter(isDefined);
+}
+
+function isRiskRootCode(code: string) {
+  return ["13", "14", "15", "17", "18", "19", "20"].includes(code.padStart(2, "0"));
+}
+
+function gdeltRiskKind(rootCode: string, eventCode: string): RiskSignalEvent["kind"] {
+  const root = rootCode.padStart(2, "0");
+  if (root === "20" || eventCode.startsWith("20")) return "violence";
+  if (root === "19" || root === "18") return "conflict";
+  if (root === "14") return "protest";
+  if (root === "15") return "military";
+  return "threat";
+}
+
+const GDELT_CAMEO_EVENT_LABELS: Record<string, string> = {
+  "13": "Threat or coercion",
+  "130": "Threat",
+  "131": "Non-force threat",
+  "132": "Threat of administrative sanction",
+  "133": "Threat of protest",
+  "134": "Threat to halt talks",
+  "135": "Threat to halt mediation",
+  "136": "Threat to halt international involvement",
+  "137": "Threat of repression",
+  "138": "Threat of military force",
+  "1381": "Threat of blockade",
+  "1382": "Threat of occupation",
+  "1383": "Threat of unconventional violence",
+  "1384": "Threat of conventional attack",
+  "1385": "Threat involving WMD",
+  "139": "Ultimatum",
+  "14": "Protest or unrest",
+  "140": "Political dissent",
+  "141": "Demonstration or rally",
+  "1411": "Demonstration for leadership change",
+  "1412": "Demonstration for policy change",
+  "1413": "Demonstration for rights",
+  "1414": "Demonstration for institutional change",
+  "142": "Hunger strike",
+  "143": "Strike or boycott",
+  "144": "Obstruction or blockade",
+  "145": "Violent protest or riot",
+  "15": "Military or police posture",
+  "150": "Military or police display",
+  "151": "Increased police alert",
+  "152": "Increased military alert",
+  "153": "Police mobilization",
+  "154": "Armed-force mobilization",
+  "155": "Cyber-force mobilization",
+  "17": "Coercive action",
+  "170": "Coercion",
+  "171": "Property seizure or damage",
+  "172": "Administrative sanction",
+  "173": "Arrest or detention",
+  "174": "Expulsion or deportation",
+  "175": "Repression",
+  "176": "Cyber attack",
+  "18": "Assault or violence",
+  "180": "Unconventional violence",
+  "181": "Abduction or hostage-taking",
+  "182": "Physical assault",
+  "1821": "Sexual assault",
+  "1822": "Torture",
+  "1823": "Killing by assault",
+  "183": "Suicide bombing",
+  "184": "Human shield use",
+  "185": "Attempted assassination",
+  "186": "Assassination",
+  "19": "Armed conflict",
+  "190": "Conventional military force",
+  "191": "Blockade",
+  "192": "Occupation of territory",
+  "193": "Small-arms fighting",
+  "194": "Artillery or tank fighting",
+  "195": "Aerial weapons use",
+  "196": "Ceasefire violation",
+  "20": "Mass violence",
+  "200": "Unconventional mass violence",
+  "201": "Mass expulsion",
+  "202": "Mass killing",
+  "203": "Ethnic cleansing",
+  "204": "Weapons of mass destruction",
+  "2041": "Chemical weapons use",
+  "2042": "Biological weapons use",
+  "2043": "Radiological weapons use",
+  "2044": "Nuclear weapons use"
+};
+
+const GDELT_ACTOR_TYPE_LABELS: Record<string, string> = {
+  BUS: "business",
+  COP: "police",
+  CRM: "criminal group",
+  CVL: "civilian",
+  DEV: "development group",
+  EDU: "education",
+  ELI: "elite",
+  ENV: "environmental group",
+  GOV: "government",
+  HRI: "human rights group",
+  IGO: "international organization",
+  INS: "insurgent",
+  JUD: "judiciary",
+  LAB: "labor group",
+  LEG: "legislature",
+  MED: "media",
+  MIL: "military",
+  NGO: "NGO",
+  OPP: "opposition",
+  RAD: "radical group",
+  REB: "rebel group",
+  REF: "refugees",
+  SEP: "separatist",
+  SPY: "intelligence",
+  UAF: "armed force"
+};
+
+function gdeltEventLabel(eventCode: string, rootCode: string) {
+  const normalized = eventCode.replace(/\D/g, "");
+  for (let length = normalized.length; length >= 2; length -= 1) {
+    const label = GDELT_CAMEO_EVENT_LABELS[normalized.slice(0, length)];
+    if (label) return label;
+  }
+  return GDELT_CAMEO_EVENT_LABELS[rootCode.padStart(2, "0")] ?? "Risk signal";
+}
+
+function gdeltActorTypeSummary(...codes: Array<string | undefined>) {
+  const labels = codes
+    .map((code) => (code ? GDELT_ACTOR_TYPE_LABELS[code] ?? code : ""))
+    .filter(Boolean);
+  return Array.from(new Set(labels)).join(", ") || undefined;
+}
+
+function gdeltGeoPrecisionLabel(geoType?: number) {
+  if (geoType === 1) return "Country-level estimate";
+  if (geoType === 2) return "Region-level estimate";
+  if (geoType === 3) return "City-level estimate";
+  if (geoType === 4) return "Local landmark";
+  if (geoType === 5) return "Province/state-level estimate";
+  return undefined;
+}
+
+function gdeltRiskTitle(eventLabel: string, place: string) {
+  return `${eventLabel} near ${place || "reported location"}`;
+}
+
+function gdeltRiskSummary(eventLabel: string, place: string, actor1?: string, actor2?: string) {
+  const involved = [actor1, actor2].filter(Boolean).join(" and ");
+  if (involved && place) return `${eventLabel} involving ${involved} near ${place}.`;
+  if (involved) return `${eventLabel} involving ${involved}.`;
+  if (place) return `${eventLabel} reported near ${place}.`;
+  return `${eventLabel} reported by monitored news sources.`;
+}
+
+function gdeltSourceDomain(sourceUrl: string) {
+  try {
+    return new URL(sourceUrl).hostname.replace(/^www\./, "");
+  } catch {
+    return undefined;
+  }
+}
+
+function gdeltRiskSeverity(
+  rootCode: string,
+  goldsteinScale: number | undefined,
+  avgTone: number | undefined,
+  mentions: number,
+  articles: number
+): RiskSignalEvent["severity"] {
+  const root = rootCode.padStart(2, "0");
+  const impact = Math.log2(mentions + articles + 1);
+  const negativeTone = Math.max(0, -(avgTone ?? 0)) / 3;
+  const negativeAction = Math.max(0, -(goldsteinScale ?? 0)) / 2;
+  const score =
+    (root === "20" ? 4 : root === "19" ? 3.5 : root === "18" ? 3 : root === "17" ? 2.4 : root === "15" ? 1.8 : 1.4) +
+    impact * 0.28 +
+    negativeTone +
+    negativeAction;
+
+  if (score >= 7.1 || root === "20") return "danger";
+  if (score >= 4.8 || root === "19" || root === "18") return "warning";
+  return "watch";
+}
+
+function dedupeRiskEvents(events: RiskSignalEvent[]) {
+  const seen = new Map<string, RiskSignalEvent>();
+  events.forEach((event) => {
+    const key = [
+      event.eventCode,
+      event.actor1 ?? "",
+      event.actor2 ?? "",
+      Math.round(event.lat * 5) / 5,
+      Math.round(event.lon * 5) / 5
+    ].join(":");
+    const existing = seen.get(key);
+    if (!existing || riskEventScore(event) > riskEventScore(existing)) {
+      seen.set(key, event);
+    }
+  });
+  return Array.from(seen.values());
+}
+
+function sortRiskEvents(left: RiskSignalEvent, right: RiskSignalEvent) {
+  return riskEventScore(right) - riskEventScore(left) || right.time - left.time;
+}
+
+function riskEventScore(event: RiskSignalEvent) {
+  const severityScore = event.severity === "danger" ? 3 : event.severity === "warning" ? 2 : 1;
+  return severityScore * 100 + Math.log2(event.mentions + event.articles + 1) * 8 + Math.max(0, -(event.avgTone ?? 0));
+}
+
+function parseGdeltTimestamp(value: string) {
+  const match = value.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/);
+  if (!match) return 0;
+  return Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(match[4]), Number(match[5]), Number(match[6]));
+}
+
+function parseGdeltDate(value: string) {
+  const match = value.match(/^(\d{4})(\d{2})(\d{2})$/);
+  if (!match) return 0;
+  return Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+}
+
+function formatGdeltTimestamp(timestamp: number) {
+  const date = new Date(timestamp);
+  return [
+    date.getUTCFullYear(),
+    `${date.getUTCMonth() + 1}`.padStart(2, "0"),
+    `${date.getUTCDate()}`.padStart(2, "0"),
+    `${date.getUTCHours()}`.padStart(2, "0"),
+    `${date.getUTCMinutes()}`.padStart(2, "0"),
+    `${date.getUTCSeconds()}`.padStart(2, "0")
+  ].join("");
 }
 
 interface EarthquakeProvider {

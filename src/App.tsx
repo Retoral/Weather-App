@@ -14,6 +14,7 @@ import {
   RefreshCw,
   Search,
   Settings,
+  ShieldAlert,
   SlidersHorizontal,
   Thermometer,
   TriangleAlert,
@@ -28,10 +29,11 @@ import {
   fetchGdacsAlerts,
   fetchLocalWeather,
   fetchRainViewer,
+  fetchRiskEvents,
   fetchWeatherGrid,
   searchCities
 } from "./services/weatherApi";
-import type { CityLocation, EarthquakeEvent, GdacsAlert, LocalSignal, LocalWeather, PrimaryLayer, RainViewerState, WeatherGridPoint } from "./types";
+import type { CityLocation, EarthquakeEvent, GdacsAlert, LocalSignal, LocalWeather, PrimaryLayer, RainViewerState, RiskSignalEvent, WeatherGridPoint } from "./types";
 import { formatTemperature, formatWind, weatherCodeLabel } from "./utils/weatherCodes";
 
 const LOCATION_KEY = "weather-watch:home-location";
@@ -40,6 +42,7 @@ const APP_LANGUAGE_KEY = "weather-watch:app-language";
 const LIVE_REFRESH_MS = {
   earthquakes: 60 * 1000,
   radar: 60 * 1000,
+  risk: 60 * 1000,
   warnings: 60 * 1000,
   globalWeather: 60 * 1000,
   localWeather: 60 * 1000,
@@ -47,6 +50,7 @@ const LIVE_REFRESH_MS = {
   dayNight: 60 * 1000,
   focusedEarthquakes: 30 * 1000,
   focusedRadar: 60 * 1000,
+  focusedRisk: 60 * 1000,
   focusedWarnings: 60 * 1000,
   focusedWeatherGrid: 60 * 1000,
   activeWeatherFresh: 55 * 1000,
@@ -56,8 +60,10 @@ const LIVE_REFRESH_MS = {
 const mapViews: Array<{ id: PrimaryLayer; label: string; icon: LucideIcon }> = [
   { id: "normal", label: "Normal", icon: MapIcon },
   { id: "temperature", label: "Temperature", icon: Thermometer },
+  { id: "wind", label: "Wind Speed", icon: Wind },
   { id: "radar", label: "Rain Radar", icon: CloudRain },
-  { id: "seismic", label: "Seismic Movement", icon: Activity }
+  { id: "seismic", label: "Seismic Movement", icon: Activity },
+  { id: "risk", label: "Risk Signals", icon: ShieldAlert }
 ];
 
 const mapLanguages = [
@@ -95,8 +101,10 @@ const appCopy = {
     conditionLabels: {
       normal: "Normal",
       temperature: "Temperature",
+      wind: "Wind Speed",
       radar: "Rain Radar",
-      seismic: "Seismic Movement"
+      seismic: "Seismic Movement",
+      risk: "Risk Signals"
     },
     dayNight: "Day/night",
     desktopAlerts: "Desktop alerts",
@@ -111,6 +119,7 @@ const appCopy = {
     homeCitySettings: "Home city settings",
     homeMarker: "Home marker",
     humidity: "Humidity",
+    location: "Location",
     mapLanguage: "Map language",
     mapView: "Map view",
     nightMask: "Night mask updates every minute",
@@ -132,7 +141,15 @@ const appCopy = {
     refreshingLower: "refreshing",
     refreshingWeather: "Refreshing weather",
     retry: "Retry",
+    riskCritical: "Critical",
+    riskEvents: "Risk events",
+    riskHigh: "High",
+    riskLegendNote: "Live GDELT conflict, protest, threat, and military reports from roughly the past hour. Heat size follows severity and article volume.",
+    riskNearby: "Nearby risk signal",
+    riskSignals: "Risk signals",
+    riskWatch: "Watch",
     searchCity: "Search city",
+    searchLocation: "Search location",
     searching: "Searching...",
     setCity: "Set city",
     setHomeCity: "Set Home City",
@@ -150,6 +167,12 @@ const appCopy = {
     visibleOverlays: "Visible Overlays",
     warnings: "Warnings",
     weatherUnavailable: "Weather unavailable",
+    windBreezy: "Breezy",
+    windCalm: "Calm",
+    windGale: "Gale",
+    windScaleNote: "Interpolated 10 m wind from the live global weather grid",
+    windScaleTitle: "Wind speed",
+    windStrong: "Strong",
     zoomToHome: "Zoom to home"
   },
   sv: {
@@ -162,8 +185,10 @@ const appCopy = {
     conditionLabels: {
       normal: "Normal",
       temperature: "Temperatur",
+      wind: "Vindhastighet",
       radar: "Regnradar",
-      seismic: "Seismisk rörelse"
+      seismic: "Seismisk rörelse",
+      risk: "Risksignaler"
     },
     dayNight: "Dag/natt",
     desktopAlerts: "Skrivbordsvarningar",
@@ -178,6 +203,7 @@ const appCopy = {
     homeCitySettings: "Inställningar för hemstad",
     homeMarker: "Hemmarkör",
     humidity: "Luftfuktighet",
+    location: "Plats",
     mapLanguage: "Kartspråk",
     mapView: "Kartvy",
     nightMask: "Nattmask uppdateras varje minut",
@@ -199,7 +225,15 @@ const appCopy = {
     refreshingLower: "uppdaterar",
     refreshingWeather: "Uppdaterar väder",
     retry: "Försök igen",
+    riskCritical: "Kritisk",
+    riskEvents: "Riskhändelser",
+    riskHigh: "Hög",
+    riskLegendNote: "Live-rapporter från GDELT om konflikt, protest, hot och militär aktivitet från ungefär den senaste timmen. Värmens storlek följer allvarlighet och artikelvolym.",
+    riskNearby: "Risksignal nära",
+    riskSignals: "Risksignaler",
+    riskWatch: "Bevaka",
     searchCity: "Sök stad",
+    searchLocation: "Sök plats",
     searching: "Söker...",
     setCity: "Välj stad",
     setHomeCity: "Välj hemstad",
@@ -217,6 +251,12 @@ const appCopy = {
     visibleOverlays: "Synliga lager",
     warnings: "Varningar",
     weatherUnavailable: "Väder ej tillgängligt",
+    windBreezy: "Frisk",
+    windCalm: "Lugnt",
+    windGale: "Kuling",
+    windScaleNote: "Interpolerad 10 m-vind från det globala liveväderrutnätet",
+    windScaleTitle: "Vindhastighet",
+    windStrong: "Stark",
     zoomToHome: "Zooma till hem"
   },
   de: {
@@ -229,8 +269,10 @@ const appCopy = {
     conditionLabels: {
       normal: "Normal",
       temperature: "Temperatur",
+      wind: "Windgeschwindigkeit",
       radar: "Regenradar",
-      seismic: "Seismische Bewegung"
+      seismic: "Seismische Bewegung",
+      risk: "Risikosignale"
     },
     dayNight: "Tag/Nacht",
     desktopAlerts: "Desktop-Warnungen",
@@ -245,6 +287,7 @@ const appCopy = {
     homeCitySettings: "Heimatstadt-Einstellungen",
     homeMarker: "Heimatmarkierung",
     humidity: "Luftfeuchte",
+    location: "Ort",
     mapLanguage: "Kartensprache",
     mapView: "Kartenansicht",
     nightMask: "Nachtmaske wird jede Minute aktualisiert",
@@ -266,7 +309,15 @@ const appCopy = {
     refreshingLower: "aktualisiert",
     refreshingWeather: "Wetter wird aktualisiert",
     retry: "Erneut versuchen",
+    riskCritical: "Kritisch",
+    riskEvents: "Risikoereignisse",
+    riskHigh: "Hoch",
+    riskLegendNote: "Live-GDELT-Berichte zu Konflikten, Protesten, Bedrohungen und Militäraktivität aus ungefähr der letzten Stunde. Die Wärmgröße folgt Schweregrad und Artikelvolumen.",
+    riskNearby: "Risikosignal in der Nähe",
+    riskSignals: "Risikosignale",
+    riskWatch: "Beobachten",
     searchCity: "Stadt suchen",
+    searchLocation: "Ort suchen",
     searching: "Suche...",
     setCity: "Stadt wählen",
     setHomeCity: "Heimatstadt setzen",
@@ -284,6 +335,12 @@ const appCopy = {
     visibleOverlays: "Sichtbare Ebenen",
     warnings: "Warnungen",
     weatherUnavailable: "Wetter nicht verfügbar",
+    windBreezy: "Frisch",
+    windCalm: "Ruhig",
+    windGale: "Sturm",
+    windScaleNote: "Interpolierter 10-m-Wind aus dem globalen Live-Wetterraster",
+    windScaleTitle: "Windgeschwindigkeit",
+    windStrong: "Stark",
     zoomToHome: "Zur Heimat zoomen"
   },
   fr: {
@@ -296,8 +353,10 @@ const appCopy = {
     conditionLabels: {
       normal: "Normal",
       temperature: "Température",
+      wind: "Vitesse du vent",
       radar: "Radar pluie",
-      seismic: "Mouvement sismique"
+      seismic: "Mouvement sismique",
+      risk: "Signaux de risque"
     },
     dayNight: "Jour/nuit",
     desktopAlerts: "Alertes bureau",
@@ -312,6 +371,7 @@ const appCopy = {
     homeCitySettings: "Réglages de la ville domicile",
     homeMarker: "Repère domicile",
     humidity: "Humidité",
+    location: "Lieu",
     mapLanguage: "Langue de la carte",
     mapView: "Vue carte",
     nightMask: "Masque de nuit mis à jour chaque minute",
@@ -333,7 +393,15 @@ const appCopy = {
     refreshingLower: "actualisation",
     refreshingWeather: "Actualisation météo",
     retry: "Réessayer",
+    riskCritical: "Critique",
+    riskEvents: "Événements risque",
+    riskHigh: "Élevé",
+    riskLegendNote: "Rapports GDELT en direct sur conflits, protestations, menaces et activité militaire depuis environ la dernière heure. La taille de chaleur suit la gravité et le volume d'articles.",
+    riskNearby: "Signal de risque proche",
+    riskSignals: "Signaux de risque",
+    riskWatch: "Veille",
     searchCity: "Rechercher une ville",
+    searchLocation: "Rechercher un lieu",
     searching: "Recherche...",
     setCity: "Choisir la ville",
     setHomeCity: "Définir la ville domicile",
@@ -351,6 +419,12 @@ const appCopy = {
     visibleOverlays: "Couches visibles",
     warnings: "Alertes",
     weatherUnavailable: "Météo indisponible",
+    windBreezy: "Brise",
+    windCalm: "Calme",
+    windGale: "Coup de vent",
+    windScaleNote: "Vent à 10 m interpolé depuis la grille météo mondiale en direct",
+    windScaleTitle: "Vitesse du vent",
+    windStrong: "Fort",
     zoomToHome: "Zoomer sur le domicile"
   },
   es: {
@@ -363,8 +437,10 @@ const appCopy = {
     conditionLabels: {
       normal: "Normal",
       temperature: "Temperatura",
+      wind: "Velocidad del viento",
       radar: "Radar de lluvia",
-      seismic: "Movimiento sísmico"
+      seismic: "Movimiento sísmico",
+      risk: "Señales de riesgo"
     },
     dayNight: "Día/noche",
     desktopAlerts: "Alertas de escritorio",
@@ -379,6 +455,7 @@ const appCopy = {
     homeCitySettings: "Ajustes de ciudad local",
     homeMarker: "Marcador local",
     humidity: "Humedad",
+    location: "Lugar",
     mapLanguage: "Idioma del mapa",
     mapView: "Vista del mapa",
     nightMask: "La máscara nocturna se actualiza cada minuto",
@@ -400,7 +477,15 @@ const appCopy = {
     refreshingLower: "actualizando",
     refreshingWeather: "Actualizando clima",
     retry: "Reintentar",
+    riskCritical: "Crítico",
+    riskEvents: "Eventos de riesgo",
+    riskHigh: "Alto",
+    riskLegendNote: "Reportes GDELT en vivo sobre conflicto, protesta, amenaza y actividad militar de aproximadamente la última hora. El tamaño del calor sigue la gravedad y el volumen de artículos.",
+    riskNearby: "Señal de riesgo cercana",
+    riskSignals: "Señales de riesgo",
+    riskWatch: "Vigilancia",
     searchCity: "Buscar ciudad",
+    searchLocation: "Buscar lugar",
     searching: "Buscando...",
     setCity: "Elegir ciudad",
     setHomeCity: "Definir ciudad local",
@@ -418,6 +503,12 @@ const appCopy = {
     visibleOverlays: "Capas visibles",
     warnings: "Alertas",
     weatherUnavailable: "Clima no disponible",
+    windBreezy: "Brisa",
+    windCalm: "Calma",
+    windGale: "Temporal",
+    windScaleNote: "Viento a 10 m interpolado desde la cuadrícula meteorológica global en vivo",
+    windScaleTitle: "Velocidad viento",
+    windStrong: "Fuerte",
     zoomToHome: "Acercar a inicio"
   },
   it: {
@@ -430,8 +521,10 @@ const appCopy = {
     conditionLabels: {
       normal: "Normale",
       temperature: "Temperatura",
+      wind: "Velocità vento",
       radar: "Radar pioggia",
-      seismic: "Movimento sismico"
+      seismic: "Movimento sismico",
+      risk: "Segnali di rischio"
     },
     dayNight: "Giorno/notte",
     desktopAlerts: "Avvisi desktop",
@@ -446,6 +539,7 @@ const appCopy = {
     homeCitySettings: "Impostazioni città di casa",
     homeMarker: "Indicatore casa",
     humidity: "Umidità",
+    location: "Luogo",
     mapLanguage: "Lingua mappa",
     mapView: "Vista mappa",
     nightMask: "La maschera notte si aggiorna ogni minuto",
@@ -467,7 +561,15 @@ const appCopy = {
     refreshingLower: "aggiornamento",
     refreshingWeather: "Aggiornamento meteo",
     retry: "Riprova",
+    riskCritical: "Critico",
+    riskEvents: "Eventi di rischio",
+    riskHigh: "Alto",
+    riskLegendNote: "Report GDELT live su conflitti, proteste, minacce e attività militare dell'ultima ora circa. La dimensione della mappa segue gravità e volume di articoli.",
+    riskNearby: "Segnale di rischio vicino",
+    riskSignals: "Segnali di rischio",
+    riskWatch: "Osservazione",
     searchCity: "Cerca città",
+    searchLocation: "Cerca luogo",
     searching: "Ricerca...",
     setCity: "Scegli città",
     setHomeCity: "Imposta città di casa",
@@ -485,6 +587,12 @@ const appCopy = {
     visibleOverlays: "Livelli visibili",
     warnings: "Avvisi",
     weatherUnavailable: "Meteo non disponibile",
+    windBreezy: "Brezza",
+    windCalm: "Calmo",
+    windGale: "Burrasca",
+    windScaleNote: "Vento a 10 m interpolato dalla griglia meteo globale live",
+    windScaleTitle: "Velocità vento",
+    windStrong: "Forte",
     zoomToHome: "Zoom su casa"
   },
   ja: {
@@ -497,8 +605,10 @@ const appCopy = {
     conditionLabels: {
       normal: "通常",
       temperature: "気温",
+      wind: "風速",
       radar: "雨雲レーダー",
-      seismic: "地震活動"
+      seismic: "地震活動",
+      risk: "リスク信号"
     },
     dayNight: "昼/夜",
     desktopAlerts: "デスクトップ通知",
@@ -513,6 +623,7 @@ const appCopy = {
     homeCitySettings: "ホーム都市設定",
     homeMarker: "ホームマーカー",
     humidity: "湿度",
+    location: "場所",
     mapLanguage: "地図の言語",
     mapView: "地図表示",
     nightMask: "夜間マスクは毎分更新",
@@ -534,7 +645,15 @@ const appCopy = {
     refreshingLower: "更新中",
     refreshingWeather: "天気を更新中",
     retry: "再試行",
+    riskCritical: "重大",
+    riskEvents: "リスク事象",
+    riskHigh: "高",
+    riskLegendNote: "過去約1時間の紛争、抗議、脅威、軍事活動に関するGDELTライブ報告。ヒートの大きさは深刻度と記事量に応じます。",
+    riskNearby: "近くのリスク信号",
+    riskSignals: "リスク信号",
+    riskWatch: "注意",
     searchCity: "都市を検索",
+    searchLocation: "場所を検索",
     searching: "検索中...",
     setCity: "都市を設定",
     setHomeCity: "ホーム都市を設定",
@@ -552,6 +671,12 @@ const appCopy = {
     visibleOverlays: "表示レイヤー",
     warnings: "警報",
     weatherUnavailable: "天気を利用できません",
+    windBreezy: "やや強い",
+    windCalm: "穏やか",
+    windGale: "強風",
+    windScaleNote: "ライブ全球気象グリッドから補間した10m風",
+    windScaleTitle: "風速",
+    windStrong: "強い",
     zoomToHome: "ホームへズーム"
   },
   zh: {
@@ -564,8 +689,10 @@ const appCopy = {
     conditionLabels: {
       normal: "普通",
       temperature: "温度",
+      wind: "风速",
       radar: "降雨雷达",
-      seismic: "地震活动"
+      seismic: "地震活动",
+      risk: "风险信号"
     },
     dayNight: "昼/夜",
     desktopAlerts: "桌面提醒",
@@ -580,6 +707,7 @@ const appCopy = {
     homeCitySettings: "所在城市设置",
     homeMarker: "主页标记",
     humidity: "湿度",
+    location: "地点",
     mapLanguage: "地图语言",
     mapView: "地图视图",
     nightMask: "夜间遮罩每分钟更新",
@@ -601,7 +729,15 @@ const appCopy = {
     refreshingLower: "正在刷新",
     refreshingWeather: "正在刷新天气",
     retry: "重试",
+    riskCritical: "危急",
+    riskEvents: "风险事件",
+    riskHigh: "高",
+    riskLegendNote: "来自 GDELT 的近一小时冲突、抗议、威胁和军事活动实时报告。热度大小随严重程度和文章量变化。",
+    riskNearby: "附近风险信号",
+    riskSignals: "风险信号",
+    riskWatch: "关注",
     searchCity: "搜索城市",
+    searchLocation: "搜索地点",
     searching: "搜索中...",
     setCity: "设置城市",
     setHomeCity: "设置所在城市",
@@ -619,6 +755,12 @@ const appCopy = {
     visibleOverlays: "可见图层",
     warnings: "警报",
     weatherUnavailable: "天气不可用",
+    windBreezy: "微风",
+    windCalm: "平静",
+    windGale: "大风",
+    windScaleNote: "根据实时全球天气网格插值的 10 米风速",
+    windScaleTitle: "风速",
+    windStrong: "强",
     zoomToHome: "缩放到主页"
   }
 } satisfies Record<AppLanguage, Record<string, unknown>>;
@@ -703,6 +845,31 @@ function warningToSignal(warning: GdacsAlert): LocalSignal {
   };
 }
 
+function riskEventsNearLocation(events: RiskSignalEvent[], location: CityLocation) {
+  return events
+    .map((event) => ({
+      event,
+      distance: distanceKm(location.latitude, location.longitude, event.lat, event.lon)
+    }))
+    .filter(({ distance }) => distance <= 180)
+    .sort((left, right) => riskSignalSortScore(right.event, right.distance) - riskSignalSortScore(left.event, left.distance))
+    .map(({ event }) => event);
+}
+
+function riskSignalSortScore(event: RiskSignalEvent, distance: number) {
+  const severity = event.severity === "danger" ? 3 : event.severity === "warning" ? 2 : 1;
+  return severity * 120 - distance * 0.35 + Math.log2(event.articles + event.mentions + 1) * 7;
+}
+
+function riskEventToSignal(event: RiskSignalEvent, label: string): LocalSignal {
+  return {
+    id: `risk-${event.id}`,
+    title: label,
+    detail: [event.summary, event.actors ? `Involved: ${event.actors}` : undefined].filter(Boolean).join(" "),
+    severity: event.severity
+  };
+}
+
 function pointInGeometry(geometry: NonNullable<GdacsAlert["geometry"]>, lon: number, lat: number): boolean {
   if (geometry.type === "Polygon") return pointInPolygon(geometry.coordinates, lon, lat);
   if (geometry.type === "MultiPolygon") return geometry.coordinates.some((polygon) => pointInPolygon(polygon, lon, lat));
@@ -745,50 +912,86 @@ export function App() {
   const [showDayNight, setShowDayNight] = useState(false);
   const [showHomeMarker, setShowHomeMarker] = useState(true);
   const [filtersOpen, setFiltersOpen] = useState(false);
+  const [placeSearchOpen, setPlaceSearchOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(!loadSavedLocation());
   const [localOpen, setLocalOpen] = useState(false);
   const [homeLocation, setHomeLocation] = useState<CityLocation | undefined>(() => loadSavedLocation());
   const [homeFocusRequest, setHomeFocusRequest] = useState(0);
+  const [inspectedLocation, setInspectedLocation] = useState<CityLocation | undefined>();
+  const [inspectedFocusRequest, setInspectedFocusRequest] = useState(0);
   const [mapLanguage, setMapLanguage] = useState(() => loadSavedMapLanguage());
   const [appLanguage, setAppLanguage] = useState<AppLanguage>(() => loadSavedAppLanguage());
   const [cityQuery, setCityQuery] = useState("");
   const [cityResults, setCityResults] = useState<CityLocation[]>([]);
+  const [placeQuery, setPlaceQuery] = useState("");
+  const [placeResults, setPlaceResults] = useState<CityLocation[]>([]);
   const [localWeather, setLocalWeather] = useState<LocalWeather | undefined>();
+  const [inspectedWeather, setInspectedWeather] = useState<LocalWeather | undefined>();
   const [weatherGrid, setWeatherGrid] = useState<WeatherGridPoint[]>([]);
   const [earthquakes, setEarthquakes] = useState<EarthquakeEvent[]>([]);
   const [warnings, setWarnings] = useState<GdacsAlert[]>([]);
+  const [riskEvents, setRiskEvents] = useState<RiskSignalEvent[]>([]);
   const [rainViewer, setRainViewer] = useState<RainViewerState | undefined>();
   const [notificationPermission, setNotificationPermission] = useState(() =>
     typeof Notification === "undefined" ? "denied" : Notification.permission
   );
-  const [loading, setLoading] = useState({ global: false, local: false, search: false });
+  const [loading, setLoading] = useState({ global: false, local: false, search: false, placeSearch: false, inspected: false });
   const [error, setError] = useState<string | undefined>();
   const [localError, setLocalError] = useState<string | undefined>();
+  const [inspectedError, setInspectedError] = useState<string | undefined>();
   const [lastGlobalRefresh, setLastGlobalRefresh] = useState<string | undefined>();
   const [solarTimestamp, setSolarTimestamp] = useState(Date.now());
   const notifiedSignals = useRef<Set<string>>(new Set());
-  const refreshInFlight = useRef({ weatherGrid: false, earthquakes: false, radar: false, warnings: false });
+  const refreshInFlight = useRef({ weatherGrid: false, earthquakes: false, radar: false, warnings: false, risk: false });
+  const copy = appCopy[appLanguage];
 
   const weatherSignals = useMemo(() => deriveLocalSignals(localWeather), [localWeather]);
+  const inspectedWeatherSignals = useMemo(() => deriveLocalSignals(inspectedWeather), [inspectedWeather]);
   const localWarningSignals = useMemo(
     () => (homeLocation ? warnings.filter((warning) => warningCoversLocation(warning, homeLocation)).slice(0, 4).map(warningToSignal) : []),
     [warnings, homeLocation?.id, homeLocation?.latitude, homeLocation?.longitude]
   );
-  const localSignals = useMemo(() => [...localWarningSignals, ...weatherSignals], [localWarningSignals, weatherSignals]);
+  const inspectedWarningSignals = useMemo(
+    () => (inspectedLocation ? warnings.filter((warning) => warningCoversLocation(warning, inspectedLocation)).slice(0, 4).map(warningToSignal) : []),
+    [warnings, inspectedLocation?.id, inspectedLocation?.latitude, inspectedLocation?.longitude]
+  );
+  const localRiskSignals = useMemo(
+    () => (homeLocation ? riskEventsNearLocation(riskEvents, homeLocation).slice(0, 3).map((event) => riskEventToSignal(event, copy.riskNearby)) : []),
+    [riskEvents, homeLocation?.id, homeLocation?.latitude, homeLocation?.longitude, copy.riskNearby]
+  );
+  const inspectedRiskSignals = useMemo(
+    () => (inspectedLocation ? riskEventsNearLocation(riskEvents, inspectedLocation).slice(0, 3).map((event) => riskEventToSignal(event, copy.riskNearby)) : []),
+    [riskEvents, inspectedLocation?.id, inspectedLocation?.latitude, inspectedLocation?.longitude, copy.riskNearby]
+  );
+  const localSignals = useMemo(() => [...localWarningSignals, ...localRiskSignals, ...weatherSignals], [localWarningSignals, localRiskSignals, weatherSignals]);
+  const inspectedSignals = useMemo(
+    () => [...inspectedWarningSignals, ...inspectedRiskSignals, ...inspectedWeatherSignals],
+    [inspectedWarningSignals, inspectedRiskSignals, inspectedWeatherSignals]
+  );
   const activeWarnings = warnings.filter((warning) => warning.geometry || typeof warning.lat === "number" && typeof warning.lon === "number");
+  const highRiskEvents = riskEvents.filter((event) => event.severity === "danger" || event.severity === "warning");
+  const criticalRiskEvents = riskEvents.filter((event) => event.severity === "danger");
   const strongQuakes = earthquakes.filter((quake) => (quake.magnitude ?? 0) >= 4.5);
   const strongestQuake = earthquakes.reduce<EarthquakeEvent | undefined>(
     (strongest, quake) => (quake.magnitude ?? 0) > (strongest?.magnitude ?? 0) ? quake : strongest,
     undefined
   );
   const strongestQuakeLabel = strongestQuake?.magnitude !== undefined ? `M${strongestQuake.magnitude.toFixed(1)}` : "--";
-  const current = localWeather?.current;
-  const copy = appCopy[appLanguage];
+  const homeCurrent = localWeather?.current;
+  const inspectedCurrent = inspectedWeather?.current;
   const layerLabel = copy.conditionLabels[activeLayer];
   const mapLanguageLabel = mapLanguages.find((language) => language.id === mapLanguage)?.label ?? "English";
   const appLanguageLabel = appLanguages.find((language) => language.id === appLanguage)?.label ?? "English";
   const localWeatherStatus = localError ? copy.weatherUnavailable : loading.local ? copy.refreshingWeather : "Weather updating";
-  const localUpdatedLabel = localWeather?.fetchedAt ? timeAgo(localWeather.fetchedAt) : localError ? copy.unavailable : loading.local ? copy.refreshingLower : "--";
+  const inspectedWeatherStatus = inspectedError ? copy.weatherUnavailable : loading.inspected ? copy.refreshingWeather : "Weather updating";
+  const homeUpdatedLabel = localWeather?.fetchedAt ? timeAgo(localWeather.fetchedAt) : localError ? copy.unavailable : loading.local ? copy.refreshingLower : "--";
+  const inspectedUpdatedLabel = inspectedWeather?.fetchedAt
+    ? timeAgo(inspectedWeather.fetchedAt)
+    : inspectedError
+      ? copy.unavailable
+      : loading.inspected
+        ? copy.refreshingLower
+        : "--";
 
   function markLiveRefresh() {
     setLastGlobalRefresh(new Date().toISOString());
@@ -848,28 +1051,43 @@ export function App() {
     }
   }
 
+  async function refreshRiskFeed(force = false) {
+    if (refreshInFlight.current.risk) return;
+    refreshInFlight.current.risk = true;
+    try {
+      setRiskEvents(await fetchRiskEvents(undefined, { freshMs: force ? 0 : LIVE_REFRESH_MS.risk }));
+      markLiveRefresh();
+    } catch {
+      // Keep the last successful risk layer visible.
+    } finally {
+      refreshInFlight.current.risk = false;
+    }
+  }
+
   async function refreshGlobal(force = false) {
     setLoading((state) => ({ ...state, global: true }));
     setError(undefined);
     try {
-      const [gridResult, quakeResult, rainResult, gdacsResult] = await Promise.allSettled([
+      const [gridResult, quakeResult, rainResult, gdacsResult, riskResult] = await Promise.allSettled([
         fetchWeatherGrid(undefined, { freshMs: force ? 0 : LIVE_REFRESH_MS.backgroundWeatherFresh }),
         fetchEarthquakes(),
         fetchRainViewer(),
-        fetchGdacsAlerts().catch(() => [] as GdacsAlert[])
+        fetchGdacsAlerts().catch(() => [] as GdacsAlert[]),
+        fetchRiskEvents(undefined, { freshMs: force ? 0 : LIVE_REFRESH_MS.risk }).catch(() => [] as RiskSignalEvent[])
       ]);
 
       if (gridResult.status === "fulfilled") setWeatherGrid(gridResult.value);
       if (quakeResult.status === "fulfilled") setEarthquakes(quakeResult.value);
       if (rainResult.status === "fulfilled") setRainViewer(rainResult.value);
       if (gdacsResult.status === "fulfilled") setWarnings(gdacsResult.value);
+      if (riskResult.status === "fulfilled") setRiskEvents(riskResult.value);
 
-      const failedFeeds = [gridResult, quakeResult, rainResult, gdacsResult].filter((result) => result.status === "rejected").length;
-      if (failedFeeds === 4) {
+      const failedFeeds = [gridResult, quakeResult, rainResult, gdacsResult, riskResult].filter((result) => result.status === "rejected").length;
+      if (failedFeeds === 5) {
         setError("Unable to refresh live map feeds right now");
       }
 
-      if (failedFeeds < 4) {
+      if (failedFeeds < 5) {
         markLiveRefresh();
       }
       setSolarTimestamp(Date.now());
@@ -898,25 +1116,46 @@ export function App() {
     }
   }
 
+  async function refreshInspected(location = inspectedLocation, force = false) {
+    if (!location) {
+      setInspectedWeather(undefined);
+      setInspectedError(undefined);
+      return;
+    }
+    setLoading((state) => ({ ...state, inspected: true }));
+    setInspectedError(undefined);
+    try {
+      const weather = await fetchLocalWeather(location, undefined, { freshMs: force ? 0 : LIVE_REFRESH_MS.localWeatherFresh });
+      setInspectedWeather(weather);
+    } catch (err) {
+      setInspectedError(err instanceof Error ? err.message : "Unable to refresh local weather");
+    } finally {
+      setLoading((state) => ({ ...state, inspected: false }));
+    }
+  }
+
   useEffect(() => {
     void refreshGlobal(true);
     const weatherInterval = window.setInterval(() => void refreshWeatherGrid(), LIVE_REFRESH_MS.globalWeather);
     const quakeInterval = window.setInterval(() => void refreshEarthquakeFeed(), LIVE_REFRESH_MS.earthquakes);
     const radarInterval = window.setInterval(() => void refreshRadarFeed(), LIVE_REFRESH_MS.radar);
     const warningInterval = window.setInterval(() => void refreshWarningFeed(), LIVE_REFRESH_MS.warnings);
+    const riskInterval = window.setInterval(() => void refreshRiskFeed(), LIVE_REFRESH_MS.risk);
 
     return () => {
       window.clearInterval(weatherInterval);
       window.clearInterval(quakeInterval);
       window.clearInterval(radarInterval);
       window.clearInterval(warningInterval);
+      window.clearInterval(riskInterval);
     };
   }, []);
 
   useEffect(() => {
     const timers: number[] = [];
-    const needsWeatherGrid = activeLayer === "temperature";
+    const needsWeatherGrid = activeLayer === "temperature" || activeLayer === "wind";
     const needsRadar = activeLayer === "radar";
+    const needsRisk = activeLayer === "risk";
     const needsEarthquakes = activeLayer === "seismic" || showEarthquakes;
     const needsWarnings = showWarnings;
 
@@ -940,6 +1179,11 @@ export function App() {
       timers.push(window.setInterval(() => void refreshWarningFeed(), LIVE_REFRESH_MS.focusedWarnings));
     }
 
+    if (needsRisk) {
+      void refreshRiskFeed();
+      timers.push(window.setInterval(() => void refreshRiskFeed(), LIVE_REFRESH_MS.focusedRisk));
+    }
+
     return () => {
       timers.forEach((timer) => window.clearInterval(timer));
     };
@@ -959,6 +1203,12 @@ export function App() {
     const localInterval = window.setInterval(() => void refreshLocal(homeLocation), LIVE_REFRESH_MS.localWeather);
     return () => window.clearInterval(localInterval);
   }, [homeLocation?.id, homeLocation?.latitude, homeLocation?.longitude]);
+
+  useEffect(() => {
+    void refreshInspected(inspectedLocation, true);
+    const inspectedInterval = window.setInterval(() => void refreshInspected(inspectedLocation), LIVE_REFRESH_MS.localWeather);
+    return () => window.clearInterval(inspectedInterval);
+  }, [inspectedLocation?.id, inspectedLocation?.latitude, inspectedLocation?.longitude]);
 
   useEffect(() => {
     if (cityQuery.trim().length < 2) {
@@ -983,6 +1233,30 @@ export function App() {
       window.clearTimeout(timer);
     };
   }, [cityQuery, mapLanguage]);
+
+  useEffect(() => {
+    if (placeQuery.trim().length < 2) {
+      setPlaceResults([]);
+      return;
+    }
+
+    const controller = new AbortController();
+    const timer = window.setTimeout(async () => {
+      setLoading((state) => ({ ...state, placeSearch: true }));
+      try {
+        setPlaceResults(await searchCities(placeQuery.trim(), mapLanguage, controller.signal));
+      } catch {
+        setPlaceResults([]);
+      } finally {
+        setLoading((state) => ({ ...state, placeSearch: false }));
+      }
+    }, 220);
+
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [placeQuery, mapLanguage]);
 
   useEffect(() => {
     if (notificationPermission !== "granted") return;
@@ -1015,10 +1289,30 @@ export function App() {
     notifiedSignals.current.clear();
   }
 
+  function choosePlace(location: CityLocation) {
+    setInspectedLocation(location);
+    setInspectedWeather(undefined);
+    setInspectedError(undefined);
+    setPlaceQuery("");
+    setPlaceResults([]);
+    setPlaceSearchOpen(false);
+    setInspectedFocusRequest((value) => value + 1);
+    void refreshInspected(location, true);
+  }
+
+  function clearInspectedLocation() {
+    setInspectedLocation(undefined);
+    setInspectedWeather(undefined);
+    setInspectedError(undefined);
+    setPlaceQuery("");
+    setPlaceResults([]);
+  }
+
   function chooseMapLanguage(language: string) {
     setMapLanguage(language);
     saveMapLanguage(language);
     setCityResults([]);
+    setPlaceResults([]);
   }
 
   function chooseAppLanguage(language: string) {
@@ -1047,6 +1341,7 @@ export function App() {
   }
 
   const filterCount = [showEarthquakes, showWarnings, showTimezones, showDayNight, showHomeMarker].filter(Boolean).length;
+  const showPlaceResults = placeSearchOpen && (placeQuery.trim().length >= 2 || loading.placeSearch);
 
   return (
     <main className="app-shell">
@@ -1062,10 +1357,12 @@ export function App() {
           weatherGrid={weatherGrid}
           earthquakes={earthquakes}
           warnings={warnings}
+          riskEvents={riskEvents}
           rainViewer={rainViewer}
           mapLanguage={mapLanguage}
           appLanguage={appLanguage}
           homeFocusRequest={homeFocusRequest}
+          inspectedFocusRequest={inspectedFocusRequest}
           selectedLocation={
             homeLocation
               ? {
@@ -1075,7 +1372,22 @@ export function App() {
                   weather: localWeather?.current,
                   airQuality: localWeather?.airQuality,
                   fetchedAt: localWeather?.fetchedAt,
-                  weatherStatus: localWeatherStatus
+                  weatherStatus: localWeatherStatus,
+                  popupLabel: copy.home
+                }
+              : undefined
+          }
+          inspectedLocation={
+            inspectedLocation
+              ? {
+                  ...inspectedLocation,
+                  name: inspectedLocation.name,
+                  label: locationLabel(inspectedLocation),
+                  weather: inspectedWeather?.current,
+                  airQuality: inspectedWeather?.airQuality,
+                  fetchedAt: inspectedWeather?.fetchedAt,
+                  weatherStatus: inspectedWeatherStatus,
+                  popupLabel: copy.location
                 }
               : undefined
           }
@@ -1106,6 +1418,46 @@ export function App() {
               {copy.filters}
               <span>{filterCount}</span>
             </button>
+
+            <div className="toolbar-search-wrap">
+              <label className="toolbar-search">
+                <Search size={17} />
+                <input
+                  value={placeQuery}
+                  onChange={(event) => {
+                    setPlaceQuery(event.target.value);
+                    setPlaceSearchOpen(true);
+                  }}
+                  onFocus={() => setPlaceSearchOpen(true)}
+                  placeholder={copy.searchLocation}
+                  aria-label={copy.searchLocation}
+                />
+                {placeQuery && (
+                  <button type="button" title={copy.close} aria-label={copy.close} onClick={() => {
+                    setPlaceQuery("");
+                    setPlaceResults([]);
+                    setPlaceSearchOpen(false);
+                  }}>
+                    <X size={14} />
+                  </button>
+                )}
+              </label>
+
+              {showPlaceResults && (
+                <section className="floating-panel place-result-panel">
+                  <div className="result-list compact-results">
+                    {loading.placeSearch && <span className="subtle-line">{copy.searching}</span>}
+                    {!loading.placeSearch &&
+                      placeResults.map((result) => (
+                        <button type="button" key={`${result.id}-${result.latitude}`} onClick={() => choosePlace(result)}>
+                          <strong>{result.name}</strong>
+                          <span>{[result.admin1, result.country].filter(Boolean).join(", ")}</span>
+                        </button>
+                      ))}
+                  </div>
+                </section>
+              )}
+            </div>
 
             <button className="toolbar-button icon-only" type="button" title={copy.refreshData} aria-label={copy.refreshData} onClick={() => void refreshGlobal(true)}>
               <RefreshCw size={18} className={loading.global ? "spin" : ""} />
@@ -1220,133 +1572,249 @@ export function App() {
           )}
         </div>
 
-        <section className={localOpen ? "local-dock open" : "local-dock"}>
-          <div className="local-dock-toggle">
-            <button
-              className="local-home-focus"
-              type="button"
-              title={homeLocation ? copy.zoomToHome : copy.setHomeCity}
-              aria-label={homeLocation ? copy.zoomToHome : copy.setHomeCity}
-              onClick={focusHomeLocation}
-            >
-              <LocateFixed size={17} />
-            </button>
-            <button className="local-dock-collapse" type="button" onClick={() => setLocalOpen((value) => !value)} aria-expanded={localOpen}>
-              <span>{homeLocation ? homeLocation.name : copy.setCity}</span>
-              <ChevronDown size={16} />
-            </button>
-          </div>
-
-          {localOpen && (
-            <div className="local-dock-body">
-              <div className="local-dock-heading">
-                <div>
-                  <span className="eyebrow">{copy.home}</span>
-                  <h2>{homeLocation ? homeLocation.name : copy.setCity}</h2>
-                  <p>{locationLabel(homeLocation)}</p>
-                </div>
-                <button className="small-icon-button" type="button" title={copy.refreshLocalWeather} aria-label={copy.refreshLocalWeather} onClick={() => void refreshLocal(homeLocation, true)}>
-                  <RefreshCw size={17} className={loading.local ? "spin" : ""} />
-                </button>
-              </div>
-
-              {!homeLocation ? (
-                <button className="primary-action" type="button" onClick={() => setSettingsOpen(true)}>
-                  <LocateFixed size={18} />
-                  {copy.setHomeCity}
-                </button>
-              ) : current ? (
-                <>
-                  <div className="current-weather compact-weather">
-                    <div>
-                      <span className="temp-value">{formatTemperature(current.temperature_2m)}</span>
-                      <span className="condition-line">{weatherCodeLabel(current.weather_code)}</span>
-                    </div>
-                    <div className="weather-metrics">
-                      <span>
-                        <Wind size={15} />
-                        {formatWind(current.wind_speed_10m)}
-                      </span>
-                      <span>
-                        <CloudRain size={15} />
-                        {current.precipitation.toFixed(1)} mm
-                      </span>
-                    </div>
-                  </div>
-
-                  <div className="metric-row">
-                    <div>
-                      <span>{copy.feels}</span>
-                      <strong>{formatTemperature(current.apparent_temperature)}</strong>
-                    </div>
-                    <div>
-                      <span>{copy.gust}</span>
-                      <strong>{formatWind(current.wind_gusts_10m)}</strong>
-                    </div>
-                    <div>
-                      <span>{copy.humidity}</span>
-                      <strong>{Math.round(current.relative_humidity_2m)}%</strong>
-                    </div>
-                    <div>
-                      <span>{copy.aqi}</span>
-                      <strong>{localWeather.airQuality?.us_aqi ? Math.round(localWeather.airQuality.us_aqi) : "--"}</strong>
-                    </div>
-                  </div>
-                </>
-              ) : (
-                <div className={localError ? "local-status error" : "local-status"}>
-                  <RefreshCw size={17} className={loading.local ? "spin" : ""} />
+        <div className="location-dock-stack">
+          {inspectedLocation && (
+            <section className="local-dock inspected-dock open">
+              <div className="local-dock-body">
+                <div className="local-dock-heading">
                   <div>
-                    <strong>{localError ? copy.weatherUnavailable : copy.refreshingWeather}</strong>
-                    <span>{localError ?? copy.fetchingConditions}</span>
+                    <span className="eyebrow">{copy.location}</span>
+                    <h2>{inspectedLocation.name}</h2>
+                    <p>{locationLabel(inspectedLocation)}</p>
                   </div>
-                  <button type="button" onClick={() => void refreshLocal(homeLocation, true)} disabled={loading.local}>
-                    {copy.retry}
-                  </button>
+                  <div className="local-dock-actions">
+                    <button className="small-icon-button" type="button" title={copy.close} aria-label={copy.close} onClick={clearInspectedLocation}>
+                      <X size={17} />
+                    </button>
+                    <button
+                      className="small-icon-button"
+                      type="button"
+                      title={copy.refreshLocalWeather}
+                      aria-label={copy.refreshLocalWeather}
+                      onClick={() => void refreshInspected(inspectedLocation, true)}
+                    >
+                      <RefreshCw size={17} className={loading.inspected ? "spin" : ""} />
+                    </button>
+                  </div>
                 </div>
-              )}
 
-              <div className="signal-list">
-                {localSignals.length > 0 ? (
-                  localSignals.map((signal) => (
-                    <div className={`signal ${signal.severity}`} key={signal.id}>
-                      <TriangleAlert size={17} />
+                {inspectedCurrent ? (
+                  <>
+                    <div className="current-weather compact-weather">
                       <div>
-                        <strong>{signal.title}</strong>
-                        <span>{signal.detail}</span>
+                        <span className="temp-value">{formatTemperature(inspectedCurrent.temperature_2m)}</span>
+                        <span className="condition-line">{weatherCodeLabel(inspectedCurrent.weather_code)}</span>
+                      </div>
+                      <div className="weather-metrics">
+                        <span>
+                          <Wind size={15} />
+                          {formatWind(inspectedCurrent.wind_speed_10m)}
+                        </span>
+                        <span>
+                          <CloudRain size={15} />
+                          {inspectedCurrent.precipitation.toFixed(1)} mm
+                        </span>
                       </div>
                     </div>
-                  ))
-                ) : (
-                  <div className="signal quiet">
-                    <Bell size={17} />
-                    <div>
-                      <strong>{copy.quietLocally}</strong>
-                      <span>{homeLocation ? copy.noLocalSignals : copy.cityRequired}</span>
+
+                    <div className="metric-row">
+                      <div>
+                        <span>{copy.feels}</span>
+                        <strong>{formatTemperature(inspectedCurrent.apparent_temperature)}</strong>
+                      </div>
+                      <div>
+                        <span>{copy.gust}</span>
+                        <strong>{formatWind(inspectedCurrent.wind_gusts_10m)}</strong>
+                      </div>
+                      <div>
+                        <span>{copy.humidity}</span>
+                        <strong>{Math.round(inspectedCurrent.relative_humidity_2m)}%</strong>
+                      </div>
+                      <div>
+                        <span>{copy.aqi}</span>
+                        <strong>{inspectedWeather?.airQuality?.us_aqi ? Math.round(inspectedWeather.airQuality.us_aqi) : "--"}</strong>
+                      </div>
                     </div>
+                  </>
+                ) : (
+                  <div className={inspectedError ? "local-status error" : "local-status"}>
+                    <RefreshCw size={17} className={loading.inspected ? "spin" : ""} />
+                    <div>
+                      <strong>{inspectedError ? copy.weatherUnavailable : copy.refreshingWeather}</strong>
+                      <span>{inspectedError ?? copy.fetchingConditions}</span>
+                    </div>
+                    <button type="button" onClick={() => void refreshInspected(inspectedLocation, true)} disabled={loading.inspected}>
+                      {copy.retry}
+                    </button>
                   </div>
                 )}
-              </div>
 
-              <div className="panel-footer">
-                <span>{copy.updated} {localUpdatedLabel}</span>
-                {notificationPermission === "granted" ? (
-                  <span className="permission granted">
-                    <BellRing size={14} />
-                    {copy.desktopAlerts}
-                  </span>
-                ) : (
-                  <button className="text-button" type="button" onClick={() => void enableNotifications()}>
-                    <Bell size={14} />
-                    {copy.enableAlerts}
+                <div className="signal-list">
+                  {inspectedSignals.length > 0 ? (
+                    inspectedSignals.map((signal) => (
+                      <div className={`signal ${signal.severity}`} key={signal.id}>
+                        <TriangleAlert size={17} />
+                        <div>
+                          <strong>{signal.title}</strong>
+                          <span>{signal.detail}</span>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="signal quiet">
+                      <Bell size={17} />
+                      <div>
+                        <strong>{copy.quietLocally}</strong>
+                        <span>{copy.noLocalSignals}</span>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div className="panel-footer">
+                  <span>{copy.updated} {inspectedUpdatedLabel}</span>
+                  <button className="text-button" type="button" onClick={() => {
+                    chooseCity(inspectedLocation);
+                    clearInspectedLocation();
+                  }}>
+                    <Home size={14} />
+                    {copy.setHomeCity}
                   </button>
-                )}
+                </div>
               </div>
-            </div>
+            </section>
           )}
-        </section>
 
-        <div className={`legend${activeLayer === "radar" ? " radar-legend" : activeLayer === "seismic" ? " seismic-legend" : ""}`}>
+          <section className={localOpen ? "local-dock home-dock open" : "local-dock home-dock"}>
+            <div className="local-dock-toggle">
+              <button
+                className="local-home-focus"
+                type="button"
+                title={homeLocation ? copy.zoomToHome : copy.setHomeCity}
+                aria-label={homeLocation ? copy.zoomToHome : copy.setHomeCity}
+                onClick={focusHomeLocation}
+              >
+                <LocateFixed size={17} />
+              </button>
+              <button className="local-dock-collapse" type="button" onClick={() => setLocalOpen((value) => !value)} aria-expanded={localOpen}>
+                <span>{homeLocation ? homeLocation.name : copy.setCity}</span>
+                <ChevronDown size={16} />
+              </button>
+            </div>
+
+            {localOpen && (
+              <div className="local-dock-body">
+                <div className="local-dock-heading">
+                  <div>
+                    <span className="eyebrow">{copy.home}</span>
+                    <h2>{homeLocation ? homeLocation.name : copy.setCity}</h2>
+                    <p>{locationLabel(homeLocation)}</p>
+                  </div>
+                  <div className="local-dock-actions">
+                    <button className="small-icon-button" type="button" title={copy.refreshLocalWeather} aria-label={copy.refreshLocalWeather} onClick={() => void refreshLocal(homeLocation, true)}>
+                      <RefreshCw size={17} className={loading.local ? "spin" : ""} />
+                    </button>
+                  </div>
+                </div>
+
+                {!homeLocation ? (
+                  <button className="primary-action" type="button" onClick={() => setSettingsOpen(true)}>
+                    <LocateFixed size={18} />
+                    {copy.setHomeCity}
+                  </button>
+                ) : homeCurrent ? (
+                  <>
+                    <div className="current-weather compact-weather">
+                      <div>
+                        <span className="temp-value">{formatTemperature(homeCurrent.temperature_2m)}</span>
+                        <span className="condition-line">{weatherCodeLabel(homeCurrent.weather_code)}</span>
+                      </div>
+                      <div className="weather-metrics">
+                        <span>
+                          <Wind size={15} />
+                          {formatWind(homeCurrent.wind_speed_10m)}
+                        </span>
+                        <span>
+                          <CloudRain size={15} />
+                          {homeCurrent.precipitation.toFixed(1)} mm
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="metric-row">
+                      <div>
+                        <span>{copy.feels}</span>
+                        <strong>{formatTemperature(homeCurrent.apparent_temperature)}</strong>
+                      </div>
+                      <div>
+                        <span>{copy.gust}</span>
+                        <strong>{formatWind(homeCurrent.wind_gusts_10m)}</strong>
+                      </div>
+                      <div>
+                        <span>{copy.humidity}</span>
+                        <strong>{Math.round(homeCurrent.relative_humidity_2m)}%</strong>
+                      </div>
+                      <div>
+                        <span>{copy.aqi}</span>
+                        <strong>{localWeather?.airQuality?.us_aqi ? Math.round(localWeather.airQuality.us_aqi) : "--"}</strong>
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <div className={localError ? "local-status error" : "local-status"}>
+                    <RefreshCw size={17} className={loading.local ? "spin" : ""} />
+                    <div>
+                      <strong>{localError ? copy.weatherUnavailable : copy.refreshingWeather}</strong>
+                      <span>{localError ?? copy.fetchingConditions}</span>
+                    </div>
+                    <button type="button" onClick={() => void refreshLocal(homeLocation, true)} disabled={loading.local}>
+                      {copy.retry}
+                    </button>
+                  </div>
+                )}
+
+                <div className="signal-list">
+                  {localSignals.length > 0 ? (
+                    localSignals.map((signal) => (
+                      <div className={`signal ${signal.severity}`} key={signal.id}>
+                        <TriangleAlert size={17} />
+                        <div>
+                          <strong>{signal.title}</strong>
+                          <span>{signal.detail}</span>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="signal quiet">
+                      <Bell size={17} />
+                      <div>
+                        <strong>{copy.quietLocally}</strong>
+                        <span>{homeLocation ? copy.noLocalSignals : copy.cityRequired}</span>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div className="panel-footer">
+                  <span>{copy.updated} {homeUpdatedLabel}</span>
+                  {notificationPermission === "granted" ? (
+                    <span className="permission granted">
+                      <BellRing size={14} />
+                      {copy.desktopAlerts}
+                    </span>
+                  ) : (
+                    <button className="text-button" type="button" onClick={() => void enableNotifications()}>
+                      <Bell size={14} />
+                      {copy.enableAlerts}
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+          </section>
+        </div>
+
+        <div className={`legend${activeLayer === "radar" ? " radar-legend" : activeLayer === "seismic" ? " seismic-legend" : activeLayer === "risk" ? " risk-legend" : ""}`}>
           <div className="legend-title">
             <Globe2 size={15} />
             {layerLabel}
@@ -1356,6 +1824,29 @@ export function App() {
               <span>-30</span>
               <div />
               <span>50 C</span>
+            </div>
+          )}
+          {activeLayer === "wind" && (
+            <div className="wind-scale">
+              <div className="wind-scale-heading">
+                <span>{copy.windScaleTitle}</span>
+                <b>km/h</b>
+              </div>
+              <div className="wind-gradient" />
+              <div className="wind-scale-values" aria-hidden="true">
+                <span>0</span>
+                <span>15</span>
+                <span>35</span>
+                <span>60</span>
+                <span>90+</span>
+              </div>
+              <div className="wind-scale-labels">
+                <span>{copy.windCalm}</span>
+                <span>{copy.windBreezy}</span>
+                <span>{copy.windStrong}</span>
+                <span>{copy.windGale}</span>
+              </div>
+              <p>{copy.windScaleNote}</p>
             </div>
           )}
           {showEarthquakes && activeLayer !== "seismic" && (
@@ -1383,6 +1874,23 @@ export function App() {
                 <span>{copy.tsunamiAlert}</span>
               </div>
               <p>{copy.seismicLegendNote}</p>
+            </div>
+          )}
+          {activeLayer === "risk" && (
+            <div className="risk-scale">
+              <div>
+                <span className="risk-dot watch" />
+                <span>{copy.riskWatch}</span>
+              </div>
+              <div>
+                <span className="risk-dot warning" />
+                <span>{copy.riskHigh}</span>
+              </div>
+              <div>
+                <span className="risk-dot danger" />
+                <span>{copy.riskCritical}</span>
+              </div>
+              <p>{copy.riskLegendNote}</p>
             </div>
           )}
           {activeLayer === "radar" && (
@@ -1418,6 +1926,12 @@ export function App() {
               <span>{copy.observedEvents} {earthquakes.length}</span>
               <span>{copy.strongest} {strongestQuakeLabel}</span>
               <span>{copy.strong} {strongQuakes.length}</span>
+            </>
+          ) : activeLayer === "risk" ? (
+            <>
+              <span>{copy.riskEvents} {riskEvents.length}</span>
+              <span>{copy.riskHigh} {highRiskEvents.length}</span>
+              <span>{copy.riskCritical} {criticalRiskEvents.length}</span>
             </>
           ) : (
             <>

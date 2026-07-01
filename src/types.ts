@@ -1,6 +1,6 @@
 import type { Geometry } from "geojson";
 
-export type PrimaryLayer = "normal" | "temperature" | "radar" | "seismic";
+export type PrimaryLayer = "normal" | "temperature" | "wind" | "radar" | "seismic" | "risk";
 
 export type Severity = "quiet" | "watch" | "warning" | "danger";
 
@@ -69,6 +69,7 @@ export interface WeatherGridPoint {
   weatherCode: number;
   windSpeed: number;
   windGust: number;
+  windDirection: number;
   precipitation: number;
   pressure: number;
   cloudCover: number;
@@ -112,6 +113,38 @@ export interface GdacsAlert {
   lat?: number;
   lon?: number;
   geometry?: Geometry;
+}
+
+export interface RiskSignalEvent {
+  id: string;
+  title: string;
+  summary: string;
+  kind: "conflict" | "violence" | "protest" | "threat" | "military";
+  severity: Severity;
+  lat: number;
+  lon: number;
+  place: string;
+  country?: string;
+  time: number;
+  sourceUrl: string;
+  sourceLabel: string;
+  eventCode: string;
+  eventRootCode: string;
+  eventLabel: string;
+  geoType?: number;
+  geoPrecision?: string;
+  goldsteinScale?: number;
+  avgTone?: number;
+  mentions: number;
+  sources: number;
+  articles: number;
+  actors?: string;
+  actor1?: string;
+  actor2?: string;
+  actor1Type?: string;
+  actor2Type?: string;
+  sourceDomain?: string;
+  fetchedAt: string;
 }
 
 export interface RainFrame {
