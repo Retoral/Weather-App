@@ -15,7 +15,8 @@ import type {
   Severity,
   WeatherGridPoint
 } from "../types";
-import { weatherCodeLabel } from "../utils/weatherCodes";
+import { formatRain, formatTemperature, formatWind, weatherCodeLabel } from "../utils/weatherCodes";
+import type { RainUnit, TemperatureUnit, WindUnit } from "../utils/weatherCodes";
 
 const OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast";
 const OPEN_METEO_GEOCODING = "https://geocoding-api.open-meteo.com/v1/search";
@@ -41,12 +42,12 @@ const INMET_ACTIVE_WARNINGS = "https://apiprevmet3.inmet.gov.br/avisos/ativos";
 const GDELT_LAST_UPDATE = "http://data.gdeltproject.org/gdeltv2/lastupdate.txt";
 const OPENSKY_STATES = "https://opensky-network.org/api/states/all";
 const OPENSKY_TRACKS = "https://opensky-network.org/api/tracks/all";
-const WEATHER_GRID_CACHE_KEY = "weather-watch:weather-grid-cache:v2";
+const WEATHER_GRID_CACHE_KEY = "weather-watch:weather-grid-cache:v3";
 const RISK_EVENTS_CACHE_KEY = "weather-watch:risk-events-cache:v3";
 const AIRCRAFT_CACHE_PREFIX = "weather-watch:aircraft-cache:v1";
 const AIRCRAFT_TRACK_CACHE_PREFIX = "weather-watch:aircraft-track-cache:v1";
 const AVIATION_INCIDENTS_CACHE_KEY = "weather-watch:aviation-incidents-cache:v1";
-const WEATHER_GRID_FRESH_MS = 55 * 1000;
+const WEATHER_GRID_FRESH_MS = 9 * 60 * 1000;
 const WEATHER_GRID_STALE_MS = 8 * 60 * 60 * 1000;
 const RISK_EVENTS_FRESH_MS = 55 * 1000;
 const RISK_EVENTS_STALE_MS = 45 * 60 * 1000;
@@ -59,10 +60,12 @@ const AVIATION_INCIDENTS_STALE_MS = 8 * 60 * 60 * 1000;
 const EARTHQUAKE_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 const EARTHQUAKE_PROVIDER_TIMEOUT_MS = 9 * 1000;
 const LOCAL_WEATHER_CACHE_PREFIX = "weather-watch:local-weather-cache";
-const LOCAL_WEATHER_FRESH_MS = 55 * 1000;
+const LOCAL_WEATHER_FRESH_MS = 9 * 60 * 1000;
 const LOCAL_WEATHER_STALE_MS = 6 * 60 * 60 * 1000;
 const PROVIDER_COOLDOWN_PREFIX = "weather-watch:provider-cooldown";
 const RATE_LIMIT_COOLDOWN_MS = 10 * 60 * 1000;
+const WEATHER_GRID_PROVIDER = "open-meteo-grid";
+const WEATHER_GRID_FAILURE_COOLDOWN_MS = 30 * 60 * 1000;
 
 class WeatherRequestError extends Error {
   constructor(
@@ -75,16 +78,52 @@ class WeatherRequestError extends Error {
   }
 }
 
+class WeatherProviderPayloadError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WeatherProviderPayloadError";
+  }
+}
+
 async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
-  const response = await fetch(url, { signal });
-  if (!response.ok) {
-    throw new WeatherRequestError(`Request failed with ${response.status}`, response.status, url);
+  if (shouldPreferBridgeJson(url) && window.weatherWatch?.fetchText) {
+    return parseProviderJsonText<T>(await window.weatherWatch.fetchText(url));
   }
-  const data = await response.json();
+
+  try {
+    const response = await fetch(url, { signal, cache: "no-store" });
+    if (!response.ok) {
+      throw new WeatherRequestError(`Request failed with ${response.status}`, response.status, url);
+    }
+    return validateProviderJson(await response.json()) as T;
+  } catch (browserError) {
+    if (browserError instanceof WeatherRequestError || browserError instanceof WeatherProviderPayloadError || !window.weatherWatch?.fetchText) {
+      throw browserError;
+    }
+
+    return parseProviderJsonText<T>(await window.weatherWatch.fetchText(url));
+  }
+}
+
+function shouldPreferBridgeJson(url: string) {
+  try {
+    const parsed = new URL(url);
+    return ["api.open-meteo.com", "air-quality-api.open-meteo.com", "geocoding-api.open-meteo.com"].includes(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function validateProviderJson(data: unknown) {
   if (data && typeof data === "object" && "error" in data && data.error === true) {
-    throw new Error(typeof data.reason === "string" ? data.reason : "Weather data request failed");
+    const reason = "reason" in data && typeof data.reason === "string" ? data.reason : "Weather data request failed";
+    throw new WeatherProviderPayloadError(reason);
   }
-  return data as T;
+  return data;
+}
+
+function parseProviderJsonText<T>(text: string): T {
+  return validateProviderJson(JSON.parse(text)) as T;
 }
 
 async function fetchJsonViaText<T>(url: string, signal?: AbortSignal): Promise<T> {
@@ -93,7 +132,7 @@ async function fetchJsonViaText<T>(url: string, signal?: AbortSignal): Promise<T
   } catch (browserError) {
     const text = await fetchText(url, signal);
     try {
-      return JSON.parse(text) as T;
+      return parseProviderJsonText<T>(text);
     } catch {
       throw browserError;
     }
@@ -101,7 +140,7 @@ async function fetchJsonViaText<T>(url: string, signal?: AbortSignal): Promise<T
 }
 
 async function fetchBrowserText(url: string, signal?: AbortSignal): Promise<string> {
-  const response = await fetch(url, { signal });
+  const response = await fetch(url, { signal, cache: "no-store" });
   if (!response.ok) {
     throw new WeatherRequestError(`Request failed with ${response.status}`, response.status, url);
   }
@@ -330,7 +369,10 @@ function clearProviderCooldown(provider: string) {
 
 function shouldCooldownProvider(error: unknown) {
   if (error instanceof WeatherRequestError) return error.status === 429 || error.status === 403;
-  return error instanceof Error && (/\b(?:403|429)\b/.test(error.message) || /forbidden|rate limit|too many requests/i.test(error.message));
+  return error instanceof Error && (
+    /\b(?:400|403|429)\b/.test(error.message) ||
+    /forbidden|rate limit|too many requests|daily api request limit|cert_|certificate|ssl|handshake|fetch failed/i.test(error.message)
+  );
 }
 
 interface MetNorwayForecast {
@@ -444,8 +486,16 @@ function isSnowCode(code: number) {
   return [71, 73, 75, 77, 85, 86].includes(code);
 }
 
-function makeGrid() {
-  const points: { lat: number; lon: number }[] = [];
+type WeatherGridCoordinate = { lat: number; lon: number };
+
+function makeGrid(options: { bounds?: AviationBounds; step?: number; maxPoints?: number } = {}): WeatherGridCoordinate[] {
+  if (options.bounds) return makeBoundedGrid(options.bounds, options.step ?? 2.5, options.maxPoints ?? 220);
+
+  return makeGlobalGrid();
+}
+
+function makeGlobalGrid(): WeatherGridCoordinate[] {
+  const points: WeatherGridCoordinate[] = [];
   for (let lat = -80; lat <= 80; lat += 10) {
     for (let lon = -180; lon < 180; lon += 10) {
       points.push({ lat, lon });
@@ -454,13 +504,100 @@ function makeGrid() {
   return points;
 }
 
-export async function fetchWeatherGrid(signal?: AbortSignal, options: { freshMs?: number; forecastHourOffset?: number } = {}): Promise<WeatherGridPoint[]> {
-  const forecastHourOffset = Math.max(0, Math.round(options.forecastHourOffset ?? 0));
-  const freshCache = readWeatherGridCache(options.freshMs ?? WEATHER_GRID_FRESH_MS, forecastHourOffset);
-  if (freshCache) return freshCache;
+function makeBoundedGrid(bounds: AviationBounds, requestedStep: number, maxPoints: number): WeatherGridCoordinate[] {
+  const normalized = normalizedWeatherBounds(bounds);
+  if (!normalized) return makeGlobalGrid();
 
-  const grid = makeGrid();
-  const batchSize = 90;
+  let step = requestedStep;
+  let points = boundedGridPoints(normalized, step);
+  while (points.length > maxPoints && step < 10) {
+    step = nextWeatherGridStep(step);
+    points = boundedGridPoints(normalized, step);
+  }
+  return points;
+}
+
+function nextWeatherGridStep(currentStep: number) {
+  const steps = [0.25, 0.5, 1, 2.5, 5, 7.5, 10];
+  return steps.find((step) => step > currentStep + 0.001) ?? Math.min(10, currentStep * 2);
+}
+
+function normalizedWeatherBounds(bounds?: AviationBounds): AviationBounds | undefined {
+  if (!bounds) return undefined;
+  const south = Math.max(-80, Math.min(80, Math.min(bounds.south, bounds.north)));
+  const north = Math.max(-80, Math.min(80, Math.max(bounds.south, bounds.north)));
+  if (north - south < 0.05) return undefined;
+
+  const rawSpan = Math.abs(bounds.east - bounds.west);
+  if (rawSpan >= 330) return undefined;
+
+  return {
+    south,
+    north,
+    west: normalizeApiLongitude(bounds.west),
+    east: normalizeApiLongitude(bounds.east)
+  };
+}
+
+function boundedGridPoints(bounds: AviationBounds, step: number): WeatherGridCoordinate[] {
+  const points: WeatherGridCoordinate[] = [];
+  const south = Math.max(-80, Math.floor((bounds.south - step) / step) * step);
+  const north = Math.min(80, Math.ceil((bounds.north + step) / step) * step);
+  const west = bounds.west;
+  const east = bounds.east < bounds.west ? bounds.east + 360 : bounds.east;
+  const startLon = Math.floor((west - step) / step) * step;
+  const endLon = Math.ceil((east + step) / step) * step;
+
+  for (let lat = south; lat <= north + step * 0.25; lat += step) {
+    for (let lon = startLon; lon <= endLon + step * 0.25; lon += step) {
+      points.push({ lat: roundCoordinate(lat), lon: roundCoordinate(normalizeApiLongitude(lon)) });
+    }
+  }
+
+  return points;
+}
+
+function roundCoordinate(value: number) {
+  return Math.round(value * 1000) / 1000;
+}
+
+export interface WeatherGridFetchResult {
+  points: WeatherGridPoint[];
+  fromCache: boolean;
+  stale: boolean;
+  fetchedAt: number;
+}
+
+export async function fetchWeatherGridWithMeta(
+  signal?: AbortSignal,
+  options: { freshMs?: number; forecastHourOffset?: number; bounds?: AviationBounds; step?: number; maxPoints?: number } = {}
+): Promise<WeatherGridFetchResult> {
+  const forecastHourOffset = Math.max(0, Math.round(options.forecastHourOffset ?? 0));
+  const freshCache = readWeatherGridCache(options.freshMs ?? WEATHER_GRID_FRESH_MS, forecastHourOffset, options);
+  if (freshCache) {
+    return {
+      points: freshCache,
+      fromCache: true,
+      stale: false,
+      fetchedAt: Date.now()
+    };
+  }
+
+  if (providerInCooldown(WEATHER_GRID_PROVIDER)) {
+    const staleCache = readWeatherGridCache(WEATHER_GRID_STALE_MS, forecastHourOffset, options);
+    if (staleCache) {
+      return {
+        points: staleCache,
+        fromCache: true,
+        stale: true,
+        fetchedAt: Date.now()
+      };
+    }
+    throw new Error("Weather forecast provider is cooling down after a recent request failure");
+  }
+
+  const grid = makeGrid(options);
+  const batchSize = forecastHourOffset > 0 ? 25 : 120;
   const result: WeatherGridPoint[] = [];
 
   try {
@@ -532,19 +669,45 @@ export async function fetchWeatherGrid(signal?: AbortSignal, options: { freshMs?
           windGust: numberValue(sample.wind_gusts_10m) ?? 0,
           windDirection: numberValue(sample.wind_direction_10m) ?? 0,
           precipitation: numberValue(sample.precipitation) ?? 0,
+          precipitationProbability: numberValue(sample.precipitation_probability),
           pressure: numberValue(sample.pressure_msl) ?? 0,
           cloudCover: numberValue(sample.cloud_cover) ?? 0
         });
       });
     }
 
-    writeWeatherGridCache(result, forecastHourOffset);
-    return result;
+    writeWeatherGridCache(result, forecastHourOffset, options);
+    return {
+      points: result,
+      fromCache: false,
+      stale: false,
+      fetchedAt: Date.now()
+    };
   } catch (err) {
-    const staleCache = readWeatherGridCache(WEATHER_GRID_STALE_MS, forecastHourOffset);
-    if (staleCache) return staleCache;
+    if (shouldCooldownProvider(err)) setProviderCooldown(WEATHER_GRID_PROVIDER, WEATHER_GRID_FAILURE_COOLDOWN_MS);
+    const staleCache = readWeatherGridCache(WEATHER_GRID_STALE_MS, forecastHourOffset, options);
+    if (staleCache) {
+      return {
+        points: staleCache,
+        fromCache: true,
+        stale: true,
+        fetchedAt: Date.now()
+      };
+    }
     throw err;
   }
+}
+
+export async function fetchWeatherGrid(
+  signal?: AbortSignal,
+  options: { freshMs?: number; forecastHourOffset?: number; bounds?: AviationBounds; step?: number; maxPoints?: number } = {}
+): Promise<WeatherGridPoint[]> {
+  return (await fetchWeatherGridWithMeta(signal, options)).points;
+}
+
+export function getCachedWeatherGrid(options: { maxAgeMs?: number; forecastHourOffset?: number; bounds?: AviationBounds; step?: number; maxPoints?: number } = {}) {
+  const forecastHourOffset = Math.max(0, Math.round(options.forecastHourOffset ?? 0));
+  return readWeatherGridCache(options.maxAgeMs ?? WEATHER_GRID_STALE_MS, forecastHourOffset, options);
 }
 
 function forecastGridSample(hourly: Record<string, Array<number | string>> | undefined, forecastHourOffset: number) {
@@ -566,13 +729,27 @@ function forecastGridSample(hourly: Record<string, Array<number | string>> | und
   return Object.fromEntries(Object.entries(hourly).map(([key, values]) => [key, values[bestIndex]])) as Record<string, number | string>;
 }
 
-function weatherGridCacheKey(forecastHourOffset: number) {
-  return `${WEATHER_GRID_CACHE_KEY}:${forecastHourOffset}`;
+function weatherGridCacheKey(forecastHourOffset: number, options: { bounds?: AviationBounds; step?: number; maxPoints?: number } = {}) {
+  const bounds = normalizedWeatherBounds(options.bounds);
+  if (!bounds) return `${WEATHER_GRID_CACHE_KEY}:global:${forecastHourOffset}`;
+  const step = options.step ?? 2.5;
+  const maxPoints = options.maxPoints ?? 220;
+  return [
+    WEATHER_GRID_CACHE_KEY,
+    "viewport",
+    forecastHourOffset,
+    step.toFixed(2),
+    maxPoints,
+    bounds.south.toFixed(2),
+    bounds.west.toFixed(2),
+    bounds.north.toFixed(2),
+    bounds.east.toFixed(2)
+  ].join(":");
 }
 
-function readWeatherGridCache(maxAgeMs: number, forecastHourOffset = 0) {
+function readWeatherGridCache(maxAgeMs: number, forecastHourOffset = 0, options: { bounds?: AviationBounds; step?: number; maxPoints?: number } = {}) {
   try {
-    const raw = localStorage.getItem(weatherGridCacheKey(forecastHourOffset));
+    const raw = localStorage.getItem(weatherGridCacheKey(forecastHourOffset, options));
     if (!raw) return undefined;
     const cached = JSON.parse(raw) as { fetchedAt: number; points: WeatherGridPoint[] };
     if (!Array.isArray(cached.points) || Date.now() - cached.fetchedAt > maxAgeMs) return undefined;
@@ -582,9 +759,9 @@ function readWeatherGridCache(maxAgeMs: number, forecastHourOffset = 0) {
   }
 }
 
-function writeWeatherGridCache(points: WeatherGridPoint[], forecastHourOffset = 0) {
+function writeWeatherGridCache(points: WeatherGridPoint[], forecastHourOffset = 0, options: { bounds?: AviationBounds; step?: number; maxPoints?: number } = {}) {
   try {
-    localStorage.setItem(weatherGridCacheKey(forecastHourOffset), JSON.stringify({ fetchedAt: Date.now(), points }));
+    localStorage.setItem(weatherGridCacheKey(forecastHourOffset, options), JSON.stringify({ fetchedAt: Date.now(), points }));
   } catch {
     // Cache is only a resilience layer for provider rate limits.
   }
@@ -2652,13 +2829,141 @@ function includesCodeInNext(hours: number, times: string[], codes: number[], mat
   });
 }
 
+const localSignalCopy = {
+  en: {
+    severeGusts: "Severe gusts",
+    strongGusts: "Strong gusts",
+    gustsNear: "Gusts near",
+    heavyPrecipitation: "Heavy precipitation",
+    peakHourlyAmountNear: "Peak hourly amount near",
+    wetConditions: "Wet conditions",
+    precipitationChanceAhead: "precipitation chance ahead",
+    thunderstormRisk: "Thunderstorm risk",
+    snowNearby: "Snow nearby",
+    snowfallReportedNow: "Snowfall reported now",
+    dangerousHeat: "Dangerous heat",
+    severeCold: "Severe cold",
+    feelsLike: "Feels like"
+  },
+  sv: {
+    severeGusts: "Mycket hårda vindbyar",
+    strongGusts: "Hårda vindbyar",
+    gustsNear: "Vindbyar nära",
+    heavyPrecipitation: "Kraftig nederbörd",
+    peakHourlyAmountNear: "Högsta timmängd nära",
+    wetConditions: "Blöta förhållanden",
+    precipitationChanceAhead: "nederbördsrisk framåt",
+    thunderstormRisk: "Risk för åska",
+    snowNearby: "Snö i närheten",
+    snowfallReportedNow: "Snöfall rapporteras nu",
+    dangerousHeat: "Farlig värme",
+    severeCold: "Sträng kyla",
+    feelsLike: "Känns som"
+  },
+  de: {
+    severeGusts: "Schwere Böen",
+    strongGusts: "Starke Böen",
+    gustsNear: "Böen nahe",
+    heavyPrecipitation: "Starker Niederschlag",
+    peakHourlyAmountNear: "Höchste Stundenmenge nahe",
+    wetConditions: "Nasse Bedingungen",
+    precipitationChanceAhead: "Niederschlagswahrscheinlichkeit voraus",
+    thunderstormRisk: "Gewitterrisiko",
+    snowNearby: "Schnee in der Nähe",
+    snowfallReportedNow: "Schneefall jetzt gemeldet",
+    dangerousHeat: "Gefährliche Hitze",
+    severeCold: "Strenge Kälte",
+    feelsLike: "Gefühlt"
+  },
+  fr: {
+    severeGusts: "Rafales violentes",
+    strongGusts: "Fortes rafales",
+    gustsNear: "Rafales proches de",
+    heavyPrecipitation: "Fortes précipitations",
+    peakHourlyAmountNear: "Pic horaire proche de",
+    wetConditions: "Conditions humides",
+    precipitationChanceAhead: "probabilité de précipitation à venir",
+    thunderstormRisk: "Risque d'orage",
+    snowNearby: "Neige proche",
+    snowfallReportedNow: "Chute de neige signalée maintenant",
+    dangerousHeat: "Chaleur dangereuse",
+    severeCold: "Froid intense",
+    feelsLike: "Ressenti"
+  },
+  es: {
+    severeGusts: "Ráfagas severas",
+    strongGusts: "Ráfagas fuertes",
+    gustsNear: "Ráfagas cerca de",
+    heavyPrecipitation: "Precipitación intensa",
+    peakHourlyAmountNear: "Pico horario cerca de",
+    wetConditions: "Condiciones húmedas",
+    precipitationChanceAhead: "probabilidad de precipitación próxima",
+    thunderstormRisk: "Riesgo de tormenta",
+    snowNearby: "Nieve cercana",
+    snowfallReportedNow: "Nevada reportada ahora",
+    dangerousHeat: "Calor peligroso",
+    severeCold: "Frío severo",
+    feelsLike: "Sensación"
+  },
+  it: {
+    severeGusts: "Raffiche severe",
+    strongGusts: "Raffiche forti",
+    gustsNear: "Raffiche vicino a",
+    heavyPrecipitation: "Precipitazioni intense",
+    peakHourlyAmountNear: "Picco orario vicino a",
+    wetConditions: "Condizioni bagnate",
+    precipitationChanceAhead: "probabilità di precipitazione in arrivo",
+    thunderstormRisk: "Rischio temporali",
+    snowNearby: "Neve vicina",
+    snowfallReportedNow: "Nevicata segnalata ora",
+    dangerousHeat: "Caldo pericoloso",
+    severeCold: "Freddo intenso",
+    feelsLike: "Percepita"
+  },
+  ja: {
+    severeGusts: "非常に強い突風",
+    strongGusts: "強い突風",
+    gustsNear: "突風 約",
+    heavyPrecipitation: "強い降水",
+    peakHourlyAmountNear: "最大1時間量 約",
+    wetConditions: "湿った状況",
+    precipitationChanceAhead: "今後の降水確率",
+    thunderstormRisk: "雷雨リスク",
+    snowNearby: "近くで雪",
+    snowfallReportedNow: "現在降雪あり",
+    dangerousHeat: "危険な暑さ",
+    severeCold: "厳しい寒さ",
+    feelsLike: "体感"
+  },
+  zh: {
+    severeGusts: "严重阵风",
+    strongGusts: "强阵风",
+    gustsNear: "阵风接近",
+    heavyPrecipitation: "强降水",
+    peakHourlyAmountNear: "最大小时量接近",
+    wetConditions: "潮湿状况",
+    precipitationChanceAhead: "未来降水概率",
+    thunderstormRisk: "雷暴风险",
+    snowNearby: "附近有雪",
+    snowfallReportedNow: "当前报告降雪",
+    dangerousHeat: "危险高温",
+    severeCold: "严寒",
+    feelsLike: "体感"
+  }
+};
+
+function localSignalText(language?: string) {
+  return language && language in localSignalCopy ? localSignalCopy[language as keyof typeof localSignalCopy] : localSignalCopy.en;
+}
+
 function pushSignal(signals: LocalSignal[], id: string, title: string, detail: string, severity: Severity) {
   signals.push({ id, title, detail, severity });
 }
 
-export function deriveLocalSignals(weather?: LocalWeather): LocalSignal[] {
+export function deriveLocalSignals(weather?: LocalWeather, units: { temperatureUnit?: TemperatureUnit; windUnit?: WindUnit; rainUnit?: RainUnit; language?: string } = {}): LocalSignal[] {
   if (!weather) return [];
 
+  const text = localSignalText(units.language);
   const signals: LocalSignal[] = [];
   const current = weather.current;
   const nextWind = maxInNext(18, weather.hourly.time, weather.hourly.wind_gusts_10m);
@@ -2669,29 +2974,29 @@ export function deriveLocalSignals(weather?: LocalWeather): LocalSignal[] {
   const snowCode = includesCodeInNext(18, weather.hourly.time, weather.hourly.weather_code, (code) => [71, 73, 75, 77, 85, 86].includes(code));
 
   if (current.wind_gusts_10m >= 80 || (nextWind ?? 0) >= 80) {
-    pushSignal(signals, "wind-danger", "Severe gusts", `Gusts near ${Math.round(Math.max(current.wind_gusts_10m, nextWind ?? 0))} km/h`, "danger");
+    pushSignal(signals, "wind-danger", text.severeGusts, `${text.gustsNear} ${formatWind(Math.max(current.wind_gusts_10m, nextWind ?? 0), units.windUnit)}`, "danger");
   } else if (current.wind_gusts_10m >= 55 || (nextWind ?? 0) >= 55) {
-    pushSignal(signals, "wind-watch", "Strong gusts", `Gusts near ${Math.round(Math.max(current.wind_gusts_10m, nextWind ?? 0))} km/h`, "warning");
+    pushSignal(signals, "wind-watch", text.strongGusts, `${text.gustsNear} ${formatWind(Math.max(current.wind_gusts_10m, nextWind ?? 0), units.windUnit)}`, "warning");
   }
 
   if (current.precipitation >= 8 || (nextPrecip ?? 0) >= 8) {
-    pushSignal(signals, "rain-danger", "Heavy precipitation", `Peak hourly amount near ${Math.round(Math.max(current.precipitation, nextPrecip ?? 0))} mm`, "danger");
+    pushSignal(signals, "rain-danger", text.heavyPrecipitation, `${text.peakHourlyAmountNear} ${formatRain(Math.max(current.precipitation, nextPrecip ?? 0), units.rainUnit)}`, "danger");
   } else if (current.precipitation >= 3 || (nextPrecip ?? 0) >= 3 || (nextPop ?? 0) >= 80) {
-    pushSignal(signals, "rain-watch", "Wet conditions", `${Math.round(nextPop ?? 0)}% precipitation chance ahead`, "watch");
+    pushSignal(signals, "rain-watch", text.wetConditions, `${Math.round(nextPop ?? 0)}% ${text.precipitationChanceAhead}`, "watch");
   }
 
   if (stormCode) {
-    pushSignal(signals, "storm", "Thunderstorm risk", weatherCodeLabel(stormCode), "warning");
+    pushSignal(signals, "storm", text.thunderstormRisk, weatherCodeLabel(stormCode, units.language), "warning");
   }
 
   if (current.snowfall > 0 || snowCode) {
-    pushSignal(signals, "snow", "Snow nearby", snowCode ? weatherCodeLabel(snowCode) : "Snowfall reported now", "watch");
+    pushSignal(signals, "snow", text.snowNearby, snowCode ? weatherCodeLabel(snowCode, units.language) : text.snowfallReportedNow, "watch");
   }
 
   if (current.apparent_temperature >= 38) {
-    pushSignal(signals, "heat", "Dangerous heat", `Feels like ${Math.round(current.apparent_temperature)}\u00b0C`, "danger");
+    pushSignal(signals, "heat", text.dangerousHeat, `${text.feelsLike} ${formatTemperature(current.apparent_temperature, units.temperatureUnit)}`, "danger");
   } else if (current.apparent_temperature <= -15) {
-    pushSignal(signals, "cold", "Severe cold", `Feels like ${Math.round(current.apparent_temperature)}\u00b0C`, "warning");
+    pushSignal(signals, "cold", text.severeCold, `${text.feelsLike} ${formatTemperature(current.apparent_temperature, units.temperatureUnit)}`, "warning");
   }
 
   if (current.visibility <= 1000) {

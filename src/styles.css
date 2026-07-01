@@ -65,7 +65,6 @@ button {
 }
 
 .map-filter-bar,
-.forecast-time-panel,
 .floating-panel,
 .local-dock,
 .legend,
@@ -80,6 +79,8 @@ button {
 }
 
 .map-filter-bar {
+  position: relative;
+  z-index: 60;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -87,55 +88,6 @@ button {
   max-width: 100%;
   padding: 6px;
   pointer-events: auto;
-}
-
-.forecast-time-panel {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: fit-content;
-  max-width: min(760px, 100%);
-  padding: 6px;
-  pointer-events: auto;
-}
-
-.forecast-time-panel > div:first-child {
-  display: grid;
-  min-width: 142px;
-  padding: 0 6px;
-}
-
-.forecast-time-panel strong {
-  font-size: 0.78rem;
-}
-
-.forecast-time-panel span {
-  color: rgba(255, 250, 241, 0.68);
-  font-size: 0.68rem;
-  font-weight: 760;
-  white-space: nowrap;
-}
-
-.forecast-time-options {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-}
-
-.forecast-time-options button {
-  min-height: 28px;
-  padding: 0 8px;
-  border-radius: 6px;
-  background: rgba(255, 250, 241, 0.1);
-  color: rgba(255, 250, 241, 0.78);
-  cursor: pointer;
-  font-size: 0.74rem;
-  font-weight: 850;
-}
-
-.forecast-time-options button.active {
-  background: #0f766e;
-  color: #ffffff;
 }
 
 .map-view-select,
@@ -147,7 +99,7 @@ button {
 .text-button,
 .panel-footer,
 .current-weather,
-.weather-metrics span,
+.weather-metrics > span,
 .search-box,
 .local-dock-toggle,
 .local-dock-heading,
@@ -170,12 +122,26 @@ button {
   font-size: 0.92rem;
 }
 
+.map-view-control {
+  position: relative;
+  display: flex;
+  flex: 0 0 auto;
+  z-index: 1;
+}
+
+.map-view-control.open {
+  z-index: 120;
+}
+
 .map-view-select {
   position: relative;
   gap: 7px;
   min-width: 156px;
+  width: 156px;
   padding: 0 9px;
+  border: 0;
   cursor: pointer;
+  font-weight: 850;
 }
 
 .settings-select {
@@ -214,22 +180,6 @@ button {
   text-align: right;
 }
 
-.map-view-select select {
-  position: absolute;
-  inset: 0;
-  z-index: 2;
-  width: 100%;
-  height: 100%;
-  cursor: pointer;
-  opacity: 0;
-  appearance: none;
-  border: 0;
-  outline: 0;
-  background: transparent;
-  color: #fffaf1;
-  font-weight: 850;
-}
-
 .settings-select select {
   position: absolute;
   inset: 0;
@@ -254,18 +204,66 @@ button {
   flex: 0 0 auto;
 }
 
-.map-view-select:focus-within,
+.map-view-select:focus-visible,
 .settings-select:focus-within {
   outline: 2px solid rgba(153, 246, 228, 0.46);
   outline-offset: 2px;
 }
 
-.map-view-select option {
+.settings-select option {
   color: #171615;
 }
 
-.settings-select option {
-  color: #171615;
+.map-view-menu-panel {
+  position: absolute;
+  z-index: 121;
+  top: calc(100% + 6px);
+  left: 0;
+  display: grid;
+  gap: 4px;
+  width: 190px;
+  padding: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 7px;
+  background: rgba(25, 27, 26, 0.88);
+  color: #fffaf1;
+  box-shadow: 0 14px 32px rgba(0, 0, 0, 0.24);
+  backdrop-filter: blur(14px);
+  pointer-events: auto;
+}
+
+.map-view-menu-panel button {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-height: 31px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 6px;
+  background: rgba(255, 250, 241, 0.1);
+  color: rgba(255, 250, 241, 0.88);
+  cursor: pointer;
+  font-size: 0.86rem;
+  font-weight: 820;
+  text-align: left;
+}
+
+.map-view-menu-panel button:hover,
+.map-view-menu-panel button.active {
+  background: rgba(20, 184, 166, 0.26);
+  color: #ffffff;
+}
+
+.map-view-menu-panel button.active {
+  box-shadow: inset 2px 0 0 #5eead4;
+}
+
+.map-view-menu-panel span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .compact-select {
@@ -283,7 +281,8 @@ button {
 
 .toolbar-button.active,
 .toolbar-button:hover,
-.map-view-select:hover {
+.map-view-select:hover,
+.map-view-select.active {
   background: rgba(255, 250, 241, 0.2);
 }
 
@@ -671,7 +670,7 @@ button {
   min-width: 108px;
 }
 
-.weather-metrics span {
+.weather-metrics > span {
   gap: 6px;
   justify-content: flex-start;
   color: #c7f2e6;
@@ -679,9 +678,20 @@ button {
   font-weight: 750;
 }
 
+.inline-wind-readout {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.weather-metrics .inline-wind-readout {
+  color: #c7f2e6;
+}
+
 .metric-row {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 6px;
 }
 
@@ -962,13 +972,6 @@ button {
   height: 9px;
   border-radius: 999px;
   background: linear-gradient(90deg, #4fc3f7 0%, #2ecc71 23%, #f2d84b 48%, #f59e0b 66%, #ef4444 82%, #c026d3 100%);
-  box-shadow: inset 0 0 0 1px rgba(255, 250, 241, 0.18);
-}
-
-.rain-forecast-gradient {
-  height: 9px;
-  border-radius: 999px;
-  background: linear-gradient(90deg, #7dd3fc 0%, #0ea5e9 24%, #2563eb 46%, #facc15 66%, #f97316 82%, #ef4444 100%);
   box-shadow: inset 0 0 0 1px rgba(255, 250, 241, 0.18);
 }
 
@@ -1424,8 +1427,7 @@ button {
 }
 
 .temperature-canvas,
-.wind-canvas,
-.rain-forecast-canvas {
+.wind-canvas {
   mix-blend-mode: multiply;
 }
 
@@ -1768,8 +1770,12 @@ button {
     flex-wrap: wrap;
   }
 
-  .map-view-select {
+  .map-view-control {
     flex: 1 1 170px;
+  }
+
+  .map-view-select {
+    width: 100%;
   }
 
   .toolbar-search-wrap {

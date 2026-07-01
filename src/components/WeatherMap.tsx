@@ -17,7 +17,18 @@ import type {
   RiskSignalEvent,
   WeatherGridPoint
 } from "../types";
-import { temperatureRgb, weatherCodeLabel } from "../utils/weatherCodes";
+import {
+  formatRain,
+  formatRainRate,
+  formatRainRateRange,
+  formatTemperature,
+  formatWind,
+  rainIntensityLabel,
+  temperatureRgb,
+  weatherCodeLabel,
+  windStrengthLabel
+} from "../utils/weatherCodes";
+import type { UnitSettings } from "../utils/weatherCodes";
 
 interface MapLocationDetails {
   latitude: number;
@@ -43,6 +54,7 @@ interface WeatherMapProps {
   showHomeMarker: boolean;
   dayNightTimestamp: number;
   weatherGrid: WeatherGridPoint[];
+  liveWeatherPoints: WeatherGridPoint[];
   earthquakes: EarthquakeEvent[];
   warnings: GdacsAlert[];
   riskEvents: RiskSignalEvent[];
@@ -51,6 +63,8 @@ interface WeatherMapProps {
   trackedAircraftIds: string[];
   aircraftTracks: Record<string, AircraftTrack | undefined>;
   rainViewer?: RainViewerState;
+  rainFrameTime?: number;
+  unitSettings: UnitSettings;
   mapLanguage: string;
   appLanguage: string;
   homeFocusRequest?: number;
@@ -69,15 +83,372 @@ const OPENFREEMAP_STYLE_URL = "https://tiles.openfreemap.org/styles/liberty";
 const HOME_MARKER_ICON = `<span aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><path d="M9 22V12h6v10"></path></svg></span>`;
 const PLACE_MARKER_ICON = `<span aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M20 10c0 5.25-8 12-8 12S4 15.25 4 10a8 8 0 1 1 16 0Z"></path><circle cx="12" cy="10" r="3"></circle></svg></span>`;
 const AIRCRAFT_MARKER_ICON = `<svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path d="M10.18 9"></path><path d="m21 16-8-5-8 5V8l8-5 8 5Z"></path><path d="m13 11 4 9h-8Z"></path></svg>`;
-const SURFACE_GRID_STEP = 10;
 const SURFACE_GRID_MIN_LAT = -80;
 const SURFACE_GRID_MAX_LAT = 80;
-const SURFACE_RASTER_MAX_PIXELS = 520_000;
+const SURFACE_RASTER_MAX_PIXELS = 340_000;
 const WARNING_TRANSLATION_CACHE_PREFIX = "weather-watch:warning-translation:v1";
+const DEFAULT_UNIT_SETTINGS: UnitSettings = {
+  temperatureUnit: "celsius",
+  windUnit: "ms",
+  rainUnit: "mm"
+};
+const MAP_UI_COPY = {
+  en: {
+    home: "Home",
+    location: "Location",
+    condition: "Condition",
+    weatherUpdating: "Weather updating",
+    temperature: "Temperature",
+    feelsLike: "Feels like",
+    wind: "Wind",
+    gust: "Gust",
+    peakGust: "Peak gust",
+    rain: "Rain",
+    humidity: "Humidity",
+    pressure: "Pressure",
+    cloudCover: "Cloud cover",
+    visibility: "Visibility",
+    uvIndex: "UV index",
+    updated: "Updated",
+    localTime: "Local time",
+    direction: "Direction",
+    blowingFrom: "Blowing from",
+    forecastTime: "Forecast time",
+    chance: "Chance",
+    weather: "Weather",
+    noRainExpected: "No rain expected",
+    noRainDetected: "No rain detected",
+    lightRainForecast: "Light rain forecast",
+    moderateRainForecast: "Moderate rain forecast",
+    heavyRainForecast: "Heavy rain forecast",
+    veryHeavyRainForecast: "Very heavy rain forecast",
+    rainfall: "Rainfall",
+    frame: "Frame",
+    intensity: "Intensity",
+    estTemp: "Est. temp",
+    readingRadar: "Reading radar",
+    radarUnavailable: "Radar sample unavailable",
+    providerUnavailable: "Provider tile could not be sampled",
+    estimatedFromRadar: "Estimated from RainViewer color table",
+    estimatedFromRadarTemp: "Estimated from RainViewer color table and local temperature",
+    at: "at"
+  },
+  sv: {
+    home: "Hem",
+    location: "Plats",
+    condition: "Väder",
+    weatherUpdating: "Väder uppdateras",
+    temperature: "Temperatur",
+    feelsLike: "Känns som",
+    wind: "Vind",
+    gust: "Byvind",
+    peakGust: "Högsta byvind",
+    rain: "Regn",
+    humidity: "Luftfuktighet",
+    pressure: "Tryck",
+    cloudCover: "Molntäcke",
+    visibility: "Sikt",
+    uvIndex: "UV-index",
+    updated: "Uppdaterad",
+    localTime: "Lokal tid",
+    direction: "Riktning",
+    blowingFrom: "Blåser från",
+    forecastTime: "Prognostid",
+    chance: "Sannolikhet",
+    weather: "Väder",
+    noRainExpected: "Inget regn väntas",
+    noRainDetected: "Inget regn upptäckt",
+    lightRainForecast: "Lätt regnprognos",
+    moderateRainForecast: "Måttlig regnprognos",
+    heavyRainForecast: "Kraftig regnprognos",
+    veryHeavyRainForecast: "Mycket kraftig regnprognos",
+    rainfall: "Nederbörd",
+    frame: "Bild",
+    intensity: "Intensitet",
+    estTemp: "Uppsk. temp",
+    readingRadar: "Läser radar",
+    radarUnavailable: "Radarsampling saknas",
+    providerUnavailable: "Leverantörens ruta kunde inte läsas",
+    estimatedFromRadar: "Uppskattat från RainViewers färgtabell",
+    estimatedFromRadarTemp: "Uppskattat från RainViewers färgtabell och lokal temperatur",
+    at: "vid"
+  },
+  de: {
+    home: "Zuhause",
+    location: "Ort",
+    condition: "Wetterlage",
+    weatherUpdating: "Wetter wird aktualisiert",
+    temperature: "Temperatur",
+    feelsLike: "Gefühlt",
+    wind: "Wind",
+    gust: "Böe",
+    peakGust: "Spitzenböe",
+    rain: "Regen",
+    humidity: "Feuchte",
+    pressure: "Druck",
+    cloudCover: "Bewölkung",
+    visibility: "Sicht",
+    uvIndex: "UV-Index",
+    updated: "Aktualisiert",
+    localTime: "Ortszeit",
+    direction: "Richtung",
+    blowingFrom: "Weht aus",
+    forecastTime: "Prognosezeit",
+    chance: "Wahrscheinlichkeit",
+    weather: "Wetter",
+    noRainExpected: "Kein Regen erwartet",
+    noRainDetected: "Kein Regen erkannt",
+    lightRainForecast: "Leichter Regen erwartet",
+    moderateRainForecast: "Mäßiger Regen erwartet",
+    heavyRainForecast: "Starker Regen erwartet",
+    veryHeavyRainForecast: "Sehr starker Regen erwartet",
+    rainfall: "Niederschlag",
+    frame: "Bild",
+    intensity: "Intensität",
+    estTemp: "Gesch. Temp.",
+    readingRadar: "Radar wird gelesen",
+    radarUnavailable: "Radarprobe nicht verfügbar",
+    providerUnavailable: "Anbieterkachel konnte nicht gelesen werden",
+    estimatedFromRadar: "Aus RainViewer-Farbtabelle geschätzt",
+    estimatedFromRadarTemp: "Aus RainViewer-Farbtabelle und lokaler Temperatur geschätzt",
+    at: "bei"
+  },
+  fr: {
+    home: "Domicile",
+    location: "Lieu",
+    condition: "Condition",
+    weatherUpdating: "Actualisation météo",
+    temperature: "Température",
+    feelsLike: "Ressenti",
+    wind: "Vent",
+    gust: "Rafale",
+    peakGust: "Rafale max",
+    rain: "Pluie",
+    humidity: "Humidité",
+    pressure: "Pression",
+    cloudCover: "Couverture nuageuse",
+    visibility: "Visibilité",
+    uvIndex: "Indice UV",
+    updated: "Mis à jour",
+    localTime: "Heure locale",
+    direction: "Direction",
+    blowingFrom: "Vient de",
+    forecastTime: "Heure prévue",
+    chance: "Probabilité",
+    weather: "Météo",
+    noRainExpected: "Pas de pluie prévue",
+    noRainDetected: "Aucune pluie détectée",
+    lightRainForecast: "Pluie faible prévue",
+    moderateRainForecast: "Pluie modérée prévue",
+    heavyRainForecast: "Forte pluie prévue",
+    veryHeavyRainForecast: "Très forte pluie prévue",
+    rainfall: "Précipitations",
+    frame: "Image",
+    intensity: "Intensité",
+    estTemp: "Temp. estimée",
+    readingRadar: "Lecture radar",
+    radarUnavailable: "Échantillon radar indisponible",
+    providerUnavailable: "Tuile fournisseur illisible",
+    estimatedFromRadar: "Estimé depuis la table de couleurs RainViewer",
+    estimatedFromRadarTemp: "Estimé depuis la table de couleurs RainViewer et la température locale",
+    at: "à"
+  },
+  es: {
+    home: "Inicio",
+    location: "Lugar",
+    condition: "Condición",
+    weatherUpdating: "Actualizando clima",
+    temperature: "Temperatura",
+    feelsLike: "Sensación",
+    wind: "Viento",
+    gust: "Ráfaga",
+    peakGust: "Ráfaga máx.",
+    rain: "Lluvia",
+    humidity: "Humedad",
+    pressure: "Presión",
+    cloudCover: "Nubosidad",
+    visibility: "Visibilidad",
+    uvIndex: "Índice UV",
+    updated: "Actualizado",
+    localTime: "Hora local",
+    direction: "Dirección",
+    blowingFrom: "Sopla desde",
+    forecastTime: "Hora prevista",
+    chance: "Probabilidad",
+    weather: "Clima",
+    noRainExpected: "No se espera lluvia",
+    noRainDetected: "No se detecta lluvia",
+    lightRainForecast: "Lluvia ligera prevista",
+    moderateRainForecast: "Lluvia moderada prevista",
+    heavyRainForecast: "Lluvia fuerte prevista",
+    veryHeavyRainForecast: "Lluvia muy fuerte prevista",
+    rainfall: "Precipitación",
+    frame: "Imagen",
+    intensity: "Intensidad",
+    estTemp: "Temp. est.",
+    readingRadar: "Leyendo radar",
+    radarUnavailable: "Muestra radar no disponible",
+    providerUnavailable: "No se pudo leer la tesela",
+    estimatedFromRadar: "Estimado desde la tabla de colores RainViewer",
+    estimatedFromRadarTemp: "Estimado desde la tabla de colores RainViewer y temperatura local",
+    at: "en"
+  },
+  it: {
+    home: "Casa",
+    location: "Luogo",
+    condition: "Condizione",
+    weatherUpdating: "Aggiornamento meteo",
+    temperature: "Temperatura",
+    feelsLike: "Percepita",
+    wind: "Vento",
+    gust: "Raffica",
+    peakGust: "Raffica max",
+    rain: "Pioggia",
+    humidity: "Umidità",
+    pressure: "Pressione",
+    cloudCover: "Copertura nuvole",
+    visibility: "Visibilità",
+    uvIndex: "Indice UV",
+    updated: "Aggiornato",
+    localTime: "Ora locale",
+    direction: "Direzione",
+    blowingFrom: "Soffia da",
+    forecastTime: "Ora prevista",
+    chance: "Probabilità",
+    weather: "Meteo",
+    noRainExpected: "Nessuna pioggia prevista",
+    noRainDetected: "Nessuna pioggia rilevata",
+    lightRainForecast: "Pioggia leggera prevista",
+    moderateRainForecast: "Pioggia moderata prevista",
+    heavyRainForecast: "Pioggia forte prevista",
+    veryHeavyRainForecast: "Pioggia molto forte prevista",
+    rainfall: "Precipitazioni",
+    frame: "Frame",
+    intensity: "Intensità",
+    estTemp: "Temp. stimata",
+    readingRadar: "Lettura radar",
+    radarUnavailable: "Campione radar non disponibile",
+    providerUnavailable: "Tessera provider non leggibile",
+    estimatedFromRadar: "Stimato dalla tabella colori RainViewer",
+    estimatedFromRadarTemp: "Stimato dalla tabella colori RainViewer e temperatura locale",
+    at: "a"
+  },
+  ja: {
+    home: "ホーム",
+    location: "場所",
+    condition: "状態",
+    weatherUpdating: "天気を更新中",
+    temperature: "気温",
+    feelsLike: "体感",
+    wind: "風",
+    gust: "突風",
+    peakGust: "最大突風",
+    rain: "雨",
+    humidity: "湿度",
+    pressure: "気圧",
+    cloudCover: "雲量",
+    visibility: "視程",
+    uvIndex: "UV指数",
+    updated: "更新",
+    localTime: "現地時刻",
+    direction: "方向",
+    blowingFrom: "吹いてくる方向",
+    forecastTime: "予報時刻",
+    chance: "確率",
+    weather: "天気",
+    noRainExpected: "雨の予報なし",
+    noRainDetected: "雨は検出されません",
+    lightRainForecast: "弱い雨の予報",
+    moderateRainForecast: "中程度の雨の予報",
+    heavyRainForecast: "強い雨の予報",
+    veryHeavyRainForecast: "非常に強い雨の予報",
+    rainfall: "降水量",
+    frame: "フレーム",
+    intensity: "強度",
+    estTemp: "推定気温",
+    readingRadar: "レーダー読取中",
+    radarUnavailable: "レーダーサンプルなし",
+    providerUnavailable: "提供元タイルを読取不可",
+    estimatedFromRadar: "RainViewerの色表から推定",
+    estimatedFromRadarTemp: "RainViewerの色表と現地気温から推定",
+    at: "地点"
+  },
+  zh: {
+    home: "主页",
+    location: "地点",
+    condition: "天气",
+    weatherUpdating: "正在刷新天气",
+    temperature: "温度",
+    feelsLike: "体感",
+    wind: "风",
+    gust: "阵风",
+    peakGust: "峰值阵风",
+    rain: "雨",
+    humidity: "湿度",
+    pressure: "气压",
+    cloudCover: "云量",
+    visibility: "能见度",
+    uvIndex: "紫外线指数",
+    updated: "已更新",
+    localTime: "当地时间",
+    direction: "方向",
+    blowingFrom: "来自",
+    forecastTime: "预报时间",
+    chance: "概率",
+    weather: "天气",
+    noRainExpected: "预计无雨",
+    noRainDetected: "未检测到降雨",
+    lightRainForecast: "小雨预报",
+    moderateRainForecast: "中雨预报",
+    heavyRainForecast: "大雨预报",
+    veryHeavyRainForecast: "强降雨预报",
+    rainfall: "降雨",
+    frame: "帧",
+    intensity: "强度",
+    estTemp: "估计温度",
+    readingRadar: "正在读取雷达",
+    radarUnavailable: "雷达样本不可用",
+    providerUnavailable: "无法读取提供方图块",
+    estimatedFromRadar: "根据 RainViewer 色表估算",
+    estimatedFromRadarTemp: "根据 RainViewer 色表和当地温度估算",
+    at: "于"
+  }
+};
 const WORLD_BOUNDS: L.LatLngBoundsExpression = [
   [-MAX_MERCATOR_LAT, -LONGITUDE_WRAP_LIMIT],
   [MAX_MERCATOR_LAT, LONGITUDE_WRAP_LIMIT]
 ];
+const NODE_POPUP_OPTIONS: L.PopupOptions = {
+  autoClose: true,
+  autoPan: true,
+  closeButton: true,
+  closeOnClick: false,
+  keepInView: true
+};
+
+function nodePopupOptions(className?: string): L.PopupOptions {
+  return className ? { ...NODE_POPUP_OPTIONS, className } : NODE_POPUP_OPTIONS;
+}
+
+type MapUiLanguage = keyof typeof MAP_UI_COPY;
+type MapUiCopy = typeof MAP_UI_COPY.en;
+
+function mapCopy(language?: string): MapUiCopy {
+  return language && language in MAP_UI_COPY ? MAP_UI_COPY[language as MapUiLanguage] : MAP_UI_COPY.en;
+}
+
+function windArrowHtml(fromDirection?: number) {
+  if (typeof fromDirection !== "number") return "";
+  const toDirection = normalizeBearing(fromDirection + 180);
+  return `<span class="wind-arrow" style="--wind-dir: ${toDirection}deg" aria-hidden="true">&uarr;</span>`;
+}
+
+function windReadoutHtml(speed: number, fromDirection: number | undefined, units: UnitSettings, language = "en") {
+  return `<span class="inline-wind-readout">${windArrowHtml(fromDirection)}<span>${formatWind(speed, units.windUnit)} · ${windStrengthLabel(
+    speed,
+    language
+  )}</span></span>`;
+}
 
 function popupTable(rows: Array<[string, string | number | undefined]>) {
   return `<div class="map-popup">${rows
@@ -86,24 +457,24 @@ function popupTable(rows: Array<[string, string | number | undefined]>) {
     .join("")}</div>`;
 }
 
-function locationPopup(location: MapLocationDetails) {
+function locationPopup(location: MapLocationDetails, units: UnitSettings, language = "en") {
   const current = location.weather;
+  const text = mapCopy(language);
   return popupTable([
-    [location.popupLabel ?? "Home", location.name],
-    ["Location", location.label],
-    ["Condition", current ? weatherCodeLabel(current.weather_code) : location.weatherStatus ?? "Weather updating"],
-    ["Temperature", current ? `${Math.round(current.temperature_2m)}\u00b0C` : undefined],
-    ["Feels like", current ? `${Math.round(current.apparent_temperature)}\u00b0C` : undefined],
-    ["Wind", current ? `${Math.round(current.wind_speed_10m)} km/h` : undefined],
-    ["Gust", current ? `${Math.round(current.wind_gusts_10m)} km/h` : undefined],
-    ["Rain", current ? `${current.precipitation.toFixed(1)} mm` : undefined],
-    ["Humidity", current ? `${Math.round(current.relative_humidity_2m)}%` : undefined],
-    ["Pressure", current ? `${Math.round(current.pressure_msl)} hPa` : undefined],
-    ["Cloud cover", current ? `${Math.round(current.cloud_cover)}%` : undefined],
-    ["Visibility", current ? `${Math.round(current.visibility / 1000)} km` : undefined],
-    ["UV index", current ? current.uv_index.toFixed(1) : undefined],
+    [location.popupLabel ?? text.home, location.name],
+    [text.location, location.label],
+    [text.condition, current ? weatherCodeLabel(current.weather_code, language) : location.weatherStatus ?? text.weatherUpdating],
+    [text.temperature, current ? formatTemperature(current.temperature_2m, units.temperatureUnit) : undefined],
+    [text.feelsLike, current ? formatTemperature(current.apparent_temperature, units.temperatureUnit) : undefined],
+    [text.wind, current ? windReadoutHtml(current.wind_speed_10m, current.wind_direction_10m, units, language) : undefined],
+    [text.rain, current ? `${formatRain(current.precipitation, units.rainUnit)} · ${rainIntensityLabel(current.precipitation, language)}` : undefined],
+    [text.humidity, current ? `${Math.round(current.relative_humidity_2m)}%` : undefined],
+    [text.pressure, current ? `${Math.round(current.pressure_msl)} hPa` : undefined],
+    [text.cloudCover, current ? `${Math.round(current.cloud_cover)}%` : undefined],
+    [text.visibility, current ? `${Math.round(current.visibility / 1000)} km` : undefined],
+    [text.uvIndex, current ? current.uv_index.toFixed(1) : undefined],
     ["AQI", location.airQuality?.us_aqi !== undefined ? Math.round(location.airQuality.us_aqi) : undefined],
-    ["Updated", location.fetchedAt ? new Date(location.fetchedAt).toLocaleTimeString() : undefined]
+    [text.updated, location.fetchedAt ? new Date(location.fetchedAt).toLocaleTimeString(language) : undefined]
   ]);
 }
 
@@ -155,8 +526,14 @@ function applyBaseMapLanguage(map: MapLibreMap, language: string) {
   map.once("styledata", apply);
 }
 
-function makeTemperatureLayer(points: WeatherGridPoint[], includeLocalTime = false) {
+function makeTemperatureLayer(
+  points: WeatherGridPoint[],
+  livePoints: WeatherGridPoint[] = [],
+  includeLocalTime = false,
+  units: UnitSettings = DEFAULT_UNIT_SETTINGS
+) {
   const surfaceGrid = makeSurfaceGrid(points);
+  const liveStations = makeSurfaceStations(livePoints);
 
   interface TemperatureLayerInternal extends L.Layer {
     _canvas?: HTMLCanvasElement;
@@ -191,16 +568,16 @@ function makeTemperatureLayer(points: WeatherGridPoint[], includeLocalTime = fal
       if (this._tooltip) this._tooltip.classList.remove("visible");
     },
     _moveHover(this: TemperatureLayerInternal, event: L.LeafletMouseEvent) {
-      if (!this._weatherMap || !this._tooltip || surfaceGrid.size === 0) return;
+      if (!this._weatherMap || !this._tooltip || surfaceGrid.samples.size === 0 && liveStations.length === 0) return;
       const map = this._weatherMap;
-      const sample = interpolatedSurfaceSample(surfaceGrid, event.latlng.lat, event.latlng.lng);
+      const sample = interpolatedSurfaceSample(surfaceGrid, event.latlng.lat, event.latlng.lng, liveStations);
       if (!sample) {
         this._hideHover();
         return;
       }
 
       positionHoverReadout(map, event, this._tooltip);
-      this._tooltip.innerHTML = `<strong>${Math.round(sample.temperature)}\u00b0C</strong>${includeLocalTime ? `<span>${localTimeSummary(event.latlng.lat, event.latlng.lng, Date.now())}</span>` : ""}<em>${event.latlng.lat.toFixed(1)}°, ${normalizeLongitude(event.latlng.lng).toFixed(1)}°</em>`;
+      this._tooltip.innerHTML = `<strong>${formatTemperature(sample.temperature, units.temperatureUnit)}</strong>${includeLocalTime ? `<span>${localTimeSummary(event.latlng.lat, event.latlng.lng, Date.now())}</span>` : ""}<em>${event.latlng.lat.toFixed(1)}°, ${normalizeLongitude(event.latlng.lng).toFixed(1)}°</em>`;
       showHoverReadout(this._tooltip);
     },
     _reset(this: TemperatureLayerInternal) {
@@ -223,14 +600,20 @@ function makeTemperatureLayer(points: WeatherGridPoint[], includeLocalTime = fal
       ctx.imageSmoothingEnabled = true;
       ctx.clearRect(0, 0, width, height);
 
-      if (surfaceGrid.size === 0) return;
+      if (surfaceGrid.samples.size === 0 && liveStations.length === 0) return;
 
       const image = ctx.createImageData(width, height);
+      const { lats, lons } = surfaceRasterCoordinates(map, width, height, scale);
       for (let y = 0; y < height; y += 1) {
+        const lat = lats[y];
         for (let x = 0; x < width; x += 1) {
-          const latLng = map.containerPointToLatLng([(x + 0.5) / scale, (y + 0.5) / scale]);
-          const sample = interpolatedSurfaceSample(surfaceGrid, latLng.lat, latLng.lng);
-          const temp = sample?.temperature ?? 0;
+          const sample = interpolatedSurfacePaintSample(surfaceGrid, lat, lons[x]);
+          if (!sample) {
+            const index = (y * width + x) * 4;
+            image.data[index + 3] = 0;
+            continue;
+          }
+          const temp = sample.temperature;
           const rgb = temperatureRgb(temp);
           const index = (y * width + x) * 4;
           image.data[index] = rgb[0];
@@ -247,8 +630,15 @@ function makeTemperatureLayer(points: WeatherGridPoint[], includeLocalTime = fal
   return new CanvasLayer();
 }
 
-function makeWindLayer(points: WeatherGridPoint[], includeLocalTime = false) {
+function makeWindLayer(
+  points: WeatherGridPoint[],
+  livePoints: WeatherGridPoint[] = [],
+  includeLocalTime = false,
+  units: UnitSettings = DEFAULT_UNIT_SETTINGS,
+  language = "en"
+) {
   const surfaceGrid = makeSurfaceGrid(points);
+  const liveStations = makeSurfaceStations(livePoints);
 
   interface WindLayerInternal extends L.Layer {
     _canvas?: HTMLCanvasElement;
@@ -283,15 +673,15 @@ function makeWindLayer(points: WeatherGridPoint[], includeLocalTime = false) {
       hideHoverReadout(this._tooltip);
     },
     _moveHover(this: WindLayerInternal, event: L.LeafletMouseEvent) {
-      if (!this._weatherMap || !this._tooltip || surfaceGrid.size === 0) return;
-      const sample = interpolatedSurfaceSample(surfaceGrid, event.latlng.lat, event.latlng.lng);
+      if (!this._weatherMap || !this._tooltip || surfaceGrid.samples.size === 0 && liveStations.length === 0) return;
+      const sample = interpolatedSurfaceSample(surfaceGrid, event.latlng.lat, event.latlng.lng, liveStations);
       if (!sample) {
         this._hideHover();
         return;
       }
 
       positionHoverReadout(this._weatherMap, event, this._tooltip);
-      this._tooltip.innerHTML = windHoverContent(sample, event.latlng.lat, event.latlng.lng, includeLocalTime ? forecastSampleTimestamp(sample) : undefined);
+      this._tooltip.innerHTML = windHoverContent(sample, event.latlng.lat, event.latlng.lng, units, language, includeLocalTime ? forecastSampleTimestamp(sample) : undefined);
       showHoverReadout(this._tooltip);
     },
     _reset(this: WindLayerInternal) {
@@ -314,14 +704,20 @@ function makeWindLayer(points: WeatherGridPoint[], includeLocalTime = false) {
       ctx.imageSmoothingEnabled = true;
       ctx.clearRect(0, 0, width, height);
 
-      if (surfaceGrid.size === 0) return;
+      if (surfaceGrid.samples.size === 0 && liveStations.length === 0) return;
 
       const image = ctx.createImageData(width, height);
+      const { lats, lons } = surfaceRasterCoordinates(map, width, height, scale);
       for (let y = 0; y < height; y += 1) {
+        const lat = lats[y];
         for (let x = 0; x < width; x += 1) {
-          const latLng = map.containerPointToLatLng([(x + 0.5) / scale, (y + 0.5) / scale]);
-          const sample = interpolatedSurfaceSample(surfaceGrid, latLng.lat, latLng.lng);
-          const rgb = windRgb(sample?.windSpeed ?? 0);
+          const sample = interpolatedSurfacePaintSample(surfaceGrid, lat, lons[x]);
+          if (!sample) {
+            const index = (y * width + x) * 4;
+            image.data[index + 3] = 0;
+            continue;
+          }
+          const rgb = windRgb(sample.windSpeed);
           const index = (y * width + x) * 4;
           image.data[index] = rgb[0];
           image.data[index + 1] = rgb[1];
@@ -337,171 +733,21 @@ function makeWindLayer(points: WeatherGridPoint[], includeLocalTime = false) {
   return new CanvasLayer();
 }
 
-function makeRainForecastLayer(points: WeatherGridPoint[], includeLocalTime = false) {
-  const surfaceGrid = makeSurfaceGrid(points);
-
-  interface RainForecastLayerInternal extends L.Layer {
-    _canvas?: HTMLCanvasElement;
-    _tooltip?: HTMLDivElement;
-    _weatherMap?: L.Map;
-    _hideHover: () => void;
-    _moveHover: (event: L.LeafletMouseEvent) => void;
-    _reset: () => void;
-  }
-
-  const CanvasLayer = L.Layer.extend({
-    onAdd(this: RainForecastLayerInternal, map: L.Map) {
-      this._weatherMap = map;
-      this._canvas = L.DomUtil.create("canvas", "rain-forecast-canvas") as HTMLCanvasElement;
-      this._canvas.style.pointerEvents = "none";
-      this._tooltip = L.DomUtil.create("div", "map-hover-tooltip rain-forecast") as HTMLDivElement;
-      map.getPanes().overlayPane.appendChild(this._canvas);
-      map.getPanes().tooltipPane.appendChild(this._tooltip);
-      map.on("moveend zoomend resize", (this as unknown as { _reset: () => void })._reset, this);
-      map.on("mousemove", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
-      map.on("mouseout movestart zoomstart", (this as unknown as { _hideHover: () => void })._hideHover, this);
-      (this as unknown as { _reset: () => void })._reset();
-    },
-    onRemove(this: RainForecastLayerInternal) {
-      if (this._canvas?.parentNode) this._canvas.parentNode.removeChild(this._canvas);
-      if (this._tooltip?.parentNode) this._tooltip.parentNode.removeChild(this._tooltip);
-      this._weatherMap?.off("moveend zoomend resize", (this as unknown as { _reset: () => void })._reset, this);
-      this._weatherMap?.off("mousemove", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
-      this._weatherMap?.off("mouseout movestart zoomstart", (this as unknown as { _hideHover: () => void })._hideHover, this);
-    },
-    _hideHover(this: RainForecastLayerInternal) {
-      hideHoverReadout(this._tooltip);
-    },
-    _moveHover(this: RainForecastLayerInternal, event: L.LeafletMouseEvent) {
-      if (!this._weatherMap || !this._tooltip || surfaceGrid.size === 0) return;
-      const sample = interpolatedSurfaceSample(surfaceGrid, event.latlng.lat, event.latlng.lng);
-      if (!sample) {
-        this._hideHover();
-        return;
-      }
-
-      positionHoverReadout(this._weatherMap, event, this._tooltip);
-      this._tooltip.innerHTML = rainForecastHoverContent(sample, event.latlng.lat, event.latlng.lng, includeLocalTime ? forecastSampleTimestamp(sample) : undefined);
-      showHoverReadout(this._tooltip);
-    },
-    _reset(this: RainForecastLayerInternal) {
-      if (!this._weatherMap || !this._canvas) return;
-      const map = this._weatherMap;
-      const canvas = this._canvas;
-      const size = map.getSize();
-      const topLeft = map.containerPointToLayerPoint([0, 0]);
-      const scale = surfaceRasterScale(size, map.getZoom());
-      const width = Math.max(1, Math.ceil(size.x * scale));
-      const height = Math.max(1, Math.ceil(size.y * scale));
-      L.DomUtil.setPosition(canvas, topLeft);
-      canvas.width = width;
-      canvas.height = height;
-      canvas.style.width = `${size.x}px`;
-      canvas.style.height = `${size.y}px`;
-
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return;
-      ctx.imageSmoothingEnabled = true;
-      ctx.clearRect(0, 0, width, height);
-
-      if (surfaceGrid.size === 0) return;
-
-      const image = ctx.createImageData(width, height);
-      for (let y = 0; y < height; y += 1) {
-        for (let x = 0; x < width; x += 1) {
-          const latLng = map.containerPointToLatLng([(x + 0.5) / scale, (y + 0.5) / scale]);
-          const sample = interpolatedSurfaceSample(surfaceGrid, latLng.lat, latLng.lng);
-          const precipitation = sample?.precipitation ?? 0;
-          const rgb = rainForecastRgb(precipitation);
-          const index = (y * width + x) * 4;
-          image.data[index] = rgb[0];
-          image.data[index + 1] = rgb[1];
-          image.data[index + 2] = rgb[2];
-          image.data[index + 3] = precipitation <= 0.05 ? 0 : Math.max(58, Math.min(154, 68 + precipitation * 10));
-        }
-      }
-
-      ctx.putImageData(image, 0, 0);
-    }
-  });
-
-  return new CanvasLayer();
-}
-
-function windHoverContent(sample: SurfaceSample, lat: number, lon: number, timestamp?: number) {
-  const localTimeRow = timestamp !== undefined ? `<span>Local time</span><b>${localTimeSummary(lat, lon, timestamp)}</b>` : "";
+function windHoverContent(sample: SurfaceSample, lat: number, lon: number, units: UnitSettings, language = "en", timestamp?: number) {
+  const text = mapCopy(language);
+  const localTimeRow = timestamp !== undefined ? `<span>${text.localTime}</span><b>${localTimeSummary(lat, lon, timestamp)}</b>` : "";
   const fromDirection = normalizeBearing(sample.windDirection);
   const toDirection = normalizeBearing(fromDirection + 180);
-  const strength = windStrengthLabel(sample.windSpeed);
+  const strength = windStrengthLabel(sample.windSpeed, language);
   const fromLabel = windCompassLabel(fromDirection);
   const toLabel = windCompassLabel(toDirection);
   const arrow = `<span class="wind-arrow" style="--wind-dir: ${toDirection}deg" aria-hidden="true">&uarr;</span>`;
 
-  return `<strong class="wind-title">${arrow}<span>${Math.round(sample.windSpeed)} km/h · ${strength}</span></strong><div class="hover-metrics">
-    <span>Direction</span><b><span class="wind-direction-readout">${arrow}${toLabel}</span></b>
-    <span>Gust</span><b>${Math.round(sample.windGust)} km/h</b>
-    <span>Pressure</span><b>${Math.round(sample.pressure)} hPa</b>
+  return `<strong class="wind-title">${arrow}<span>${text.wind} ${formatWind(sample.windSpeed, units.windUnit)} · ${strength}</span></strong><div class="hover-metrics">
+    <span>${text.direction}</span><b><span class="wind-direction-readout">${toLabel}</span></b>
+    <span>${text.pressure}</span><b>${Math.round(sample.pressure)} hPa</b>
     ${localTimeRow}
-  </div><em>Blowing from ${fromLabel} · ${lat.toFixed(1)}°, ${normalizeLongitude(lon).toFixed(1)}°</em>`;
-}
-
-function rainForecastHoverContent(sample: SurfaceSample, lat: number, lon: number, timestamp?: number) {
-  const localTimeRow = timestamp !== undefined ? `<span>Forecast time</span><b>${localTimeSummary(lat, lon, timestamp)}</b>` : "";
-  const precipitation = Math.max(0, sample.precipitation);
-  const level = rainForecastLevel(precipitation);
-  const windRows = `<span>Wind</span><b>${Math.round(sample.windSpeed)} km/h</b><span>Gust</span><b>${Math.round(sample.windGust)} km/h</b>`;
-
-  return `<strong>${level}</strong><div class="hover-metrics">
-    <span>Rain</span><b>${precipitation.toFixed(1)} mm/h</b>
-    <span>Weather</span><b>${escapeHtml(weatherCodeLabel(sample.weatherCode))}</b>
-    ${windRows}
-    ${localTimeRow}
-  </div><em>${lat.toFixed(1)}°, ${normalizeLongitude(lon).toFixed(1)}°</em>`;
-}
-
-function rainForecastLevel(precipitation: number) {
-  if (precipitation < 0.1) return "No rain expected";
-  if (precipitation < 1) return "Light rain forecast";
-  if (precipitation < 3) return "Moderate rain forecast";
-  if (precipitation < 8) return "Heavy rain forecast";
-  return "Very heavy rain forecast";
-}
-
-function rainForecastRgb(precipitation: number): [number, number, number] {
-  const stops: Array<[number, [number, number, number]]> = [
-    [0, [148, 163, 184]],
-    [0.2, [125, 211, 252]],
-    [1, [14, 165, 233]],
-    [3, [37, 99, 235]],
-    [8, [250, 204, 21]],
-    [18, [249, 115, 22]],
-    [30, [239, 68, 68]]
-  ];
-  const value = Math.max(0, precipitation);
-  for (let index = 0; index < stops.length - 1; index += 1) {
-    const [startValue, startColor] = stops[index];
-    const [endValue, endColor] = stops[index + 1];
-    if (value <= endValue) {
-      const ratio = Math.max(0, Math.min(1, (value - startValue) / (endValue - startValue)));
-      return [
-        Math.round(lerp(startColor[0], endColor[0], ratio)),
-        Math.round(lerp(startColor[1], endColor[1], ratio)),
-        Math.round(lerp(startColor[2], endColor[2], ratio))
-      ];
-    }
-  }
-
-  return stops[stops.length - 1][1];
-}
-
-function windStrengthLabel(windSpeed: number) {
-  if (windSpeed < 6) return "Calm";
-  if (windSpeed < 20) return "Weak";
-  if (windSpeed < 39) return "Moderate";
-  if (windSpeed < 62) return "Strong";
-  if (windSpeed < 88) return "Very strong";
-  if (windSpeed < 118) return "Gale";
-  return "Storm-force";
+  </div><em>${text.blowingFrom} ${fromLabel} · ${lat.toFixed(1)}°, ${normalizeLongitude(lon).toFixed(1)}°</em>`;
 }
 
 function windCompassLabel(direction: number) {
@@ -548,14 +794,31 @@ interface SurfaceSample {
   windGust: number;
   windDirection: number;
   precipitation: number;
+  precipitationProbability?: number;
   pressure: number;
   cloudCover: number;
 }
 
+interface SurfaceStation extends SurfaceSample {
+  lat: number;
+  lon: number;
+}
+
+interface SurfaceGrid {
+  samples: Map<string, SurfaceSample>;
+  latStep: number;
+  lonStep: number;
+}
+
 function makeSurfaceGrid(points: WeatherGridPoint[]) {
-  const grid = new Map<string, SurfaceSample>();
+  const grid: SurfaceGrid = {
+    samples: new Map<string, SurfaceSample>(),
+    latStep: inferredCoordinateStep(points.map((point) => point.lat), 10),
+    lonStep: inferredCoordinateStep(points.map((point) => normalizeLongitude(point.lon)), 10)
+  };
+
   points.forEach((point) => {
-    grid.set(surfaceGridKey(point.lat, point.lon), {
+    grid.samples.set(surfaceGridKey(point.lat, point.lon), {
       temperature: point.temperature,
       time: point.time,
       weatherCode: point.weatherCode,
@@ -563,6 +826,7 @@ function makeSurfaceGrid(points: WeatherGridPoint[]) {
       windGust: point.windGust,
       windDirection: point.windDirection ?? 0,
       precipitation: point.precipitation,
+      precipitationProbability: point.precipitationProbability,
       pressure: point.pressure,
       cloudCover: point.cloudCover ?? 0
     });
@@ -570,60 +834,174 @@ function makeSurfaceGrid(points: WeatherGridPoint[]) {
   return grid;
 }
 
+function inferredCoordinateStep(values: number[], fallback: number) {
+  const unique = Array.from(new Set(values.map((value) => Math.round(value * 1000) / 1000))).sort((left, right) => left - right);
+  const deltas = unique
+    .slice(1)
+    .map((value, index) => Math.abs(value - unique[index]))
+    .filter((delta) => delta >= 0.01 && delta <= 30);
+  if (deltas.length === 0) return fallback;
+  return Math.round(Math.min(...deltas) * 1000) / 1000;
+}
+
+function makeSurfaceStations(points: WeatherGridPoint[] = []): SurfaceStation[] {
+  return points.map((point) => ({
+    lat: point.lat,
+    lon: point.lon,
+    temperature: point.temperature,
+    time: point.time,
+    weatherCode: point.weatherCode,
+    windSpeed: point.windSpeed,
+    windGust: point.windGust,
+    windDirection: point.windDirection ?? 0,
+    precipitation: point.precipitation,
+    precipitationProbability: point.precipitationProbability,
+    pressure: point.pressure,
+    cloudCover: point.cloudCover ?? 0
+  }));
+}
+
 function surfaceGridKey(lat: number, lon: number) {
-  return `${Math.round(lat)}:${Math.round(normalizeLongitude(lon))}`;
+  return `${(Math.round(lat * 1000) / 1000).toFixed(3)}:${(Math.round(normalizeLongitude(lon) * 1000) / 1000).toFixed(3)}`;
 }
 
 function surfaceRasterScale(size: L.Point, zoom: number) {
   const desired = Math.max(0.42, Math.min(0.76, 0.36 + zoom * 0.045));
   const maxScale = Math.sqrt(SURFACE_RASTER_MAX_PIXELS / Math.max(1, size.x * size.y));
-  return Math.max(0.36, Math.min(desired, maxScale));
+  return Math.max(0.22, Math.min(desired, maxScale));
 }
 
-function gridCell(lat: number, lon: number) {
+function surfaceRasterCoordinates(map: L.Map, width: number, height: number, scale: number) {
+  const lons = new Float32Array(width);
+  const lats = new Float32Array(height);
+
+  for (let x = 0; x < width; x += 1) {
+    lons[x] = map.containerPointToLatLng([(x + 0.5) / scale, 0]).lng;
+  }
+
+  for (let y = 0; y < height; y += 1) {
+    lats[y] = map.containerPointToLatLng([0, (y + 0.5) / scale]).lat;
+  }
+
+  return { lats, lons };
+}
+
+function gridCell(grid: SurfaceGrid, lat: number, lon: number) {
+  const latStep = grid.latStep;
+  const lonStep = grid.lonStep;
   const clampedLat = Math.max(SURFACE_GRID_MIN_LAT, Math.min(SURFACE_GRID_MAX_LAT, lat));
   const normalizedLon = normalizeLongitude(lon);
   const south =
     clampedLat >= SURFACE_GRID_MAX_LAT
-      ? SURFACE_GRID_MAX_LAT - SURFACE_GRID_STEP
-      : Math.floor(clampedLat / SURFACE_GRID_STEP) * SURFACE_GRID_STEP;
-  const north = Math.min(SURFACE_GRID_MAX_LAT, south + SURFACE_GRID_STEP);
+      ? SURFACE_GRID_MAX_LAT - latStep
+      : Math.floor(clampedLat / latStep) * latStep;
+  const north = Math.min(SURFACE_GRID_MAX_LAT, south + latStep);
   const latRatio = north === south ? 0 : (clampedLat - south) / (north - south);
 
   const shiftedLon = normalizedLon + 180;
-  const west = -180 + Math.floor(shiftedLon / SURFACE_GRID_STEP) * SURFACE_GRID_STEP;
-  const east = west + SURFACE_GRID_STEP >= 180 ? -180 : west + SURFACE_GRID_STEP;
-  const lonRatio = (shiftedLon - Math.floor(shiftedLon / SURFACE_GRID_STEP) * SURFACE_GRID_STEP) / SURFACE_GRID_STEP;
+  const west = -180 + Math.floor(shiftedLon / lonStep) * lonStep;
+  const east = west + lonStep >= 180 ? -180 : west + lonStep;
+  const lonRatio = (shiftedLon - Math.floor(shiftedLon / lonStep) * lonStep) / lonStep;
 
   return { south, north, west, east, latRatio, lonRatio };
 }
 
-function interpolatedSurfaceSample(grid: Map<string, SurfaceSample>, lat: number, lon: number): SurfaceSample | undefined {
-  const { south, north, west, east, latRatio, lonRatio } = gridCell(lat, lon);
+function interpolatedSurfaceSample(grid: SurfaceGrid, lat: number, lon: number, stations: SurfaceStation[] = []): SurfaceSample | undefined {
+  const base = interpolatedGridSample(grid, lat, lon);
+  return blendSurfaceStations(base, stations, lat, lon);
+}
+
+function interpolatedSurfacePaintSample(grid: SurfaceGrid, lat: number, lon: number): SurfaceSample | undefined {
+  return interpolatedGridCellSample(grid, lat, lon);
+}
+
+function interpolatedGridSample(grid: SurfaceGrid, lat: number, lon: number): SurfaceSample | undefined {
+  const interpolated = interpolatedGridCellSample(grid, lat, lon);
+  if (!interpolated) return nearestSurfaceSample(grid, lat, lon);
+  const nearest = nearestSurfaceSample(grid, lat, lon);
+  return {
+    ...interpolated,
+    time: nearest?.time ?? interpolated.time,
+    weatherCode: nearest?.weatherCode ?? interpolated.weatherCode
+  };
+}
+
+function interpolatedGridCellSample(grid: SurfaceGrid, lat: number, lon: number): SurfaceSample | undefined {
+  const { south, north, west, east, latRatio, lonRatio } = gridCell(grid, lat, lon);
   const southwest = readSurfaceGrid(grid, south, west);
   const southeast = readSurfaceGrid(grid, south, east);
   const northwest = readSurfaceGrid(grid, north, west);
   const northeast = readSurfaceGrid(grid, north, east);
 
-  if (!southwest || !southeast || !northwest || !northeast) return nearestSurfaceSample(grid, lat, lon);
+  if (!southwest || !southeast || !northwest || !northeast) return undefined;
 
-  const interpolate = (key: keyof Omit<SurfaceSample, "time" | "weatherCode" | "windDirection">) => {
-    const southValue = lerp(southwest[key], southeast[key], lonRatio);
-    const northValue = lerp(northwest[key], northeast[key], lonRatio);
+  const interpolate = (key: keyof Omit<SurfaceSample, "time" | "weatherCode" | "windDirection">, fallback = 0) => {
+    const southValue = lerp(southwest[key] ?? fallback, southeast[key] ?? fallback, lonRatio);
+    const northValue = lerp(northwest[key] ?? fallback, northeast[key] ?? fallback, lonRatio);
     return lerp(southValue, northValue, latRatio);
   };
 
   return {
     temperature: interpolate("temperature"),
-    time: nearestSurfaceSample(grid, lat, lon)?.time ?? southwest.time,
-    weatherCode: nearestSurfaceSample(grid, lat, lon)?.weatherCode ?? southwest.weatherCode,
+    time: southwest.time,
+    weatherCode: southwest.weatherCode,
     windSpeed: interpolate("windSpeed"),
     windGust: interpolate("windGust"),
     windDirection: interpolatedWindDirection(southwest, southeast, northwest, northeast, latRatio, lonRatio),
     precipitation: interpolate("precipitation"),
+    precipitationProbability: interpolate("precipitationProbability"),
     pressure: interpolate("pressure"),
     cloudCover: interpolate("cloudCover")
   };
+}
+
+function blendSurfaceStations(base: SurfaceSample | undefined, stations: SurfaceStation[], lat: number, lon: number): SurfaceSample | undefined {
+  if (stations.length === 0) return base;
+
+  const nearby = stations
+    .map((station) => {
+      const distance = surfaceDistanceKm(lat, lon, station.lat, station.lon);
+      if (distance <= 1.5) return { station, weight: Number.POSITIVE_INFINITY, distance };
+      const radiusKm = 420;
+      const falloff = Math.max(0, 1 - distance / radiusKm);
+      return { station, weight: falloff * falloff * 7, distance };
+    })
+    .filter(({ weight }) => weight > 0)
+    .sort((left, right) => right.weight - left.weight);
+
+  if (nearby.length === 0) return base;
+  if (!Number.isFinite(nearby[0].weight)) return nearby[0].station;
+
+  const baseWeight = base ? 0.35 : 0;
+  const totalWeight = baseWeight + nearby.reduce((sum, item) => sum + item.weight, 0);
+  if (totalWeight <= 0) return base;
+
+  const mix = (key: keyof Omit<SurfaceSample, "time" | "weatherCode" | "windDirection">) =>
+    ((base?.[key] ?? 0) * baseWeight + nearby.reduce((sum, { station, weight }) => sum + (station[key] ?? 0) * weight, 0)) / totalWeight;
+
+  const closest = nearby.reduce((best, item) => (item.distance < best.distance ? item : best), nearby[0]);
+  return {
+    temperature: mix("temperature"),
+    time: closest.station.time ?? base?.time,
+    weatherCode: closest.station.weatherCode ?? base?.weatherCode ?? 0,
+    windSpeed: mix("windSpeed"),
+    windGust: mix("windGust"),
+    windDirection: closest.station.windDirection ?? base?.windDirection ?? 0,
+    precipitation: mix("precipitation"),
+    precipitationProbability: mix("precipitationProbability"),
+    pressure: mix("pressure"),
+    cloudCover: mix("cloudCover")
+  };
+}
+
+function surfaceDistanceKm(latA: number, lonA: number, latB: number, lonB: number) {
+  const toRad = Math.PI / 180;
+  const deltaLat = (latB - latA) * toRad;
+  const deltaLon = ((((lonB - lonA) % 360) + 540) % 360 - 180) * toRad;
+  const a =
+    Math.sin(deltaLat / 2) ** 2 +
+    Math.cos(latA * toRad) * Math.cos(latB * toRad) * Math.sin(deltaLon / 2) ** 2;
+  return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
 function forecastSampleTimestamp(sample: SurfaceSample) {
@@ -659,26 +1037,26 @@ function windDirectionVector(direction: number) {
   };
 }
 
-function readSurfaceGrid(grid: Map<string, SurfaceSample>, lat: number, lon: number) {
-  return grid.get(surfaceGridKey(lat, lon));
+function readSurfaceGrid(grid: SurfaceGrid, lat: number, lon: number) {
+  return grid.samples.get(surfaceGridKey(lat, lon));
 }
 
-function nearestSurfaceSample(grid: Map<string, SurfaceSample>, lat: number, lon: number) {
+function nearestSurfaceSample(grid: SurfaceGrid, lat: number, lon: number) {
   return nearestSurfacePoint(grid, lat, lon)?.sample;
 }
 
-function nearestSurfacePoint(grid: Map<string, SurfaceSample>, lat: number, lon: number) {
-  const nearestLat = Math.max(
-    SURFACE_GRID_MIN_LAT,
-    Math.min(SURFACE_GRID_MAX_LAT, Math.round(lat / SURFACE_GRID_STEP) * SURFACE_GRID_STEP)
-  );
-  const normalizedLon = normalizeLongitude(lon);
-  const nearestLon = normalizeLongitude(Math.round(normalizedLon / SURFACE_GRID_STEP) * SURFACE_GRID_STEP);
-  const sample = readSurfaceGrid(grid, nearestLat, nearestLon);
-  if (!sample) return undefined;
-
-  const visibleLon = nearestLon + Math.round((lon - nearestLon) / 360) * 360;
-  return { lat: nearestLat, lon: visibleLon, sample };
+function nearestSurfacePoint(grid: SurfaceGrid, lat: number, lon: number) {
+  let nearest: { lat: number; lon: number; sample: SurfaceSample; distance: number } | undefined;
+  grid.samples.forEach((sample, key) => {
+    const [sampleLatText, sampleLonText] = key.split(":");
+    const sampleLat = Number(sampleLatText);
+    const sampleLon = Number(sampleLonText);
+    if (!Number.isFinite(sampleLat) || !Number.isFinite(sampleLon)) return;
+    const distance = surfaceDistanceKm(lat, lon, sampleLat, sampleLon);
+    if (!nearest || distance < nearest.distance) nearest = { lat: sampleLat, lon: sampleLon, sample, distance };
+  });
+  if (!nearest) return undefined;
+  return { lat: nearest.lat, lon: nearest.lon + Math.round((lon - nearest.lon) / 360) * 360, sample: nearest.sample };
 }
 
 function lerp(start: number, end: number, ratio: number) {
@@ -774,16 +1152,33 @@ function makeLocalTimeHoverLayer() {
 interface RadarPixelSample {
   weatherType: string;
   rainfall: string;
+  rainfallMmRange?: [number, number?];
   intensity: string;
   confidence: string;
   dbz?: number;
 }
 
 type RainRadarLayerInstance = L.Layer & {
-  updateRainRadar: (rainViewer: RainViewerState, frame: RainFrame, weatherGrid: WeatherGridPoint[], includeLocalTime: boolean) => void;
+  updateRainRadar: (
+    rainViewer: RainViewerState,
+    frame: RainFrame,
+    weatherGrid: WeatherGridPoint[],
+    liveWeatherPoints: WeatherGridPoint[],
+    includeLocalTime: boolean,
+    units: UnitSettings,
+    language: string
+  ) => void;
 };
 
-function makeRainRadarLayer(rainViewer: RainViewerState, frame: RainFrame, weatherGrid: WeatherGridPoint[], includeLocalTime = false) {
+function makeRainRadarLayer(
+  rainViewer: RainViewerState,
+  frame: RainFrame,
+  weatherGrid: WeatherGridPoint[],
+  liveWeatherPoints: WeatherGridPoint[] = [],
+  includeLocalTime = false,
+  units: UnitSettings = DEFAULT_UNIT_SETTINGS,
+  language = "en"
+) {
   const makeTileLayer = (state: RainViewerState, radarFrame: RainFrame, opacity = 0.78) => L.tileLayer(`${state.host}${radarFrame.path}/512/{z}/{x}/{y}/2/1_1.png`, {
     opacity,
     maxNativeZoom: 7,
@@ -800,7 +1195,10 @@ function makeRainRadarLayer(rainViewer: RainViewerState, frame: RainFrame, weath
   let currentRainViewer = rainViewer;
   let currentFrame = frame;
   let currentSurfaceGrid = makeSurfaceGrid(weatherGrid);
+  let currentSurfaceStations = makeSurfaceStations(liveWeatherPoints);
   let currentIncludeLocalTime = includeLocalTime;
+  let currentUnits = units;
+  let currentLanguage = language;
   let currentUrlKey = initialUrlKey(rainViewer, frame);
 
   interface RainRadarLayerInternal extends L.Layer {
@@ -839,12 +1237,18 @@ function makeRainRadarLayer(rainViewer: RainViewerState, frame: RainFrame, weath
       nextRainViewer: RainViewerState,
       nextFrame: RainFrame,
       nextWeatherGrid: WeatherGridPoint[],
-      nextIncludeLocalTime: boolean
+      nextLiveWeatherPoints: WeatherGridPoint[],
+      nextIncludeLocalTime: boolean,
+      nextUnits: UnitSettings,
+      nextLanguage: string
     ) {
       currentRainViewer = nextRainViewer;
       currentFrame = nextFrame;
       currentSurfaceGrid = makeSurfaceGrid(nextWeatherGrid);
+      currentSurfaceStations = makeSurfaceStations(nextLiveWeatherPoints);
       currentIncludeLocalTime = nextIncludeLocalTime;
+      currentUnits = nextUnits;
+      currentLanguage = nextLanguage;
 
       const nextUrlKey = initialUrlKey(nextRainViewer, nextFrame);
       if (!this._weatherMap || nextUrlKey === currentUrlKey) return;
@@ -874,17 +1278,17 @@ function makeRainRadarLayer(rainViewer: RainViewerState, frame: RainFrame, weath
     _moveHover(this: RainRadarLayerInternal, event: L.LeafletMouseEvent) {
       if (!this._weatherMap || !this._tooltip) return;
       const lookup = radarTileLookup(this._weatherMap, currentRainViewer, currentFrame, event.latlng);
-      const surface = interpolatedSurfaceSample(currentSurfaceGrid, event.latlng.lat, event.latlng.lng);
+      const surface = interpolatedSurfaceSample(currentSurfaceGrid, event.latlng.lat, event.latlng.lng, currentSurfaceStations);
       const serial = (this._hoverSerial ?? 0) + 1;
       this._hoverSerial = serial;
       positionHoverReadout(this._weatherMap, event, this._tooltip);
-      this._tooltip.innerHTML = radarHoverContent(undefined, currentFrame, event.latlng.lat, event.latlng.lng, surface, currentIncludeLocalTime ? Date.now() : undefined);
+      this._tooltip.innerHTML = radarHoverContent(undefined, currentFrame, event.latlng.lat, event.latlng.lng, surface, currentUnits, currentLanguage, currentIncludeLocalTime ? Date.now() : undefined);
       showHoverReadout(this._tooltip);
 
       void sampleRadarTile(lookup, this._tileCache ?? new Map(), surface?.temperature).then((sample) => {
         if (this._hoverSerial !== serial || !this._tooltip || !this._weatherMap) return;
         positionHoverReadout(this._weatherMap, event, this._tooltip);
-        this._tooltip.innerHTML = radarHoverContent(sample, currentFrame, event.latlng.lat, event.latlng.lng, surface, currentIncludeLocalTime ? Date.now() : undefined);
+        this._tooltip.innerHTML = radarHoverContent(sample, currentFrame, event.latlng.lat, event.latlng.lng, surface, currentUnits, currentLanguage, currentIncludeLocalTime ? Date.now() : undefined);
         showHoverReadout(this._tooltip);
       });
     }
@@ -895,6 +1299,19 @@ function makeRainRadarLayer(rainViewer: RainViewerState, frame: RainFrame, weath
 
 function isRainRadarLayer(layer: L.Layer | null): layer is RainRadarLayerInstance {
   return Boolean(layer && "updateRainRadar" in layer && typeof (layer as RainRadarLayerInstance).updateRainRadar === "function");
+}
+
+function rainViewerFrames(rainViewer?: RainViewerState) {
+  return rainViewer ? [...rainViewer.past, ...rainViewer.nowcast] : [];
+}
+
+function defaultRainViewerFrame(rainViewer?: RainViewerState) {
+  return rainViewer?.past.at(-1) ?? rainViewer?.nowcast[0];
+}
+
+function selectedRainViewerFrame(rainViewer: RainViewerState | undefined, selectedTime: number | undefined) {
+  const frames = rainViewerFrames(rainViewer);
+  return frames.find((frame) => frame.time === selectedTime) ?? defaultRainViewerFrame(rainViewer);
 }
 
 function radarTileLookup(map: L.Map, rainViewer: RainViewerState, frame: RainFrame, latLng: L.LatLng) {
@@ -1008,6 +1425,7 @@ function classifyRadarPixel(red: number, green: number, blue: number, alpha: num
     return {
       weatherType: "No rain detected",
       rainfall: "0 mm/h",
+      rainfallMmRange: [0, 0],
       intensity: "Dry",
       confidence: "Radar pixel is transparent"
     };
@@ -1044,6 +1462,7 @@ function radarSampleFromDbz(dbz: number, family: "rain" | "snow" | "unknown", te
     return {
       weatherType: precipitationTypeLabel("Very light", family, temperature),
       rainfall: "0-0.2 mm/h",
+      rainfallMmRange: [0, 0.2],
       intensity: "Trace",
       confidence: radarConfidence(family, temperature),
       dbz
@@ -1054,6 +1473,7 @@ function radarSampleFromDbz(dbz: number, family: "rain" | "snow" | "unknown", te
     return {
       weatherType: precipitationTypeLabel("Light", family, temperature),
       rainfall: "0.2-1 mm/h",
+      rainfallMmRange: [0.2, 1],
       intensity: "Light",
       confidence: radarConfidence(family, temperature),
       dbz
@@ -1064,6 +1484,7 @@ function radarSampleFromDbz(dbz: number, family: "rain" | "snow" | "unknown", te
     return {
       weatherType: precipitationTypeLabel("Light", family, temperature),
       rainfall: "1-3 mm/h",
+      rainfallMmRange: [1, 3],
       intensity: "Light",
       confidence: radarConfidence(family, temperature),
       dbz
@@ -1074,6 +1495,7 @@ function radarSampleFromDbz(dbz: number, family: "rain" | "snow" | "unknown", te
     return {
       weatherType: precipitationTypeLabel("Moderate", family, temperature),
       rainfall: "3-8 mm/h",
+      rainfallMmRange: [3, 8],
       intensity: "Moderate",
       confidence: radarConfidence(family, temperature),
       dbz
@@ -1084,6 +1506,7 @@ function radarSampleFromDbz(dbz: number, family: "rain" | "snow" | "unknown", te
     return {
       weatherType: precipitationTypeLabel("Heavy", family, temperature),
       rainfall: "8-18 mm/h",
+      rainfallMmRange: [8, 18],
       intensity: "Heavy",
       confidence: radarConfidence(family, temperature),
       dbz
@@ -1094,6 +1517,7 @@ function radarSampleFromDbz(dbz: number, family: "rain" | "snow" | "unknown", te
     return {
       weatherType: precipitationTypeLabel("Very heavy", family, temperature),
       rainfall: "18-30 mm/h",
+      rainfallMmRange: [18, 30],
       intensity: "Severe",
       confidence: radarConfidence(family, temperature),
       dbz
@@ -1103,6 +1527,7 @@ function radarSampleFromDbz(dbz: number, family: "rain" | "snow" | "unknown", te
   return {
     weatherType: precipitationTypeLabel("Intense", family, temperature),
     rainfall: "30+ mm/h",
+    rainfallMmRange: [30],
     intensity: "Extreme",
     confidence: radarConfidence(family, temperature),
     dbz
@@ -1121,34 +1546,51 @@ function radarConfidence(family: "rain" | "snow" | "unknown", temperature?: numb
   return temperature === undefined ? "Estimated from RainViewer color table" : "Estimated from RainViewer color table and local temperature";
 }
 
-function radarHoverContent(sample: RadarPixelSample | null | undefined, frame: RainFrame, lat: number, lon: number, surface?: SurfaceSample, timestamp?: number) {
-  const frameTime = new Date(frame.time * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  const localTimeRow = timestamp !== undefined ? `<span>Local time</span><b>${localTimeSummary(lat, lon, timestamp)}</b>` : "";
-  const temperatureRow = surface?.temperature !== undefined ? `<span>Est. temp</span><b>${Math.round(surface.temperature)}\u00b0C</b>` : "";
+function radarHoverContent(
+  sample: RadarPixelSample | null | undefined,
+  frame: RainFrame,
+  lat: number,
+  lon: number,
+  surface: SurfaceSample | undefined,
+  units: UnitSettings,
+  language = "en",
+  timestamp?: number
+) {
+  const text = mapCopy(language);
+  const frameTime = new Date(frame.time * 1000).toLocaleTimeString(language, { hour: "2-digit", minute: "2-digit" });
+  const localTimeRow = timestamp !== undefined ? `<span>${text.localTime}</span><b>${localTimeSummary(lat, lon, timestamp)}</b>` : "";
+  const temperatureRow = surface?.temperature !== undefined ? `<span>${text.estTemp}</span><b>${formatTemperature(surface.temperature, units.temperatureUnit)}</b>` : "";
   const windRows = surface
-    ? `<span>Wind</span><b>${Math.round(surface.windSpeed)} km/h</b><span>Gust</span><b>${Math.round(surface.windGust)} km/h</b>`
+    ? `<span>${text.wind}</span><b>${windReadoutHtml(surface.windSpeed, surface.windDirection, units, language)}</b>`
     : "";
   if (!sample) {
-    const title = sample === null ? "Radar sample unavailable" : "Reading radar";
-    const note = sample === null ? "Provider tile could not be sampled" : `${lat.toFixed(1)}°, ${normalizeLongitude(lon).toFixed(1)}°`;
+    const title = sample === null ? text.radarUnavailable : text.readingRadar;
+    const note = sample === null ? text.providerUnavailable : `${lat.toFixed(1)}°, ${normalizeLongitude(lon).toFixed(1)}°`;
     return `<strong>${title}</strong><div class="hover-metrics">
-      <span>Rainfall</span><b>--</b>
-      <span>Frame</span><b>${frameTime}</b>
+      <span>${text.rainfall}</span><b>--</b>
+      <span>${text.frame}</span><b>${frameTime}</b>
       ${windRows}
       ${temperatureRow}
       ${localTimeRow}
     </div><em>${note}</em>`;
   }
 
-  return `<strong>${sample.weatherType}</strong><div class="hover-metrics">
-    <span>Rainfall</span><b>${sample.rainfall}</b>
-    <span>Intensity</span><b>${sample.intensity}</b>
+  const lowerRainRate = sample.rainfallMmRange?.[0] ?? 0;
+  const localizedWeatherType = lowerRainRate < 0.1
+    ? text.noRainDetected
+    : surface?.temperature !== undefined
+      ? `${rainIntensityLabel(lowerRainRate, language)} ${surface.temperature <= 1.5 ? weatherCodeLabel(71, language).toLowerCase() : weatherCodeLabel(61, language).toLowerCase()}`
+      : sample.weatherType;
+  const confidence = surface?.temperature === undefined ? text.estimatedFromRadar : text.estimatedFromRadarTemp;
+  return `<strong>${localizedWeatherType}</strong><div class="hover-metrics">
+    <span>${text.rainfall}</span><b>${formatRainRateRange(sample.rainfallMmRange, units.rainUnit)}</b>
+    <span>${text.intensity}</span><b>${rainIntensityLabel(lowerRainRate, language)}</b>
     <span>dBZ</span><b>${sample.dbz !== undefined ? sample.dbz.toFixed(0) : "--"}</b>
-    <span>Frame</span><b>${frameTime}</b>
+    <span>${text.frame}</span><b>${frameTime}</b>
     ${windRows}
     ${temperatureRow}
     ${localTimeRow}
-  </div><em>${sample.confidence} at ${lat.toFixed(1)}°, ${normalizeLongitude(lon).toFixed(1)}°</em>`;
+  </div><em>${confidence} ${text.at} ${lat.toFixed(1)}°, ${normalizeLongitude(lon).toFixed(1)}°</em>`;
 }
 
 function makeTimezoneLayer() {
@@ -1357,7 +1799,7 @@ function makeEarthquakeLayer(earthquakes: EarthquakeEvent[]) {
         fillOpacity: 0.86,
         opacity: 0.95
       })
-        .bindPopup(earthquakePopup(quake))
+        .bindPopup(earthquakePopup(quake), NODE_POPUP_OPTIONS)
         .addTo(group);
     });
   });
@@ -1548,7 +1990,7 @@ function makeRiskSignalLayer(events: RiskSignalEvent[], includeLocalTime = false
         fillOpacity: 0.9,
         opacity: 0.94
       })
-        .bindPopup(riskPopup(event))
+        .bindPopup(riskPopup(event), NODE_POPUP_OPTIONS)
         .addTo(group);
 
       targets.push({ event, lat: event.lat, lon: event.lon + copyOffset, radius: heatRadius });
@@ -1778,7 +2220,7 @@ function makeAviationLayer({
             iconAnchor: [13, 13]
           })
         })
-          .bindPopup(aircraftPopup(plane, trackedIds.has(plane.id)))
+          .bindPopup(aircraftPopup(plane, trackedIds.has(plane.id)), NODE_POPUP_OPTIONS)
           .on("popupopen", (event) => bindAircraftPopupActions((event as L.PopupEvent).popup, plane, onToggleAircraftTrack))
           .addTo(group);
       });
@@ -1797,7 +2239,7 @@ function makeAviationLayer({
           fillOpacity: 0.9,
           opacity: 0.96
         })
-          .bindPopup(aviationIncidentPopup(incident))
+          .bindPopup(aviationIncidentPopup(incident), NODE_POPUP_OPTIONS)
           .addTo(group);
       });
     });
@@ -1931,7 +2373,7 @@ function warningDetailHtml(warning: GdacsAlert, appLanguage: string) {
 }
 
 function bindWarningPopup(layer: L.Layer, warning: GdacsAlert, appLanguage: string) {
-  layer.bindPopup(warningPopup(warning, appLanguage));
+  layer.bindPopup(warningPopup(warning, appLanguage), NODE_POPUP_OPTIONS);
   layer.on("popupopen", (event) => {
     const popup = (event as L.PopupEvent).popup;
     void translateWarningPopup(popup.getElement(), warning, appLanguage);
@@ -2092,6 +2534,7 @@ interface OverlapSelectableItem {
 function makeOverlapSelectorLayer(getItems: () => OverlapSelectableItem[]) {
   interface OverlapSelectorInternal extends L.Layer {
     _weatherMap?: L.Map;
+    _lastPopupOpenAt?: number;
     _click: (event: L.LeafletMouseEvent) => void;
     _popupOpen: (event: L.PopupEvent) => void;
   }
@@ -2108,10 +2551,11 @@ function makeOverlapSelectorLayer(getItems: () => OverlapSelectableItem[]) {
     },
     _click(this: OverlapSelectorInternal, event: L.LeafletMouseEvent) {
       if (!this._weatherMap) return;
+      if (Date.now() - (this._lastPopupOpenAt ?? 0) < 120) return;
       const candidates = overlappingItemsAtPoint(this._weatherMap, event.containerPoint, event.latlng.lng, getItems());
       if (candidates.length < 2) return;
 
-      const popup = L.popup({ className: "selector-popup", closeButton: true, autoPan: true })
+      const popup = L.popup(nodePopupOptions("selector-popup"))
         .setLatLng(event.latlng)
         .setContent(overlapSelectorContent(candidates))
         .openOn(this._weatherMap);
@@ -2120,6 +2564,7 @@ function makeOverlapSelectorLayer(getItems: () => OverlapSelectableItem[]) {
     },
     _popupOpen(this: OverlapSelectorInternal, event: L.PopupEvent) {
       if (!this._weatherMap) return;
+      this._lastPopupOpenAt = Date.now();
       const element = event.popup.getElement();
       if (element?.querySelector(".map-overlap-selector")) return;
       const latlng = event.popup.getLatLng();
@@ -2206,6 +2651,7 @@ function selectableItemsForMap({
   aviationIncidents,
   selectedLocation,
   inspectedLocation,
+  unitSettings,
   appLanguage,
   onToggleAircraftTrack
 }: {
@@ -2224,6 +2670,7 @@ function selectableItemsForMap({
   aviationIncidents: AviationIncident[];
   selectedLocation?: MapLocationDetails;
   inspectedLocation?: MapLocationDetails;
+  unitSettings: UnitSettings;
   appLanguage: string;
   onToggleAircraftTrack?: (id: string) => void;
 }): OverlapSelectableItem[] {
@@ -2308,7 +2755,7 @@ function selectableItemsForMap({
       lat: selectedLocation.latitude,
       lon: selectedLocation.longitude,
       radiusPx: 26,
-      popupHtml: locationPopup(selectedLocation)
+      popupHtml: locationPopup(selectedLocation, unitSettings, appLanguage)
     });
   }
 
@@ -2321,7 +2768,7 @@ function selectableItemsForMap({
       lat: inspectedLocation.latitude,
       lon: inspectedLocation.longitude,
       radiusPx: 26,
-      popupHtml: locationPopup(inspectedLocation)
+      popupHtml: locationPopup(inspectedLocation, unitSettings, appLanguage)
     });
   }
 
@@ -2362,6 +2809,7 @@ export function WeatherMap({
   showHomeMarker,
   dayNightTimestamp,
   weatherGrid,
+  liveWeatherPoints,
   earthquakes,
   warnings,
   riskEvents,
@@ -2370,6 +2818,8 @@ export function WeatherMap({
   trackedAircraftIds,
   aircraftTracks,
   rainViewer,
+  rainFrameTime,
+  unitSettings,
   mapLanguage,
   appLanguage,
   homeFocusRequest = 0,
@@ -2397,11 +2847,7 @@ export function WeatherMap({
   const lastInspectedFocusRequestRef = useRef(0);
   const lastAircraftFocusRequestRef = useRef(0);
 
-  const latestRainFrame = useMemo(() => {
-    if (!rainViewer) return undefined;
-    const frames = [...rainViewer.past, ...rainViewer.nowcast];
-    return frames[frames.length - 1];
-  }, [rainViewer]);
+  const selectedRainFrame = useMemo(() => selectedRainViewerFrame(rainViewer, rainFrameTime), [rainViewer, rainFrameTime]);
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
@@ -2411,6 +2857,7 @@ export function WeatherMap({
       minZoom: 2,
       maxZoom: 9,
       zoomControl: false,
+      closePopupOnClick: false,
       maxBounds: WORLD_BOUNDS,
       maxBoundsViscosity: 0.85
     }).setView([22, 4], 2);
@@ -2452,8 +2899,8 @@ export function WeatherMap({
     const map = mapRef.current;
     if (!map) return;
 
-    if (activeLayer === "radar" && rainViewer && latestRainFrame && isRainRadarLayer(activeLayerRef.current)) {
-      activeLayerRef.current.updateRainRadar(rainViewer, latestRainFrame, weatherGrid, showDayNight);
+    if (activeLayer === "radar" && rainViewer && selectedRainFrame && isRainRadarLayer(activeLayerRef.current)) {
+      activeLayerRef.current.updateRainRadar(rainViewer, selectedRainFrame, weatherGrid, liveWeatherPoints, showDayNight, unitSettings, appLanguage);
       return;
     }
 
@@ -2465,19 +2912,15 @@ export function WeatherMap({
     let nextLayer: L.Layer | undefined;
 
     if (activeLayer === "temperature") {
-      nextLayer = makeTemperatureLayer(weatherGrid, showDayNight);
+      nextLayer = makeTemperatureLayer(weatherGrid, liveWeatherPoints, showDayNight, unitSettings);
     }
 
     if (activeLayer === "wind") {
-      nextLayer = makeWindLayer(weatherGrid, showDayNight);
+      nextLayer = makeWindLayer(weatherGrid, liveWeatherPoints, showDayNight, unitSettings, appLanguage);
     }
 
-    if (activeLayer === "rainForecast") {
-      nextLayer = makeRainForecastLayer(weatherGrid, showDayNight);
-    }
-
-    if (activeLayer === "radar" && rainViewer && latestRainFrame) {
-      nextLayer = makeRainRadarLayer(rainViewer, latestRainFrame, weatherGrid, showDayNight);
+    if (activeLayer === "radar" && rainViewer && selectedRainFrame) {
+      nextLayer = makeRainRadarLayer(rainViewer, selectedRainFrame, weatherGrid, liveWeatherPoints, showDayNight, unitSettings, appLanguage);
     }
 
     if (activeLayer === "seismic") {
@@ -2492,7 +2935,7 @@ export function WeatherMap({
       nextLayer.addTo(map);
       activeLayerRef.current = nextLayer;
     }
-  }, [activeLayer, weatherGrid, rainViewer, latestRainFrame, earthquakes, riskEvents, showDayNight]);
+  }, [activeLayer, weatherGrid, liveWeatherPoints, rainViewer, selectedRainFrame, earthquakes, riskEvents, showDayNight, unitSettings, appLanguage]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -2670,12 +3113,12 @@ export function WeatherMap({
     let hasMarkers = false;
 
     if (selectedLocation && showHomeMarker) {
-      addLocationMarkers(group, selectedLocation, "home-marker", HOME_MARKER_ICON);
+      addLocationMarkers(group, selectedLocation, "home-marker", HOME_MARKER_ICON, unitSettings, appLanguage);
       hasMarkers = true;
     }
 
     if (inspectedLocation) {
-      addLocationMarkers(group, inspectedLocation, "place-marker", PLACE_MARKER_ICON);
+      addLocationMarkers(group, inspectedLocation, "place-marker", PLACE_MARKER_ICON, unitSettings, appLanguage);
       hasMarkers = true;
     }
 
@@ -2683,7 +3126,7 @@ export function WeatherMap({
       group.addTo(map);
       locationLayerRef.current = group;
     }
-  }, [selectedLocation, inspectedLocation, showHomeMarker]);
+  }, [selectedLocation, inspectedLocation, showHomeMarker, unitSettings, appLanguage]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -2711,6 +3154,7 @@ export function WeatherMap({
         aviationIncidents,
         selectedLocation,
         inspectedLocation,
+        unitSettings,
         appLanguage,
         onToggleAircraftTrack
       })
@@ -2731,6 +3175,7 @@ export function WeatherMap({
     aviationIncidents,
     selectedLocation,
     inspectedLocation,
+    unitSettings,
     appLanguage,
     onToggleAircraftTrack
   ]);
@@ -2748,7 +3193,7 @@ function flyToMapLocation(map: L.Map, location: MapLocationDetails) {
   });
 }
 
-function addLocationMarkers(group: L.LayerGroup, location: MapLocationDetails, className: string, iconHtml: string) {
+function addLocationMarkers(group: L.LayerGroup, location: MapLocationDetails, className: string, iconHtml: string, units: UnitSettings, language: string) {
   WORLD_COPY_OFFSETS.forEach((copyOffset) => {
     L.marker([location.latitude, location.longitude + copyOffset], {
       title: location.name,
@@ -2760,7 +3205,7 @@ function addLocationMarkers(group: L.LayerGroup, location: MapLocationDetails, c
         iconAnchor: [16, 16]
       })
     })
-      .bindPopup(locationPopup(location))
+      .bindPopup(locationPopup(location, units, language), NODE_POPUP_OPTIONS)
       .addTo(group);
   });
 }

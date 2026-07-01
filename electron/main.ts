@@ -7,6 +7,10 @@ const devServerUrl = process.argv
   .find((arg) => arg.startsWith("--dev-server="))
   ?.replace("--dev-server=", "");
 
+if (isDev) {
+  app.commandLine.appendSwitch("log-level", "3");
+}
+
 function createWindow() {
   const window = new BrowserWindow({
     width: 1440,
@@ -36,31 +40,31 @@ function createWindow() {
 
 app.whenReady().then(() => {
   ipcMain.handle("fetch-text", async (_event, url: string) => {
-    const response = await fetch(url, {
-      headers: {
-        "User-Agent": "Weather Watch Desktop 0.1"
+    try {
+      const response = await fetchWithTimeout(url, "application/json,text/plain,*/*");
+
+      if (!response.ok) {
+        return fetchFailure(url, `Request failed with ${response.status}`, response.status);
       }
-    });
 
-    if (!response.ok) {
-      throw new Error(`Request failed with ${response.status}`);
+      return { ok: true, text: await response.text() };
+    } catch (err) {
+      return fetchFailure(url, networkErrorMessage(err));
     }
-
-    return response.text();
   });
 
   ipcMain.handle("fetch-zip-text", async (_event, url: string) => {
-    const response = await fetch(url, {
-      headers: {
-        "User-Agent": "Weather Watch Desktop 0.1"
+    try {
+      const response = await fetchWithTimeout(url, "application/zip,application/octet-stream,text/plain,*/*");
+
+      if (!response.ok) {
+        return fetchFailure(url, `Request failed with ${response.status}`, response.status);
       }
-    });
 
-    if (!response.ok) {
-      throw new Error(`Request failed with ${response.status}`);
+      return { ok: true, text: extractFirstZipEntryText(Buffer.from(await response.arrayBuffer())) };
+    } catch (err) {
+      return fetchFailure(url, networkErrorMessage(err));
     }
-
-    return extractFirstZipEntryText(Buffer.from(await response.arrayBuffer()));
   });
 
   createWindow();
@@ -71,6 +75,52 @@ app.whenReady().then(() => {
     }
   });
 });
+
+async function fetchWithTimeout(url: string, accept: string) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12_000);
+  try {
+    return await fetch(url, {
+      headers: requestHeaders(accept),
+      cache: "no-store",
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function requestHeaders(accept: string) {
+  return {
+    "Accept": accept,
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "User-Agent": "Weather Watch Desktop 1.0"
+  };
+}
+
+function fetchFailure(url: string, message: string, status?: number) {
+  return {
+    ok: false,
+    error: `${requestHost(url)}: ${message}`,
+    status
+  };
+}
+
+function requestHost(url: string) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "request";
+  }
+}
+
+function networkErrorMessage(err: unknown) {
+  if (!(err instanceof Error)) return "Request failed";
+  const cause = (err as Error & { cause?: unknown }).cause;
+  const code = typeof cause === "object" && cause && "code" in cause ? String((cause as { code?: unknown }).code) : undefined;
+  return code ? `${err.message} (${code})` : err.message;
+}
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {

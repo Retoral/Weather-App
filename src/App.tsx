@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import {
   Activity,
   Bell,
@@ -36,7 +37,8 @@ import {
   fetchLocalWeather,
   fetchRainViewer,
   fetchRiskEvents,
-  fetchWeatherGrid,
+  fetchWeatherGridWithMeta,
+  getCachedWeatherGrid,
   searchCities
 } from "./services/weatherApi";
 import type {
@@ -50,11 +52,21 @@ import type {
   LocalSignal,
   LocalWeather,
   PrimaryLayer,
+  RainFrame,
   RainViewerState,
   RiskSignalEvent,
   WeatherGridPoint
 } from "./types";
-import { formatTemperature, formatWind, weatherCodeLabel } from "./utils/weatherCodes";
+import {
+  formatRain,
+  formatRainRate,
+  formatTemperature,
+  formatWind,
+  rainIntensityLabel,
+  weatherCodeLabel,
+  windStrengthLabel
+} from "./utils/weatherCodes";
+import type { RainUnit, TemperatureUnit, UnitSettings, WindUnit } from "./utils/weatherCodes";
 
 const LOCATION_KEY = "weather-watch:home-location";
 const MAP_LANGUAGE_KEY = "weather-watch:map-language";
@@ -63,29 +75,27 @@ const VIEW_SETTINGS_KEY = "weather-watch:view-settings:v1";
 const TRACKED_AIRCRAFT_KEY = "weather-watch:tracked-aircraft:v1";
 const LIVE_REFRESH_MS = {
   earthquakes: 60 * 1000,
-  radar: 60 * 1000,
+  radar: 10 * 60 * 1000,
   risk: 60 * 1000,
   aircraft: 30 * 1000,
   aviationIncidents: 10 * 60 * 1000,
   warnings: 60 * 1000,
-  globalWeather: 60 * 1000,
-  localWeather: 60 * 1000,
-  localWeatherFresh: 55 * 1000,
+  globalWeather: 10 * 60 * 1000,
+  localWeather: 10 * 60 * 1000,
+  localWeatherFresh: 9 * 60 * 1000,
   dayNight: 60 * 1000,
   focusedEarthquakes: 30 * 1000,
-  focusedRadar: 60 * 1000,
+  focusedRadar: 10 * 60 * 1000,
   focusedRisk: 60 * 1000,
   focusedAircraft: 22 * 1000,
   focusedAviationIncidents: 5 * 60 * 1000,
   focusedWarnings: 60 * 1000,
-  focusedWeatherGrid: 60 * 1000,
-  activeWeatherFresh: 55 * 1000,
-  backgroundWeatherFresh: 55 * 1000
+  focusedWeatherGrid: 10 * 60 * 1000,
+  activeWeatherFresh: 9 * 60 * 1000,
+  backgroundWeatherFresh: 14 * 60 * 1000
 };
 
 const TRACKED_AIRCRAFT_TRACK_RETRY_MS = 2 * 60 * 1000;
-const FORECAST_HOUR_OPTIONS = [0, 1, 3, 6, 12, 24, 48, 72, 120, 168];
-
 const KNOWN_AIRPORTS = [
   { code: "ATL", name: "Atlanta Hartsfield-Jackson", lat: 33.6407, lon: -84.4277 },
   { code: "PEK", name: "Beijing Capital", lat: 40.0799, lon: 116.6031 },
@@ -134,7 +144,6 @@ const mapViews: Array<{ id: PrimaryLayer; label: string; icon: LucideIcon }> = [
   { id: "temperature", label: "Temperature", icon: Thermometer },
   { id: "wind", label: "Wind Speed", icon: Wind },
   { id: "radar", label: "Rain Radar", icon: CloudRain },
-  { id: "rainForecast", label: "Rain Forecast", icon: CloudRain },
   { id: "seismic", label: "Seismic Movement", icon: Activity },
   { id: "risk", label: "Risk Signals", icon: ShieldAlert }
 ];
@@ -162,6 +171,25 @@ const appLanguages = [
 ] as const;
 
 type AppLanguage = (typeof appLanguages)[number]["id"];
+type FeedKey = "weather" | "radar" | "earthquakes" | "warnings" | "risk" | "aircraft" | "aviation";
+
+const temperatureUnitOptions: Array<{ id: TemperatureUnit; label: string }> = [
+  { id: "celsius", label: "Celsius (°C)" },
+  { id: "fahrenheit", label: "Fahrenheit (°F)" },
+  { id: "kelvin", label: "Kelvin (K)" }
+];
+
+const windUnitOptions: Array<{ id: WindUnit; label: string }> = [
+  { id: "ms", label: "Metric (m/s)" },
+  { id: "kmh", label: "Metric (km/h)" },
+  { id: "mph", label: "Imperial (mph)" },
+  { id: "knots", label: "Sea / aviation (knots)" }
+];
+
+const rainUnitOptions: Array<{ id: RainUnit; label: string }> = [
+  { id: "mm", label: "Metric (mm)" },
+  { id: "in", label: "Imperial (inches)" }
+];
 
 const appCopy = {
   en: {
@@ -942,6 +970,129 @@ const appCopy = {
   }
 } satisfies Record<AppLanguage, Record<string, unknown>>;
 
+const unitCopy = {
+  en: {
+    temperatureUnits: "Temperature units",
+    windUnits: "Wind units",
+    rainUnits: "Rain units",
+    now: "Now",
+    forecast: "Forecast",
+    forecastModel: "Forecast model",
+    latestObservedRadar: "Latest observed radar",
+    observedRadar: "Observed radar",
+    waitingForRadar: "Waiting for radar",
+    waitingForRadarFrames: "Waiting for radar frames",
+    forecastUnavailable: "Forecast unavailable",
+    noCitySet: "No city set",
+    checked: "checked"
+  },
+  sv: {
+    temperatureUnits: "Temperaturenheter",
+    windUnits: "Vindenheter",
+    rainUnits: "Regnenheter",
+    now: "Nu",
+    forecast: "Prognos",
+    forecastModel: "Prognosmodell",
+    latestObservedRadar: "Senaste observerade radar",
+    observedRadar: "Observerad radar",
+    waitingForRadar: "Väntar på radar",
+    waitingForRadarFrames: "Väntar på radarbilder",
+    forecastUnavailable: "Prognos inte tillgänglig",
+    noCitySet: "Ingen stad vald",
+    checked: "kontrollerad"
+  },
+  de: {
+    temperatureUnits: "Temperatureinheiten",
+    windUnits: "Windeinheiten",
+    rainUnits: "Regeneinheiten",
+    now: "Jetzt",
+    forecast: "Prognose",
+    forecastModel: "Prognosemodell",
+    latestObservedRadar: "Neuester beobachteter Radar",
+    observedRadar: "Beobachteter Radar",
+    waitingForRadar: "Warte auf Radar",
+    waitingForRadarFrames: "Warte auf Radarbilder",
+    forecastUnavailable: "Prognose nicht verfügbar",
+    noCitySet: "Keine Stadt gesetzt",
+    checked: "geprüft"
+  },
+  fr: {
+    temperatureUnits: "Unités de température",
+    windUnits: "Unités de vent",
+    rainUnits: "Unités de pluie",
+    now: "Maintenant",
+    forecast: "Prévision",
+    forecastModel: "Modèle prévisionnel",
+    latestObservedRadar: "Dernier radar observé",
+    observedRadar: "Radar observé",
+    waitingForRadar: "En attente du radar",
+    waitingForRadarFrames: "En attente des images radar",
+    forecastUnavailable: "Prévision indisponible",
+    noCitySet: "Aucune ville définie",
+    checked: "vérifié"
+  },
+  es: {
+    temperatureUnits: "Unidades de temperatura",
+    windUnits: "Unidades de viento",
+    rainUnits: "Unidades de lluvia",
+    now: "Ahora",
+    forecast: "Pronóstico",
+    forecastModel: "Modelo de pronóstico",
+    latestObservedRadar: "Último radar observado",
+    observedRadar: "Radar observado",
+    waitingForRadar: "Esperando radar",
+    waitingForRadarFrames: "Esperando imágenes de radar",
+    forecastUnavailable: "Pronóstico no disponible",
+    noCitySet: "Sin ciudad definida",
+    checked: "comprobado"
+  },
+  it: {
+    temperatureUnits: "Unità temperatura",
+    windUnits: "Unità vento",
+    rainUnits: "Unità pioggia",
+    now: "Ora",
+    forecast: "Previsione",
+    forecastModel: "Modello previsionale",
+    latestObservedRadar: "Ultimo radar osservato",
+    observedRadar: "Radar osservato",
+    waitingForRadar: "In attesa del radar",
+    waitingForRadarFrames: "In attesa dei frame radar",
+    forecastUnavailable: "Previsione non disponibile",
+    noCitySet: "Nessuna città impostata",
+    checked: "controllato"
+  },
+  ja: {
+    temperatureUnits: "温度単位",
+    windUnits: "風速単位",
+    rainUnits: "降水単位",
+    now: "現在",
+    forecast: "予報",
+    forecastModel: "予報モデル",
+    latestObservedRadar: "最新観測レーダー",
+    observedRadar: "観測レーダー",
+    waitingForRadar: "レーダー待機中",
+    waitingForRadarFrames: "レーダーフレーム待機中",
+    forecastUnavailable: "予報を利用できません",
+    noCitySet: "都市未設定",
+    checked: "確認"
+  },
+  zh: {
+    temperatureUnits: "温度单位",
+    windUnits: "风速单位",
+    rainUnits: "降雨单位",
+    now: "现在",
+    forecast: "预报",
+    forecastModel: "预报模型",
+    latestObservedRadar: "最新观测雷达",
+    observedRadar: "观测雷达",
+    waitingForRadar: "等待雷达",
+    waitingForRadarFrames: "等待雷达帧",
+    forecastUnavailable: "预报不可用",
+    noCitySet: "未设置城市",
+    checked: "已检查"
+  }
+} satisfies Record<AppLanguage, Record<string, string>>;
+
 function loadSavedMapLanguage() {
   return localStorage.getItem(MAP_LANGUAGE_KEY) || "en";
 }
@@ -968,7 +1119,9 @@ interface SavedViewSettings {
   aircraftLimit?: number;
   aircraftOriginCountry?: string;
   hideUntrackedAircraft?: boolean;
-  forecastHourOffset?: number;
+  temperatureUnit?: TemperatureUnit;
+  windUnit?: WindUnit;
+  rainUnit?: RainUnit;
 }
 
 interface SavedTrackedAircraft {
@@ -982,6 +1135,23 @@ function isPrimaryLayer(value: unknown): value is PrimaryLayer {
   return typeof value === "string" && mapViews.some((view) => view.id === value);
 }
 
+function savedPrimaryLayer(value: unknown): PrimaryLayer | undefined {
+  if (value === "rainForecast") return "radar";
+  return isPrimaryLayer(value) ? value : undefined;
+}
+
+function savedTemperatureUnit(value: unknown): TemperatureUnit | undefined {
+  return temperatureUnitOptions.some((option) => option.id === value) ? value as TemperatureUnit : undefined;
+}
+
+function savedWindUnit(value: unknown): WindUnit | undefined {
+  return windUnitOptions.some((option) => option.id === value) ? value as WindUnit : undefined;
+}
+
+function savedRainUnit(value: unknown): RainUnit | undefined {
+  return rainUnitOptions.some((option) => option.id === value) ? value as RainUnit : undefined;
+}
+
 function loadSavedViewSettings(): SavedViewSettings {
   const raw = localStorage.getItem(VIEW_SETTINGS_KEY);
   if (!raw) return {};
@@ -989,7 +1159,7 @@ function loadSavedViewSettings(): SavedViewSettings {
   try {
     const saved = JSON.parse(raw) as SavedViewSettings;
     return {
-      activeLayer: isPrimaryLayer(saved.activeLayer) ? saved.activeLayer : undefined,
+      activeLayer: savedPrimaryLayer(saved.activeLayer),
       showWarnings: typeof saved.showWarnings === "boolean" ? saved.showWarnings : undefined,
       showEarthquakes: typeof saved.showEarthquakes === "boolean" ? saved.showEarthquakes : undefined,
       showTimezones: typeof saved.showTimezones === "boolean" ? saved.showTimezones : undefined,
@@ -1001,7 +1171,9 @@ function loadSavedViewSettings(): SavedViewSettings {
       aircraftLimit: [50, 150, 400].includes(Number(saved.aircraftLimit)) ? Number(saved.aircraftLimit) : undefined,
       aircraftOriginCountry: typeof saved.aircraftOriginCountry === "string" ? saved.aircraftOriginCountry : undefined,
       hideUntrackedAircraft: typeof saved.hideUntrackedAircraft === "boolean" ? saved.hideUntrackedAircraft : undefined,
-      forecastHourOffset: FORECAST_HOUR_OPTIONS.includes(Number(saved.forecastHourOffset)) ? Number(saved.forecastHourOffset) : undefined
+      temperatureUnit: savedTemperatureUnit(saved.temperatureUnit),
+      windUnit: savedWindUnit(saved.windUnit),
+      rainUnit: savedRainUnit(saved.rainUnit)
     };
   } catch {
     return {};
@@ -1076,29 +1248,84 @@ function saveAppLanguage(language: AppLanguage) {
   localStorage.setItem(APP_LANGUAGE_KEY, language);
 }
 
-function locationLabel(location?: CityLocation) {
-  if (!location) return "No city set";
+function locationLabel(location?: CityLocation, fallback = "No city set") {
+  if (!location) return fallback;
   return [location.name, location.admin1, location.country].filter(Boolean).join(", ");
 }
 
-function timeAgo(value?: string | number) {
+function timeAgo(value?: string | number, language: AppLanguage = "en") {
   if (!value) return "--";
   const date = typeof value === "string" ? new Date(value).getTime() : value;
   const seconds = Math.max(0, Math.round((Date.now() - date) / 1000));
-  if (seconds < 60) return `${seconds}s ago`;
+  const formatter = new Intl.RelativeTimeFormat(language, { numeric: "always", style: "short" });
+  if (seconds < 60) return formatter.format(-seconds, "second");
   const minutes = Math.round(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
+  if (minutes < 60) return formatter.format(-minutes, "minute");
   const hours = Math.round(minutes / 60);
-  return `${hours}h ago`;
+  return formatter.format(-hours, "hour");
 }
 
-function forecastTimeLabel(hourOffset: number) {
+function forecastTimeLabel(hourOffset: number, language: AppLanguage = "en") {
   const target = new Date(Date.now() + hourOffset * 60 * 60 * 1000);
-  return target.toLocaleString([], {
+  return target.toLocaleString(language, {
     weekday: hourOffset >= 24 ? "short" : undefined,
     hour: "2-digit",
     minute: "2-digit"
   });
+}
+
+interface RadarTimelineFrame extends RainFrame {
+  kind: "observed" | "forecast";
+}
+
+function radarTimelineFrames(rainViewer?: RainViewerState): RadarTimelineFrame[] {
+  if (!rainViewer) return [];
+  return [
+    ...rainViewer.past.map((frame) => ({ ...frame, kind: "observed" as const })),
+    ...rainViewer.nowcast.map((frame) => ({ ...frame, kind: "forecast" as const }))
+  ];
+}
+
+function defaultRadarFrameTime(rainViewer?: RainViewerState) {
+  return rainViewer?.past.at(-1)?.time ?? rainViewer?.nowcast[0]?.time;
+}
+
+function rainViewerChanged(previous: RainViewerState | undefined, next: RainViewerState) {
+  return (
+    !previous ||
+    previous.generated !== next.generated ||
+    defaultRadarFrameTime(previous) !== defaultRadarFrameTime(next) ||
+    previous.host !== next.host
+  );
+}
+
+function selectedRadarTimelineFrame(rainViewer: RainViewerState | undefined, selectedTime: number | undefined) {
+  const frames = radarTimelineFrames(rainViewer);
+  const defaultTime = defaultRadarFrameTime(rainViewer);
+  return frames.find((frame) => frame.time === selectedTime) ?? frames.find((frame) => frame.time === defaultTime);
+}
+
+function radarFrameAbsoluteLabel(frame?: RadarTimelineFrame, language: AppLanguage = "en") {
+  if (!frame) return unitCopy[language].waitingForRadar;
+  return new Date(frame.time * 1000).toLocaleTimeString(language, {
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+}
+
+function radarFrameRelativeLabel(frame: RadarTimelineFrame, latestObservedTime?: number, language: AppLanguage = "en") {
+  const ui = unitCopy[language];
+  if (!latestObservedTime || frame.time === latestObservedTime) return frame.kind === "forecast" ? ui.forecast : ui.now;
+  const minutes = Math.round((frame.time - latestObservedTime) / 60);
+  if (minutes === 0) return ui.now;
+  return minutes > 0 ? `+${minutes}m` : `${minutes}m`;
+}
+
+function radarFrameDetailLabel(frame?: RadarTimelineFrame, latestObservedTime?: number, language: AppLanguage = "en") {
+  const ui = unitCopy[language];
+  if (!frame) return ui.waitingForRadarFrames;
+  const source = frame.kind === "forecast" ? ui.forecast : ui.observedRadar;
+  return `${radarFrameRelativeLabel(frame, latestObservedTime, language)} · ${radarFrameAbsoluteLabel(frame, language)} · ${source}`;
 }
 
 function notify(title: string, body: string) {
@@ -1245,6 +1472,98 @@ function aircraftWithStatus(plane: AircraftState): AircraftState {
   };
 }
 
+function normalizeBearing(bearing: number) {
+  return ((bearing % 360) + 360) % 360;
+}
+
+function windArrowStyle(direction?: number): CSSProperties {
+  const toDirection = typeof direction === "number" ? normalizeBearing(direction + 180) : 0;
+  return { "--wind-dir": `${toDirection}deg` } as CSSProperties;
+}
+
+function windSummary(speed: number, unit: WindUnit, language: AppLanguage = "en") {
+  return `${formatWind(speed, unit)} · ${windStrengthLabel(speed, language)}`;
+}
+
+function windReadout(speed: number, direction: number | undefined, unit: WindUnit, language: AppLanguage) {
+  return (
+    <span className="inline-wind-readout">
+      {typeof direction === "number" && (
+        <span className="wind-arrow" style={windArrowStyle(direction)} aria-hidden="true">
+          ↑
+        </span>
+      )}
+      <span>{windSummary(speed, unit, language)}</span>
+    </span>
+  );
+}
+
+function rainSummary(amount: number, unit: RainUnit) {
+  return `${formatRain(amount, unit)} · ${rainIntensityLabel(amount)}`;
+}
+
+function localWeatherGridPoint(location: CityLocation | undefined, weather: LocalWeather | undefined, id: string): WeatherGridPoint | undefined {
+  const current = weather?.current;
+  if (!location || !current) return undefined;
+  return {
+    id,
+    lat: location.latitude,
+    lon: location.longitude,
+    time: current.time,
+    temperature: current.temperature_2m,
+    weatherCode: current.weather_code,
+    windSpeed: current.wind_speed_10m,
+    windGust: current.wind_gusts_10m,
+    windDirection: current.wind_direction_10m,
+    precipitation: current.precipitation,
+    pressure: current.pressure_msl,
+    cloudCover: current.cloud_cover
+  };
+}
+
+function viewportWeatherStep(bounds: AviationBounds | undefined, highResolutionLayer = false) {
+  if (!bounds) return undefined;
+  const latSpan = Math.abs(bounds.north - bounds.south);
+  const rawLonSpan = Math.abs(bounds.east - bounds.west);
+  const lonSpan = rawLonSpan > 180 ? 360 - rawLonSpan : rawLonSpan;
+  const span = Math.max(latSpan, lonSpan);
+  if (highResolutionLayer) {
+    if (span <= 14) return 0.5;
+    if (span <= 34) return 1;
+    if (span <= 65) return 2.5;
+    if (span <= 100) return 5;
+    return 7.5;
+  }
+  if (span <= 10) return 0.5;
+  if (span <= 28) return 1;
+  if (span <= 55) return 2.5;
+  if (span <= 80) return 5;
+  return 7.5;
+}
+
+function viewportWeatherPointLimit(bounds: AviationBounds | undefined, highResolutionLayer: boolean) {
+  if (!bounds) return undefined;
+  if (!highResolutionLayer) return 360;
+  const latSpan = Math.abs(bounds.north - bounds.south);
+  const rawLonSpan = Math.abs(bounds.east - bounds.west);
+  const lonSpan = rawLonSpan > 180 ? 360 - rawLonSpan : rawLonSpan;
+  const span = Math.max(latSpan, lonSpan);
+  if (span <= 14) return 900;
+  if (span <= 34) return 760;
+  if (span <= 65) return 560;
+  return 380;
+}
+
+function plusRateLabel(amount: number, unit: RainUnit) {
+  const [value, suffix] = formatRainRate(amount, unit).split(" ");
+  return suffix ? `${value}+ ${suffix}` : `${value}+`;
+}
+
+function plusWindLabel(speed: number, unit: WindUnit) {
+  const [value, suffix] = formatWind(speed, unit).split(" ");
+  return suffix ? `${value}+ ${suffix}` : `${value}+`;
+}
+
 export function App() {
   const savedViewSettings = useMemo(() => loadSavedViewSettings(), []);
   const savedTrackedAircraft = useMemo(() => loadSavedTrackedAircraft(), []);
@@ -1259,11 +1578,11 @@ export function App() {
   const [showAviationIncidents, setShowAviationIncidents] = useState(savedViewSettings.showAviationIncidents ?? false);
   const [aircraftLimit, setAircraftLimit] = useState(savedViewSettings.aircraftLimit ?? 150);
   const [aircraftOriginCountry, setAircraftOriginCountry] = useState(savedViewSettings.aircraftOriginCountry ?? "any");
-  const [forecastHourOffset, setForecastHourOffset] = useState(savedViewSettings.forecastHourOffset ?? 0);
   const [trackedAircraftIds, setTrackedAircraftIds] = useState<string[]>(savedTrackedAircraft.ids);
   const [hideUntrackedAircraft, setHideUntrackedAircraft] = useState(savedViewSettings.hideUntrackedAircraft ?? false);
   const [trackedDockOpen, setTrackedDockOpen] = useState(savedTrackedAircraft.dockOpen || savedTrackedAircraft.ids.length > 0);
   const [filtersOpen, setFiltersOpen] = useState(false);
+  const [mapViewMenuOpen, setMapViewMenuOpen] = useState(false);
   const [placeSearchOpen, setPlaceSearchOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(!loadSavedLocation());
   const [localOpen, setLocalOpen] = useState(false);
@@ -1274,6 +1593,9 @@ export function App() {
   const [aircraftFocusRequest, setAircraftFocusRequest] = useState<{ id: string; request: number } | undefined>();
   const [mapLanguage, setMapLanguage] = useState(() => loadSavedMapLanguage());
   const [appLanguage, setAppLanguage] = useState<AppLanguage>(() => loadSavedAppLanguage());
+  const [temperatureUnit, setTemperatureUnit] = useState<TemperatureUnit>(savedViewSettings.temperatureUnit ?? "celsius");
+  const [windUnit, setWindUnit] = useState<WindUnit>(savedViewSettings.windUnit ?? "ms");
+  const [rainUnit, setRainUnit] = useState<RainUnit>(savedViewSettings.rainUnit ?? "mm");
   const [cityQuery, setCityQuery] = useState("");
   const [cityResults, setCityResults] = useState<CityLocation[]>([]);
   const [placeQuery, setPlaceQuery] = useState("");
@@ -1281,6 +1603,7 @@ export function App() {
   const [localWeather, setLocalWeather] = useState<LocalWeather | undefined>();
   const [inspectedWeather, setInspectedWeather] = useState<LocalWeather | undefined>();
   const [weatherGrid, setWeatherGrid] = useState<WeatherGridPoint[]>([]);
+  const [viewportWeatherGrid, setViewportWeatherGrid] = useState<WeatherGridPoint[]>([]);
   const [earthquakes, setEarthquakes] = useState<EarthquakeEvent[]>([]);
   const [warnings, setWarnings] = useState<GdacsAlert[]>([]);
   const [riskEvents, setRiskEvents] = useState<RiskSignalEvent[]>([]);
@@ -1290,23 +1613,32 @@ export function App() {
   const [aviationIncidents, setAviationIncidents] = useState<AviationIncident[]>([]);
   const [aviationBounds, setAviationBounds] = useState<AviationBounds | undefined>();
   const [rainViewer, setRainViewer] = useState<RainViewerState | undefined>();
+  const [radarFrameTime, setRadarFrameTime] = useState<number | undefined>();
   const [notificationPermission, setNotificationPermission] = useState(() =>
     typeof Notification === "undefined" ? "denied" : Notification.permission
   );
   const [loading, setLoading] = useState({ global: false, local: false, search: false, placeSearch: false, inspected: false });
   const [error, setError] = useState<string | undefined>();
+  const [weatherGridError, setWeatherGridError] = useState<string | undefined>();
   const [localError, setLocalError] = useState<string | undefined>();
   const [inspectedError, setInspectedError] = useState<string | undefined>();
-  const [lastGlobalRefresh, setLastGlobalRefresh] = useState<string | undefined>();
+  const [lastFeedCheck, setLastFeedCheck] = useState<Partial<Record<FeedKey, string>>>({});
+  const [lastFeedDataRefresh, setLastFeedDataRefresh] = useState<Partial<Record<FeedKey, string>>>({});
   const [solarTimestamp, setSolarTimestamp] = useState(Date.now());
   const notifiedSignals = useRef<Set<string>>(new Set());
   const notifiedAircraftWarnings = useRef<Set<string>>(new Set());
   const aircraftTrackAttemptedAt = useRef<Record<string, number>>({});
+  const mapViewMenuRef = useRef<HTMLDivElement | null>(null);
   const refreshInFlight = useRef({ weatherGrid: false, earthquakes: false, radar: false, warnings: false, risk: false, aircraft: false, aviationIncidents: false });
+  const rainViewerRef = useRef<RainViewerState | undefined>();
   const copy = appCopy[appLanguage];
+  const unitSettings = useMemo<UnitSettings>(() => ({ temperatureUnit, windUnit, rainUnit }), [temperatureUnit, windUnit, rainUnit]);
 
-  const weatherSignals = useMemo(() => deriveLocalSignals(localWeather), [localWeather]);
-  const inspectedWeatherSignals = useMemo(() => deriveLocalSignals(inspectedWeather), [inspectedWeather]);
+  const weatherSignals = useMemo(() => deriveLocalSignals(localWeather, { ...unitSettings, language: appLanguage }), [localWeather, unitSettings, appLanguage]);
+  const inspectedWeatherSignals = useMemo(
+    () => deriveLocalSignals(inspectedWeather, { ...unitSettings, language: appLanguage }),
+    [inspectedWeather, unitSettings, appLanguage]
+  );
   const localWarningSignals = useMemo(
     () => (homeLocation ? warnings.filter((warning) => warningCoversLocation(warning, homeLocation)).slice(0, 4).map(warningToSignal) : []),
     [warnings, homeLocation?.id, homeLocation?.latitude, homeLocation?.longitude]
@@ -1371,37 +1703,129 @@ export function App() {
   const homeCurrent = localWeather?.current;
   const inspectedCurrent = inspectedWeather?.current;
   const layerLabel = copy.conditionLabels[activeLayer];
-  const hasForecastTimeControl = activeLayer === "wind" || activeLayer === "rainForecast";
-  const weatherGridForecastHour = hasForecastTimeControl ? forecastHourOffset : 0;
-  const forecastDisplayLabel = forecastHourOffset === 0 ? "Now" : `+${forecastHourOffset}h`;
-  const forecastAbsoluteLabel = forecastTimeLabel(forecastHourOffset);
+  const unitText = unitCopy[appLanguage];
+  const selectedRadarFrame = useMemo(() => selectedRadarTimelineFrame(rainViewer, radarFrameTime), [rainViewer, radarFrameTime]);
+  const latestObservedRadarTime = rainViewer?.past.at(-1)?.time;
+  const currentWeatherLabel = unitText.now;
+  const currentWeatherDetailLabel = forecastTimeLabel(0, appLanguage);
+  const radarObservedDetailLabel = radarFrameDetailLabel(selectedRadarFrame, latestObservedRadarTime, appLanguage);
+  const temperatureScaleMin = formatTemperature(-30, temperatureUnit);
+  const temperatureScaleMax = formatTemperature(50, temperatureUnit);
+  const windScaleValues = [0, 15, 35, 60].map((speed) => formatWind(speed, windUnit));
+  const windScaleTop = plusWindLabel(90, windUnit);
+  const radarScaleValues = [0.2, 1, 3, 8, 18].map((amount) => formatRainRate(amount, rainUnit));
+  const radarScaleTop = plusRateLabel(30, rainUnit);
+  const liveWeatherPoints = useMemo(
+    () =>
+      [
+        localWeatherGridPoint(homeLocation, localWeather, "live-home"),
+        localWeatherGridPoint(inspectedLocation, inspectedWeather, "live-inspected")
+      ].filter((point): point is WeatherGridPoint => Boolean(point)),
+    [homeLocation, localWeather, inspectedLocation, inspectedWeather]
+  );
+  const mapLiveWeatherPoints = useMemo(
+    () => [...viewportWeatherGrid, ...liveWeatherPoints],
+    [viewportWeatherGrid, liveWeatherPoints]
+  );
   const mapLanguageLabel = mapLanguages.find((language) => language.id === mapLanguage)?.label ?? "English";
   const appLanguageLabel = appLanguages.find((language) => language.id === appLanguage)?.label ?? "English";
-  const localWeatherStatus = localError ? copy.weatherUnavailable : loading.local ? copy.refreshingWeather : "Weather updating";
-  const inspectedWeatherStatus = inspectedError ? copy.weatherUnavailable : loading.inspected ? copy.refreshingWeather : "Weather updating";
-  const homeUpdatedLabel = localWeather?.fetchedAt ? timeAgo(localWeather.fetchedAt) : localError ? copy.unavailable : loading.local ? copy.refreshingLower : "--";
+  const activeMapView = mapViews.find((view) => view.id === activeLayer) ?? mapViews[0];
+  const ActiveMapViewIcon = activeMapView.icon;
+  const localWeatherStatus = localError ? copy.weatherUnavailable : loading.local ? copy.refreshingWeather : copy.refreshingWeather;
+  const inspectedWeatherStatus = inspectedError ? copy.weatherUnavailable : loading.inspected ? copy.refreshingWeather : copy.refreshingWeather;
+  const homeUpdatedLabel = localWeather?.fetchedAt ? timeAgo(localWeather.fetchedAt, appLanguage) : localError ? copy.unavailable : loading.local ? copy.refreshingLower : "--";
   const inspectedUpdatedLabel = inspectedWeather?.fetchedAt
-    ? timeAgo(inspectedWeather.fetchedAt)
+    ? timeAgo(inspectedWeather.fetchedAt, appLanguage)
     : inspectedError
       ? copy.unavailable
       : loading.inspected
         ? copy.refreshingLower
         : "--";
+  const activeFeedKey: FeedKey =
+    activeLayer === "radar"
+      ? "radar"
+      : activeLayer === "temperature" || activeLayer === "wind"
+        ? "weather"
+        : activeLayer === "seismic"
+          ? "earthquakes"
+          : activeLayer === "risk"
+            ? "risk"
+            : "warnings";
+  const activeDataRefresh = lastFeedDataRefresh[activeFeedKey];
+  const activeFeedChecked = lastFeedCheck[activeFeedKey];
+  const activeUpdateLabel = activeDataRefresh
+    ? `${copy.updated} ${timeAgo(activeDataRefresh, appLanguage)}${
+        activeFeedChecked && activeFeedChecked !== activeDataRefresh ? ` · ${unitText.checked} ${timeAgo(activeFeedChecked, appLanguage)}` : ""
+      }`
+    : activeFeedChecked
+      ? `${unitText.checked} ${timeAgo(activeFeedChecked, appLanguage)}`
+      : `${copy.updated} --`;
 
-  function markLiveRefresh() {
-    setLastGlobalRefresh(new Date().toISOString());
+  function markLiveRefresh(feed: FeedKey, dataChanged = true) {
+    const timestamp = new Date().toISOString();
+    setLastFeedCheck((state) => ({ ...state, [feed]: timestamp }));
+    if (dataChanged) {
+      setLastFeedDataRefresh((state) => ({ ...state, [feed]: timestamp }));
+    }
   }
 
   async function refreshWeatherGrid(focused = false, force = false) {
     if (refreshInFlight.current.weatherGrid) return;
     refreshInFlight.current.weatherGrid = true;
     try {
-      setWeatherGrid(await fetchWeatherGrid(undefined, {
-        forecastHourOffset: weatherGridForecastHour,
-        freshMs: force ? 0 : focused ? LIVE_REFRESH_MS.activeWeatherFresh : LIVE_REFRESH_MS.backgroundWeatherFresh
-      }));
-      markLiveRefresh();
-    } catch {
+      const freshMs = force ? 0 : focused ? LIVE_REFRESH_MS.activeWeatherFresh : LIVE_REFRESH_MS.backgroundWeatherFresh;
+      const highResolutionWeatherLayer = activeLayer === "wind";
+      const viewportStep = focused ? viewportWeatherStep(aviationBounds, highResolutionWeatherLayer) : undefined;
+      const viewportMaxPoints = focused ? viewportWeatherPointLimit(aviationBounds, highResolutionWeatherLayer) : undefined;
+      const cachedGlobalGrid = getCachedWeatherGrid();
+      if (cachedGlobalGrid?.length) setWeatherGrid((current) => current.length > 0 ? current : cachedGlobalGrid);
+      if (focused && aviationBounds && viewportStep) {
+        const cachedViewportGrid = getCachedWeatherGrid({
+          bounds: aviationBounds,
+          step: viewportStep,
+          maxPoints: viewportMaxPoints
+        });
+        if (cachedViewportGrid?.length) setViewportWeatherGrid((current) => current.length > 0 ? current : cachedViewportGrid);
+      }
+
+      const globalRequest = fetchWeatherGridWithMeta(undefined, {
+        freshMs
+      });
+      const viewportRequest = focused && aviationBounds && viewportStep
+        ? fetchWeatherGridWithMeta(undefined, {
+            freshMs,
+            bounds: aviationBounds,
+            step: viewportStep,
+            maxPoints: viewportMaxPoints
+          })
+        : undefined;
+
+      const [globalResult, viewportResult] = await Promise.allSettled([
+        globalRequest ?? Promise.resolve(undefined),
+        viewportRequest ?? Promise.resolve(undefined)
+      ]);
+
+      if (globalResult.status === "fulfilled" && globalResult.value?.points.length) {
+        setWeatherGrid(globalResult.value.points);
+        setWeatherGridError(undefined);
+      }
+      if (viewportResult.status === "fulfilled" && viewportResult.value?.points.length) {
+        setViewportWeatherGrid(viewportResult.value.points);
+        setWeatherGridError(undefined);
+      }
+
+      if (globalResult.status === "rejected" && viewportResult.status === "rejected") {
+        setWeatherGridError(globalResult.reason instanceof Error ? globalResult.reason.message : "Unable to refresh weather forecast");
+        throw globalResult.reason;
+      }
+
+      const weatherChecked = globalResult.status === "fulfilled" || viewportResult.status === "fulfilled";
+      const weatherDataFresh =
+        globalResult.status === "fulfilled" && globalResult.value !== undefined && !globalResult.value.fromCache ||
+        viewportResult.status === "fulfilled" && viewportResult.value !== undefined && !viewportResult.value.fromCache;
+      if (weatherChecked) markLiveRefresh("weather", weatherDataFresh);
+    } catch (err) {
+      setWeatherGridError(err instanceof Error ? err.message : "Unable to refresh weather forecast");
       // Keep the last successful global weather layer visible.
     } finally {
       refreshInFlight.current.weatherGrid = false;
@@ -1413,7 +1837,7 @@ export function App() {
     refreshInFlight.current.earthquakes = true;
     try {
       setEarthquakes(await fetchEarthquakes());
-      markLiveRefresh();
+      markLiveRefresh("earthquakes");
     } catch {
       // Keep the last successful earthquake layer visible.
     } finally {
@@ -1425,8 +1849,11 @@ export function App() {
     if (refreshInFlight.current.radar) return;
     refreshInFlight.current.radar = true;
     try {
-      setRainViewer(await fetchRainViewer());
-      markLiveRefresh();
+      const nextRainViewer = await fetchRainViewer();
+      const changed = rainViewerChanged(rainViewerRef.current, nextRainViewer);
+      rainViewerRef.current = nextRainViewer;
+      setRainViewer(nextRainViewer);
+      markLiveRefresh("radar", changed);
     } catch {
       // Keep the last successful radar frame visible.
     } finally {
@@ -1439,7 +1866,7 @@ export function App() {
     refreshInFlight.current.warnings = true;
     try {
       setWarnings(await fetchGdacsAlerts());
-      markLiveRefresh();
+      markLiveRefresh("warnings");
     } catch {
       // Keep the last successful warning layer visible.
     } finally {
@@ -1452,7 +1879,7 @@ export function App() {
     refreshInFlight.current.risk = true;
     try {
       setRiskEvents(await fetchRiskEvents(undefined, { freshMs: force ? 0 : LIVE_REFRESH_MS.risk }));
-      markLiveRefresh();
+      markLiveRefresh("risk");
     } catch {
       // Keep the last successful risk layer visible.
     } finally {
@@ -1500,7 +1927,7 @@ export function App() {
       setAircraft(aircraft);
       rememberTrackedAircraft(aircraft);
       void refreshTrackedAircraftFeed(force);
-      markLiveRefresh();
+      markLiveRefresh("aircraft");
     } catch {
       // Keep the last successful aircraft layer visible.
     } finally {
@@ -1513,7 +1940,7 @@ export function App() {
     refreshInFlight.current.aviationIncidents = true;
     try {
       setAviationIncidents(await fetchAviationIncidents(undefined, { freshMs: force ? 0 : LIVE_REFRESH_MS.aviationIncidents }));
-      markLiveRefresh();
+      markLiveRefresh("aviation");
     } catch {
       // Keep the last successful aviation incident layer visible.
     } finally {
@@ -1526,26 +1953,42 @@ export function App() {
     setError(undefined);
     try {
       const [gridResult, quakeResult, rainResult, gdacsResult, riskResult] = await Promise.allSettled([
-        fetchWeatherGrid(undefined, { forecastHourOffset: weatherGridForecastHour, freshMs: force ? 0 : LIVE_REFRESH_MS.backgroundWeatherFresh }),
+        fetchWeatherGridWithMeta(undefined, { freshMs: force ? 0 : LIVE_REFRESH_MS.backgroundWeatherFresh }),
         fetchEarthquakes(),
         fetchRainViewer(),
         fetchGdacsAlerts().catch(() => [] as GdacsAlert[]),
         fetchRiskEvents(undefined, { freshMs: force ? 0 : LIVE_REFRESH_MS.risk }).catch(() => [] as RiskSignalEvent[])
       ]);
 
-      if (gridResult.status === "fulfilled") setWeatherGrid(gridResult.value);
-      if (quakeResult.status === "fulfilled") setEarthquakes(quakeResult.value);
-      if (rainResult.status === "fulfilled") setRainViewer(rainResult.value);
-      if (gdacsResult.status === "fulfilled") setWarnings(gdacsResult.value);
-      if (riskResult.status === "fulfilled") setRiskEvents(riskResult.value);
+      if (gridResult.status === "fulfilled") {
+        setWeatherGrid(gridResult.value.points);
+        setWeatherGridError(undefined);
+        markLiveRefresh("weather", !gridResult.value.fromCache);
+      } else {
+        setWeatherGridError(gridResult.reason instanceof Error ? gridResult.reason.message : "Unable to refresh weather forecast");
+      }
+      if (quakeResult.status === "fulfilled") {
+        setEarthquakes(quakeResult.value);
+        markLiveRefresh("earthquakes");
+      }
+      if (rainResult.status === "fulfilled") {
+        const changed = rainViewerChanged(rainViewerRef.current, rainResult.value);
+        rainViewerRef.current = rainResult.value;
+        setRainViewer(rainResult.value);
+        markLiveRefresh("radar", changed);
+      }
+      if (gdacsResult.status === "fulfilled") {
+        setWarnings(gdacsResult.value);
+        markLiveRefresh("warnings");
+      }
+      if (riskResult.status === "fulfilled") {
+        setRiskEvents(riskResult.value);
+        markLiveRefresh("risk");
+      }
 
       const failedFeeds = [gridResult, quakeResult, rainResult, gdacsResult, riskResult].filter((result) => result.status === "rejected").length;
       if (failedFeeds === 5) {
         setError("Unable to refresh live map feeds right now");
-      }
-
-      if (failedFeeds < 5) {
-        markLiveRefresh();
       }
       if (showAircraftLocations || showAircraftTrails) void refreshAircraftFeed(true);
       if (showAviationIncidents) void refreshAviationIncidentFeed(true);
@@ -1594,6 +2037,11 @@ export function App() {
   }
 
   useEffect(() => {
+    const defaultTime = defaultRadarFrameTime(rainViewer);
+    setRadarFrameTime(defaultTime);
+  }, [rainViewer]);
+
+  useEffect(() => {
     void refreshGlobal(true);
     const weatherInterval = window.setInterval(() => void refreshWeatherGrid(), LIVE_REFRESH_MS.globalWeather);
     const quakeInterval = window.setInterval(() => void refreshEarthquakeFeed(), LIVE_REFRESH_MS.earthquakes);
@@ -1611,8 +2059,28 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (!mapViewMenuOpen) return;
+
+    function handlePointerDown(event: PointerEvent) {
+      if (mapViewMenuRef.current?.contains(event.target as Node)) return;
+      setMapViewMenuOpen(false);
+    }
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") setMapViewMenuOpen(false);
+    }
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [mapViewMenuOpen]);
+
+  useEffect(() => {
     const timers: number[] = [];
-    const needsWeatherGrid = activeLayer === "temperature" || activeLayer === "wind" || activeLayer === "rainForecast";
+    const needsWeatherGrid = activeLayer === "temperature" || activeLayer === "wind" || activeLayer === "radar";
     const needsRadar = activeLayer === "radar";
     const needsRisk = activeLayer === "risk";
     const needsEarthquakes = activeLayer === "seismic" || showEarthquakes;
@@ -1660,7 +2128,7 @@ export function App() {
     return () => {
       timers.forEach((timer) => window.clearInterval(timer));
     };
-  }, [activeLayer, forecastHourOffset, showEarthquakes, showWarnings, showAircraftLocations, showAircraftTrails, showAviationIncidents, aviationBounds, trackedAircraftIds.join(",")]);
+  }, [activeLayer, showEarthquakes, showWarnings, showAircraftLocations, showAircraftTrails, showAviationIncidents, aviationBounds, trackedAircraftIds.join(",")]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setSolarTimestamp(Date.now()), LIVE_REFRESH_MS.dayNight);
@@ -1685,7 +2153,9 @@ export function App() {
       aircraftLimit,
       aircraftOriginCountry,
       hideUntrackedAircraft,
-      forecastHourOffset
+      temperatureUnit,
+      windUnit,
+      rainUnit
     });
   }, [
     activeLayer,
@@ -1700,7 +2170,9 @@ export function App() {
     aircraftLimit,
     aircraftOriginCountry,
     hideUntrackedAircraft,
-    forecastHourOffset
+    temperatureUnit,
+    windUnit,
+    rainUnit
   ]);
 
   useEffect(() => {
@@ -1781,7 +2253,7 @@ export function App() {
         const key = `${homeLocation?.id}:${signal.id}:${signal.detail}`;
         if (notifiedSignals.current.has(key)) return;
         notifiedSignals.current.add(key);
-        notify(signal.title, `${locationLabel(homeLocation)}: ${signal.detail}`);
+        notify(signal.title, `${locationLabel(homeLocation, unitText.noCitySet)}: ${signal.detail}`);
       });
   }, [localSignals, notificationPermission, homeLocation?.id]);
 
@@ -1958,6 +2430,7 @@ export function App() {
           showHomeMarker={showHomeMarker}
           dayNightTimestamp={solarTimestamp}
           weatherGrid={weatherGrid}
+          liveWeatherPoints={mapLiveWeatherPoints}
           earthquakes={earthquakes}
           warnings={warnings}
           riskEvents={riskEvents}
@@ -1966,6 +2439,8 @@ export function App() {
           trackedAircraftIds={trackedAircraftIds}
           aircraftTracks={aircraftTracks}
           rainViewer={rainViewer}
+          rainFrameTime={selectedRadarFrame?.time}
+          unitSettings={unitSettings}
           mapLanguage={mapLanguage}
           appLanguage={appLanguage}
           homeFocusRequest={homeFocusRequest}
@@ -1978,7 +2453,7 @@ export function App() {
               ? {
                   ...homeLocation,
                   name: homeLocation.name,
-                  label: locationLabel(homeLocation),
+                  label: locationLabel(homeLocation, unitText.noCitySet),
                   weather: localWeather?.current,
                   airQuality: localWeather?.airQuality,
                   fetchedAt: localWeather?.fetchedAt,
@@ -1992,7 +2467,7 @@ export function App() {
               ? {
                   ...inspectedLocation,
                   name: inspectedLocation.name,
-                  label: locationLabel(inspectedLocation),
+                  label: locationLabel(inspectedLocation, unitText.noCitySet),
                   weather: inspectedWeather?.current,
                   airQuality: inspectedWeather?.airQuality,
                   fetchedAt: inspectedWeather?.fetchedAt,
@@ -2003,20 +2478,47 @@ export function App() {
           }
         />
 
-        <div className="map-control-stack">
+        <div className="map-control-stack" ref={mapViewMenuRef}>
           <div className="map-filter-bar">
-            <label className="map-view-select">
-              <Globe2 size={18} />
-              <span className="select-value">{layerLabel}</span>
-              <select value={activeLayer} onChange={(event) => setActiveLayer(event.target.value as PrimaryLayer)} aria-label={copy.mapView}>
-                {mapViews.map((view) => (
-                  <option value={view.id} key={view.id}>
-                    {copy.conditionLabels[view.id]}
-                  </option>
-                ))}
-              </select>
-              <ChevronDown size={16} />
-            </label>
+            <div className={mapViewMenuOpen ? "map-view-control open" : "map-view-control"}>
+              <button
+                className={mapViewMenuOpen ? "map-view-select active" : "map-view-select"}
+                type="button"
+                aria-label={copy.mapView}
+                aria-haspopup="listbox"
+                aria-expanded={mapViewMenuOpen}
+                onClick={() => setMapViewMenuOpen((value) => !value)}
+              >
+                <ActiveMapViewIcon size={18} />
+                <span className="select-value">{layerLabel}</span>
+                <ChevronDown size={16} />
+              </button>
+
+              {mapViewMenuOpen && (
+                <section className="map-view-menu-panel" role="listbox" aria-label={copy.mapView}>
+                  {mapViews.map((view) => {
+                    const ViewIcon = view.icon;
+                    const selected = activeLayer === view.id;
+                    return (
+                      <button
+                        type="button"
+                        role="option"
+                        aria-selected={selected}
+                        className={selected ? "active" : ""}
+                        onClick={() => {
+                          setActiveLayer(view.id);
+                          setMapViewMenuOpen(false);
+                        }}
+                        key={view.id}
+                      >
+                        <ViewIcon size={16} />
+                        <span>{copy.conditionLabels[view.id]}</span>
+                      </button>
+                    );
+                  })}
+                </section>
+              )}
+            </div>
 
             <button
               className={filtersOpen ? "toolbar-button active" : "toolbar-button"}
@@ -2069,35 +2571,10 @@ export function App() {
               )}
             </div>
 
-            <button className="toolbar-button icon-only" type="button" title={copy.refreshData} aria-label={copy.refreshData} onClick={() => void refreshGlobal(true)}>
-              <RefreshCw size={18} className={loading.global ? "spin" : ""} />
-            </button>
-
             <button className="toolbar-button icon-only" type="button" title={copy.homeCitySettings} aria-label={copy.homeCitySettings} onClick={() => setSettingsOpen((value) => !value)}>
               <Settings size={18} />
             </button>
           </div>
-
-          {hasForecastTimeControl && (
-            <section className="forecast-time-panel">
-              <div>
-                <strong>{layerLabel}</strong>
-                <span>{forecastDisplayLabel} · {forecastAbsoluteLabel}</span>
-              </div>
-              <div className="forecast-time-options">
-                {FORECAST_HOUR_OPTIONS.map((hour) => (
-                  <button
-                    type="button"
-                    className={forecastHourOffset === hour ? "active" : ""}
-                    onClick={() => setForecastHourOffset(hour)}
-                    key={hour}
-                  >
-                    {hour === 0 ? "Now" : `+${hour < 24 ? `${hour}h` : `${hour / 24}d`}`}
-                  </button>
-                ))}
-              </div>
-            </section>
-          )}
 
           {filtersOpen && (
             <section className="floating-panel filter-panel">
@@ -2242,6 +2719,45 @@ export function App() {
                 <ChevronDown size={15} />
               </label>
 
+              <label className="settings-select">
+                <span className="settings-select-label">{unitText.temperatureUnits}</span>
+                <span className="select-value">{temperatureUnitOptions.find((option) => option.id === temperatureUnit)?.label}</span>
+                <select value={temperatureUnit} onChange={(event) => setTemperatureUnit(event.target.value as TemperatureUnit)} aria-label={unitText.temperatureUnits}>
+                  {temperatureUnitOptions.map((option) => (
+                    <option value={option.id} key={option.id}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                <ChevronDown size={15} />
+              </label>
+
+              <label className="settings-select">
+                <span className="settings-select-label">{unitText.windUnits}</span>
+                <span className="select-value">{windUnitOptions.find((option) => option.id === windUnit)?.label}</span>
+                <select value={windUnit} onChange={(event) => setWindUnit(event.target.value as WindUnit)} aria-label={unitText.windUnits}>
+                  {windUnitOptions.map((option) => (
+                    <option value={option.id} key={option.id}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                <ChevronDown size={15} />
+              </label>
+
+              <label className="settings-select">
+                <span className="settings-select-label">{unitText.rainUnits}</span>
+                <span className="select-value">{rainUnitOptions.find((option) => option.id === rainUnit)?.label}</span>
+                <select value={rainUnit} onChange={(event) => setRainUnit(event.target.value as RainUnit)} aria-label={unitText.rainUnits}>
+                  {rainUnitOptions.map((option) => (
+                    <option value={option.id} key={option.id}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                <ChevronDown size={15} />
+              </label>
+
               <div className="result-list">
                 {loading.search && <span className="subtle-line">{copy.searching}</span>}
                 {!loading.search &&
@@ -2304,7 +2820,7 @@ export function App() {
                   <div>
                     <span className="eyebrow">{copy.location}</span>
                     <h2>{inspectedLocation.name}</h2>
-                    <p>{locationLabel(inspectedLocation)}</p>
+                    <p>{locationLabel(inspectedLocation, unitText.noCitySet)}</p>
                   </div>
                   <div className="local-dock-actions">
                     <button className="small-icon-button" type="button" title={copy.close} aria-label={copy.close} onClick={clearInspectedLocation}>
@@ -2326,17 +2842,17 @@ export function App() {
                   <>
                     <div className="current-weather compact-weather">
                       <div>
-                        <span className="temp-value">{formatTemperature(inspectedCurrent.temperature_2m)}</span>
-                        <span className="condition-line">{weatherCodeLabel(inspectedCurrent.weather_code)}</span>
+                        <span className="temp-value">{formatTemperature(inspectedCurrent.temperature_2m, temperatureUnit)}</span>
+                        <span className="condition-line">{weatherCodeLabel(inspectedCurrent.weather_code, appLanguage)}</span>
                       </div>
                       <div className="weather-metrics">
                         <span>
                           <Wind size={15} />
-                          {formatWind(inspectedCurrent.wind_speed_10m)}
+                          {windReadout(inspectedCurrent.wind_speed_10m, inspectedCurrent.wind_direction_10m, windUnit, appLanguage)}
                         </span>
                         <span>
                           <CloudRain size={15} />
-                          {inspectedCurrent.precipitation.toFixed(1)} mm
+                          {rainSummary(inspectedCurrent.precipitation, rainUnit)}
                         </span>
                       </div>
                     </div>
@@ -2344,11 +2860,7 @@ export function App() {
                     <div className="metric-row">
                       <div>
                         <span>{copy.feels}</span>
-                        <strong>{formatTemperature(inspectedCurrent.apparent_temperature)}</strong>
-                      </div>
-                      <div>
-                        <span>{copy.gust}</span>
-                        <strong>{formatWind(inspectedCurrent.wind_gusts_10m)}</strong>
+                        <strong>{formatTemperature(inspectedCurrent.apparent_temperature, temperatureUnit)}</strong>
                       </div>
                       <div>
                         <span>{copy.humidity}</span>
@@ -2432,7 +2944,7 @@ export function App() {
                   <div>
                     <span className="eyebrow">{copy.home}</span>
                     <h2>{homeLocation ? homeLocation.name : copy.setCity}</h2>
-                    <p>{locationLabel(homeLocation)}</p>
+                    <p>{locationLabel(homeLocation, unitText.noCitySet)}</p>
                   </div>
                   <div className="local-dock-actions">
                     <button className="small-icon-button" type="button" title={copy.refreshLocalWeather} aria-label={copy.refreshLocalWeather} onClick={() => void refreshLocal(homeLocation, true)}>
@@ -2450,17 +2962,17 @@ export function App() {
                   <>
                     <div className="current-weather compact-weather">
                       <div>
-                        <span className="temp-value">{formatTemperature(homeCurrent.temperature_2m)}</span>
-                        <span className="condition-line">{weatherCodeLabel(homeCurrent.weather_code)}</span>
+                        <span className="temp-value">{formatTemperature(homeCurrent.temperature_2m, temperatureUnit)}</span>
+                        <span className="condition-line">{weatherCodeLabel(homeCurrent.weather_code, appLanguage)}</span>
                       </div>
                       <div className="weather-metrics">
                         <span>
                           <Wind size={15} />
-                          {formatWind(homeCurrent.wind_speed_10m)}
+                          {windReadout(homeCurrent.wind_speed_10m, homeCurrent.wind_direction_10m, windUnit, appLanguage)}
                         </span>
                         <span>
                           <CloudRain size={15} />
-                          {homeCurrent.precipitation.toFixed(1)} mm
+                          {rainSummary(homeCurrent.precipitation, rainUnit)}
                         </span>
                       </div>
                     </div>
@@ -2468,11 +2980,7 @@ export function App() {
                     <div className="metric-row">
                       <div>
                         <span>{copy.feels}</span>
-                        <strong>{formatTemperature(homeCurrent.apparent_temperature)}</strong>
-                      </div>
-                      <div>
-                        <span>{copy.gust}</span>
-                        <strong>{formatWind(homeCurrent.wind_gusts_10m)}</strong>
+                        <strong>{formatTemperature(homeCurrent.apparent_temperature, temperatureUnit)}</strong>
                       </div>
                       <div>
                         <span>{copy.humidity}</span>
@@ -2538,31 +3046,30 @@ export function App() {
           </section>
         </div>
 
-        <div className={`legend${activeLayer === "radar" || activeLayer === "rainForecast" ? " radar-legend" : activeLayer === "seismic" ? " seismic-legend" : activeLayer === "risk" ? " risk-legend" : ""}`}>
+        <div className={`legend${activeLayer === "radar" ? " radar-legend" : activeLayer === "seismic" ? " seismic-legend" : activeLayer === "risk" ? " risk-legend" : ""}`}>
           <div className="legend-title">
             <Globe2 size={15} />
             {layerLabel}
           </div>
           {activeLayer === "temperature" && (
             <div className="temp-scale">
-              <span>-30</span>
+              <span>{temperatureScaleMin}</span>
               <div />
-              <span>50 C</span>
+              <span>{temperatureScaleMax}</span>
             </div>
           )}
           {activeLayer === "wind" && (
             <div className="wind-scale">
               <div className="wind-scale-heading">
                 <span>{copy.windScaleTitle}</span>
-                <b>{forecastDisplayLabel}</b>
+                <b>{currentWeatherLabel}</b>
               </div>
               <div className="wind-gradient" />
               <div className="wind-scale-values" aria-hidden="true">
-                <span>0</span>
-                <span>15</span>
-                <span>35</span>
-                <span>60</span>
-                <span>90+</span>
+                {windScaleValues.map((value) => (
+                  <span key={value}>{value}</span>
+                ))}
+                <span>{windScaleTop}</span>
               </div>
               <div className="wind-scale-labels">
                 <span>{copy.windCalm}</span>
@@ -2570,7 +3077,7 @@ export function App() {
                 <span>{copy.windStrong}</span>
                 <span>{copy.windGale}</span>
               </div>
-              <p>{forecastAbsoluteLabel} · {copy.windScaleNote}</p>
+              <p>{currentWeatherDetailLabel} · {copy.windScaleNote}</p>
             </div>
           )}
           {showEarthquakes && activeLayer !== "seismic" && (
@@ -2621,16 +3128,14 @@ export function App() {
             <div className="radar-scale">
               <div className="radar-scale-heading">
                 <span>{copy.radarScaleTitle}</span>
-                <b>mm/h</b>
+                <b>{currentWeatherLabel}</b>
               </div>
               <div className="radar-gradient" />
               <div className="radar-scale-values" aria-hidden="true">
-                <span>0.2</span>
-                <span>1</span>
-                <span>3</span>
-                <span>8</span>
-                <span>18</span>
-                <span>30+</span>
+                {radarScaleValues.map((value) => (
+                  <span key={value}>{value}</span>
+                ))}
+                <span>{radarScaleTop}</span>
               </div>
               <div className="radar-scale-labels">
                 <span>{copy.radarLight}</span>
@@ -2638,31 +3143,7 @@ export function App() {
                 <span>{copy.radarHeavy}</span>
                 <span>{copy.radarExtreme}</span>
               </div>
-              <p>{copy.radarScaleNote}</p>
-            </div>
-          )}
-          {activeLayer === "rainForecast" && (
-            <div className="radar-scale">
-              <div className="radar-scale-heading">
-                <span>{copy.conditionLabels.rainForecast}</span>
-                <b>{forecastDisplayLabel}</b>
-              </div>
-              <div className="rain-forecast-gradient" />
-              <div className="radar-scale-values" aria-hidden="true">
-                <span>0.2</span>
-                <span>1</span>
-                <span>3</span>
-                <span>8</span>
-                <span>18</span>
-                <span>30+</span>
-              </div>
-              <div className="radar-scale-labels">
-                <span>{copy.radarLight}</span>
-                <span>{copy.radarModerate}</span>
-                <span>{copy.radarHeavy}</span>
-                <span>{copy.radarExtreme}</span>
-              </div>
-              <p>{forecastAbsoluteLabel} · Model forecast rain, not live radar</p>
+              <p>{radarObservedDetailLabel}</p>
             </div>
           )}
           {showDayNight && <span>{copy.nightMask}</span>}
@@ -2688,7 +3169,7 @@ export function App() {
               <span>{copy.warnings} {activeWarnings.length}</span>
             </>
           )}
-          <span>{loading.global ? copy.refreshing : `${copy.updated} ${timeAgo(lastGlobalRefresh)}`}</span>
+          <span>{loading.global ? copy.refreshing : activeUpdateLabel}</span>
         </div>
 
         {error && <div className="error-box">{error}</div>}

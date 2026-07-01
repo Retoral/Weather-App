@@ -1,6 +1,6 @@
 import type { Geometry } from "geojson";
 
-export type PrimaryLayer = "normal" | "temperature" | "wind" | "radar" | "rainForecast" | "seismic" | "risk";
+export type PrimaryLayer = "normal" | "temperature" | "wind" | "radar" | "seismic" | "risk";
 
 export type Severity = "quiet" | "watch" | "warning" | "danger";
 
@@ -72,6 +72,7 @@ export interface WeatherGridPoint {
   windGust: number;
   windDirection: number;
   precipitation: number;
+  precipitationProbability?: number;
   pressure: number;
   cloudCover: number;
 }
