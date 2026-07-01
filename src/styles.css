@@ -214,6 +214,55 @@ button {
   color: #171615;
 }
 
+.aircraft-search-filter {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.aircraft-search-input-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 38px;
+  padding: 0 9px;
+  border-radius: 7px;
+  background: rgba(255, 250, 241, 0.12);
+  color: rgba(255, 250, 241, 0.72);
+}
+
+.aircraft-search-input-row input {
+  min-width: 0;
+  flex: 1;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: #fffaf1;
+  font: inherit;
+  font-weight: 800;
+}
+
+.aircraft-search-input-row input::placeholder {
+  color: rgba(255, 250, 241, 0.46);
+}
+
+.aircraft-search-input-row button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: rgba(255, 250, 241, 0.12);
+  color: rgba(255, 250, 241, 0.82);
+  cursor: pointer;
+}
+
+.aircraft-search-input-row button:hover {
+  background: rgba(255, 250, 241, 0.2);
+  color: #fffaf1;
+}
+
 .map-view-menu-panel {
   position: absolute;
   z-index: 121;
@@ -1686,6 +1735,34 @@ button {
 
 .map-popup-action:hover {
   background: #0d9488;
+}
+
+.aircraft-node-popup .leaflet-popup-content {
+  margin: 30px 10px 10px;
+}
+
+.aircraft-node-popup .map-popup {
+  min-width: 168px;
+  max-width: 176px;
+  padding-right: 0;
+}
+
+.aircraft-node-popup .map-popup div {
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.aircraft-node-popup .map-popup strong {
+  flex: 0 0 auto;
+}
+
+.aircraft-node-popup .map-popup span {
+  max-width: 96px;
+  overflow-wrap: anywhere;
+}
+
+.aircraft-node-popup .map-popup-action {
+  width: 100%;
 }
 
 .selector-popup .leaflet-popup-content-wrapper {

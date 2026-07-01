@@ -42,17 +42,18 @@ const INMET_ACTIVE_WARNINGS = "https://apiprevmet3.inmet.gov.br/avisos/ativos";
 const GDELT_LAST_UPDATE = "http://data.gdeltproject.org/gdeltv2/lastupdate.txt";
 const OPENSKY_STATES = "https://opensky-network.org/api/states/all";
 const OPENSKY_TRACKS = "https://opensky-network.org/api/tracks/all";
+const ADSB_LOL_AIRCRAFT = "https://api.adsb.lol/v2/lat";
 const WEATHER_GRID_CACHE_KEY = "weather-watch:weather-grid-cache:v3";
 const RISK_EVENTS_CACHE_KEY = "weather-watch:risk-events-cache:v3";
-const AIRCRAFT_CACHE_PREFIX = "weather-watch:aircraft-cache:v1";
+const AIRCRAFT_CACHE_PREFIX = "weather-watch:aircraft-cache:v2";
 const AIRCRAFT_TRACK_CACHE_PREFIX = "weather-watch:aircraft-track-cache:v1";
 const AVIATION_INCIDENTS_CACHE_KEY = "weather-watch:aviation-incidents-cache:v1";
 const WEATHER_GRID_FRESH_MS = 9 * 60 * 1000;
 const WEATHER_GRID_STALE_MS = 8 * 60 * 60 * 1000;
 const RISK_EVENTS_FRESH_MS = 55 * 1000;
 const RISK_EVENTS_STALE_MS = 45 * 60 * 1000;
-const AIRCRAFT_FRESH_MS = 22 * 1000;
-const AIRCRAFT_STALE_MS = 3 * 60 * 1000;
+const AIRCRAFT_FRESH_MS = 55 * 1000;
+const AIRCRAFT_STALE_MS = 30 * 60 * 1000;
 const AIRCRAFT_TRACK_FRESH_MS = 2 * 60 * 1000;
 const AIRCRAFT_TRACK_STALE_MS = 20 * 60 * 1000;
 const AVIATION_INCIDENTS_FRESH_MS = 10 * 60 * 1000;
@@ -66,6 +67,11 @@ const PROVIDER_COOLDOWN_PREFIX = "weather-watch:provider-cooldown";
 const RATE_LIMIT_COOLDOWN_MS = 10 * 60 * 1000;
 const WEATHER_GRID_PROVIDER = "open-meteo-grid";
 const WEATHER_GRID_FAILURE_COOLDOWN_MS = 30 * 60 * 1000;
+const AIRCRAFT_PROVIDER = "opensky-states";
+const AIRCRAFT_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
+const ADSB_LOL_FALLBACK_RADIUS_KM = 350;
+const ADSB_LOL_MAX_FALLBACK_QUERIES = 12;
+const ADSB_LOL_QUERY_TIMEOUT_MS = 4_500;
 
 class WeatherRequestError extends Error {
   constructor(
@@ -774,24 +780,51 @@ export async function fetchAircraftStates(
 ): Promise<AircraftState[]> {
   const cacheKey = aircraftCacheKey(bounds);
   const freshCache = readAircraftCache(cacheKey, options.freshMs ?? AIRCRAFT_FRESH_MS);
-  if (freshCache) return freshCache.aircraft;
+  if (freshCache?.aircraft.length) return freshCache.aircraft;
+
+  if (providerInCooldown(AIRCRAFT_PROVIDER)) {
+    const fallbackAircraft = await fetchAdsbLolAircraft(bounds, signal).catch(() => []);
+    if (fallbackAircraft.length > 0) {
+      writeAircraftCache(cacheKey, fallbackAircraft);
+      return fallbackAircraft;
+    }
+    const staleCache = readAircraftCache(cacheKey, AIRCRAFT_STALE_MS);
+    if (staleCache?.aircraft.length) return staleCache.aircraft;
+    throw new Error("Aircraft provider is cooling down after a recent request failure");
+  }
 
   try {
     const urls = openskyStateUrls(bounds);
     const responses = await Promise.allSettled(urls.map((url) => fetchText(url, signal)));
+    const rejected = responses.filter((response) => response.status === "rejected");
     const aircraft = dedupeAircraft(
       responses.flatMap((response) => response.status === "fulfilled" ? parseOpenSkyStates(response.value) : [])
     )
       .sort((left, right) => right.lastContact - left.lastContact)
       .slice(0, 1_200);
 
+    if (rejected.length === responses.length || (aircraft.length === 0 && rejected.length > 0)) {
+      throw rejected[0]?.reason ?? new Error("Aircraft provider request failed");
+    }
+
     writeAircraftCache(cacheKey, aircraft);
+    clearProviderCooldown(AIRCRAFT_PROVIDER);
     return aircraft;
   } catch (err) {
+    if (shouldCooldownProvider(err)) setProviderCooldown(AIRCRAFT_PROVIDER, AIRCRAFT_FAILURE_COOLDOWN_MS);
+    const fallbackAircraft = await fetchAdsbLolAircraft(bounds, signal).catch(() => []);
+    if (fallbackAircraft.length > 0) {
+      writeAircraftCache(cacheKey, fallbackAircraft);
+      return fallbackAircraft;
+    }
     const staleCache = readAircraftCache(cacheKey, AIRCRAFT_STALE_MS);
-    if (staleCache) return staleCache.aircraft;
+    if (staleCache?.aircraft.length) return staleCache.aircraft;
     throw err;
   }
+}
+
+export function getCachedAircraftStates(bounds?: AviationBounds, maxAgeMs = AIRCRAFT_STALE_MS): AircraftState[] {
+  return readAircraftCache(aircraftCacheKey(bounds), maxAgeMs)?.aircraft ?? [];
 }
 
 export async function fetchAircraftStatesByIds(
@@ -806,13 +839,21 @@ export async function fetchAircraftStatesByIds(
   const freshCache = readAircraftCache(cacheKey, options.freshMs ?? AIRCRAFT_FRESH_MS);
   if (freshCache) return freshCache.aircraft;
 
+  if (providerInCooldown(AIRCRAFT_PROVIDER)) {
+    const staleCache = readAircraftCache(cacheKey, AIRCRAFT_STALE_MS);
+    if (staleCache) return staleCache.aircraft;
+    return [];
+  }
+
   try {
     const aircraft = dedupeAircraft(parseOpenSkyStates(await fetchText(openSkyTrackedStateUrl(normalizedIds), signal), { includeGround: true }))
       .sort((left, right) => right.lastContact - left.lastContact)
       .slice(0, normalizedIds.length);
     writeAircraftCache(cacheKey, aircraft);
+    clearProviderCooldown(AIRCRAFT_PROVIDER);
     return aircraft;
   } catch (err) {
+    if (shouldCooldownProvider(err)) setProviderCooldown(AIRCRAFT_PROVIDER, AIRCRAFT_FAILURE_COOLDOWN_MS);
     const staleCache = readAircraftCache(cacheKey, AIRCRAFT_STALE_MS);
     if (staleCache) return staleCache.aircraft;
     return [];
@@ -884,6 +925,544 @@ function openSkyTrackedStateUrl(aircraftIds: string[]) {
   return url.toString();
 }
 
+async function fetchAdsbLolAircraft(bounds?: AviationBounds, signal?: AbortSignal) {
+  const queries = adsbLolQueries(bounds);
+  if (queries.length === 0) return [];
+
+  const responses = await Promise.allSettled(
+    queries.map((query) => {
+      const url = `${ADSB_LOL_AIRCRAFT}/${query.lat.toFixed(4)}/lon/${query.lon.toFixed(4)}/dist/${query.radiusKm}`;
+      return withPromiseTimeout(
+        withTimeoutSignal(signal, ADSB_LOL_QUERY_TIMEOUT_MS, (querySignal) =>
+          fetchText(url, querySignal, { preferBrowser: true }).then((text) => parseAdsbLolAircraft(text, query.bounds))
+        ),
+        ADSB_LOL_QUERY_TIMEOUT_MS + 400
+      );
+    })
+  );
+  return dedupeAircraft(
+    responses.flatMap((response) => response.status === "fulfilled" ? response.value : [])
+  ).sort((left, right) => right.lastContact - left.lastContact);
+}
+
+function adsbLolQueries(bounds?: AviationBounds) {
+  const normalized = normalizedAviationBounds(bounds);
+  if (!normalized) return [];
+
+  const west = normalized.west;
+  const east = normalized.east < normalized.west ? normalized.east + 360 : normalized.east;
+  const centerLat = Math.max(-80, Math.min(80, (normalized.south + normalized.north) / 2));
+  const latKm = Math.max(1, (normalized.north - normalized.south) * 111);
+  const lonKm = Math.max(1, (east - west) * 111 * Math.max(0.25, Math.cos((centerLat * Math.PI) / 180)));
+  let rows = Math.max(1, Math.ceil(latKm / (ADSB_LOL_FALLBACK_RADIUS_KM * 1.55)));
+  let cols = Math.max(1, Math.ceil(lonKm / (ADSB_LOL_FALLBACK_RADIUS_KM * 1.55)));
+
+  while (rows * cols > ADSB_LOL_MAX_FALLBACK_QUERIES) {
+    if (cols >= rows && cols > 1) {
+      cols -= 1;
+    } else if (rows > 1) {
+      rows -= 1;
+    } else {
+      break;
+    }
+  }
+
+  const queries: Array<{ lat: number; lon: number; radiusKm: number; bounds: AviationBounds }> = [];
+  for (let row = 0; row < rows; row += 1) {
+    const cellSouth = normalized.south + ((normalized.north - normalized.south) * row) / rows;
+    const cellNorth = normalized.south + ((normalized.north - normalized.south) * (row + 1)) / rows;
+    const lat = (cellSouth + cellNorth) / 2;
+    for (let col = 0; col < cols; col += 1) {
+      const cellWest = west + ((east - west) * col) / cols;
+      const cellEast = west + ((east - west) * (col + 1)) / cols;
+      const lon = normalizeApiLongitude((cellWest + cellEast) / 2);
+      const corners = [
+        [cellSouth, normalizeApiLongitude(cellWest)],
+        [cellSouth, normalizeApiLongitude(cellEast)],
+        [cellNorth, normalizeApiLongitude(cellWest)],
+        [cellNorth, normalizeApiLongitude(cellEast)]
+      ] as const;
+      const radiusKm = Math.round(Math.min(ADSB_LOL_FALLBACK_RADIUS_KM, Math.max(35, ...corners.map(([cornerLat, cornerLon]) => distanceKm(lat, lon, cornerLat, cornerLon)))));
+      queries.push({ lat, lon, radiusKm, bounds: normalized });
+    }
+  }
+
+  return queries;
+}
+
+function parseAdsbLolAircraft(text: string, bounds?: AviationBounds): AircraftState[] {
+  const payload = JSON.parse(text) as { ac?: Array<Record<string, unknown>>; now?: number };
+  const now = typeof payload.now === "number" ? payload.now : Date.now();
+  return (payload.ac ?? [])
+    .map((row): AircraftState | undefined => {
+      const id = stringValue(row.hex)?.toLowerCase();
+      const lat = numberValue(row.lat);
+      const lon = numberValue(row.lon);
+      if (!id || lat === undefined || lon === undefined) return undefined;
+      if (bounds && !pointInAviationBounds(lat, lon, bounds)) return undefined;
+
+      const seenSeconds = numberValue(row.seen_pos) ?? numberValue(row.seen) ?? 0;
+      const lastContact = now - seenSeconds * 1000;
+      if (Date.now() - lastContact > 5 * 60 * 1000) return undefined;
+
+      const baroAltitude = row.alt_baro === "ground" ? undefined : feetToMeters(numberValue(row.alt_baro));
+      const geomAltitude = feetToMeters(numberValue(row.alt_geom));
+      const groundSpeed = numberValue(row.gs);
+      const categoryCode = stringValue(row.category);
+      const registration = stringValue(row.r);
+      const aircraftType = stringValue(row.t)?.toUpperCase();
+      const aircraftDescription = aircraftDescriptionLabel(stringValue(row.desc));
+      const callsign = stringValue(row.flight) || registration || undefined;
+      return {
+        id,
+        callsign,
+        registration,
+        originCountry: inferredAircraftOriginCountry(registration, id),
+        operator: aircraftOperatorLabel(row, callsign),
+        aircraftType,
+        aircraftModel: aircraftDescription ?? aircraftModelLabel(aircraftType),
+        lat,
+        lon,
+        altitude: baroAltitude,
+        geoAltitude: geomAltitude,
+        velocity: groundSpeed !== undefined ? Math.round(groundSpeed * 1.852) : undefined,
+        heading: numberValue(row.track) ?? numberValue(row.true_heading) ?? undefined,
+        verticalRate: feetPerMinuteToMetersPerSecond(numberValue(row.baro_rate) ?? numberValue(row.geom_rate)),
+        onGround: row.alt_baro === "ground",
+        squawk: stringValue(row.squawk) || undefined,
+        categoryLabel: adsbLolCategoryLabel(categoryCode),
+        lastContact,
+        sourceLabel: "ADSB.lol"
+      };
+    })
+    .filter(isDefined);
+}
+
+function pointInAviationBounds(lat: number, lon: number, bounds: AviationBounds) {
+  if (lat < bounds.south || lat > bounds.north) return false;
+  const normalizedLon = normalizeApiLongitude(lon);
+  if (bounds.west <= bounds.east) return normalizedLon >= bounds.west && normalizedLon <= bounds.east;
+  return normalizedLon >= bounds.west || normalizedLon <= bounds.east;
+}
+
+function feetToMeters(value?: number) {
+  return value !== undefined ? Math.round(value * 0.3048) : undefined;
+}
+
+function feetPerMinuteToMetersPerSecond(value?: number) {
+  return value !== undefined ? value * 0.00508 : undefined;
+}
+
+const AIRCRAFT_TYPE_LABELS: Record<string, string> = {
+  A318: "Airbus A318",
+  A319: "Airbus A319",
+  A320: "Airbus A320",
+  A321: "Airbus A321",
+  A19N: "Airbus A319neo",
+  A20N: "Airbus A320neo",
+  A21N: "Airbus A321neo",
+  A332: "Airbus A330-200",
+  A333: "Airbus A330-300",
+  A339: "Airbus A330-900neo",
+  A343: "Airbus A340-300",
+  A359: "Airbus A350-900",
+  A35K: "Airbus A350-1000",
+  A388: "Airbus A380-800",
+  B733: "Boeing 737-300",
+  B734: "Boeing 737-400",
+  B735: "Boeing 737-500",
+  B736: "Boeing 737-600",
+  B737: "Boeing 737-700",
+  B738: "Boeing 737-800",
+  B739: "Boeing 737-900",
+  B37M: "Boeing 737 MAX 7",
+  B38M: "Boeing 737 MAX 8",
+  B39M: "Boeing 737 MAX 9",
+  B3XM: "Boeing 737 MAX 10",
+  B744: "Boeing 747-400",
+  B748: "Boeing 747-8",
+  B752: "Boeing 757-200",
+  B753: "Boeing 757-300",
+  B762: "Boeing 767-200",
+  B763: "Boeing 767-300",
+  B764: "Boeing 767-400",
+  B772: "Boeing 777-200",
+  B77L: "Boeing 777-200LR",
+  B773: "Boeing 777-300",
+  B77W: "Boeing 777-300ER",
+  B788: "Boeing 787-8",
+  B789: "Boeing 787-9",
+  B78X: "Boeing 787-10",
+  BE20: "Beechcraft King Air 200",
+  B200: "Beechcraft Super King Air 200",
+  B350: "Beechcraft King Air 350",
+  B190: "Beechcraft 1900",
+  E170: "Embraer E170",
+  E175: "Embraer E175",
+  E190: "Embraer E190",
+  E195: "Embraer E195",
+  E290: "Embraer E190-E2",
+  E295: "Embraer E195-E2",
+  CRJ2: "Bombardier CRJ200",
+  CRJ7: "Bombardier CRJ700",
+  CRJ9: "Bombardier CRJ900",
+  CRJX: "Bombardier CRJ1000",
+  AT43: "ATR 42-300",
+  AT45: "ATR 42-500",
+  AT46: "ATR 42-600",
+  AT72: "ATR 72",
+  AT75: "ATR 72-500",
+  AT76: "ATR 72-600",
+  DH8A: "De Havilland Canada Dash 8-100",
+  DH8B: "De Havilland Canada Dash 8-200",
+  DH8C: "De Havilland Canada Dash 8-300",
+  DH8D: "De Havilland Canada Dash 8 Q400",
+  C172: "Cessna 172",
+  C182: "Cessna 182",
+  C208: "Cessna 208 Caravan",
+  C510: "Cessna Citation Mustang",
+  C525: "Cessna CitationJet",
+  C56X: "Cessna Citation Excel",
+  C680: "Cessna Citation Sovereign",
+  C700: "Cessna Citation Longitude",
+  PC12: "Pilatus PC-12",
+  PA31: "Piper PA-31 Navajo",
+  GLF4: "Gulfstream IV",
+  GLF5: "Gulfstream V",
+  GLF6: "Gulfstream G650",
+  GLEX: "Bombardier Global Express",
+  CL60: "Bombardier Challenger 600",
+  C25A: "Cessna Citation CJ2",
+  C25B: "Cessna Citation CJ3",
+  C25C: "Cessna Citation CJ4"
+};
+
+const AIRCRAFT_REGISTRATION_COUNTRIES: Array<[string, string]> = [
+  ["A4O-", "Oman"],
+  ["A9C-", "Bahrain"],
+  ["VP-B", "Bermuda"],
+  ["VP-C", "Cayman Islands"],
+  ["VQ-B", "Bermuda"],
+  ["3A-", "Monaco"],
+  ["4K-", "Azerbaijan"],
+  ["4L-", "Georgia"],
+  ["4O-", "Montenegro"],
+  ["4R-", "Sri Lanka"],
+  ["4X-", "Israel"],
+  ["5A-", "Libya"],
+  ["5B-", "Cyprus"],
+  ["5H-", "Tanzania"],
+  ["5N-", "Nigeria"],
+  ["5R-", "Madagascar"],
+  ["5T-", "Mauritania"],
+  ["5U-", "Niger"],
+  ["5V-", "Togo"],
+  ["5X-", "Uganda"],
+  ["5Y-", "Kenya"],
+  ["6O-", "Somalia"],
+  ["6V-", "Senegal"],
+  ["6Y-", "Jamaica"],
+  ["7O-", "Yemen"],
+  ["7P-", "Lesotho"],
+  ["7Q-", "Malawi"],
+  ["7T-", "Algeria"],
+  ["8P-", "Barbados"],
+  ["8Q-", "Maldives"],
+  ["8R-", "Guyana"],
+  ["9A-", "Croatia"],
+  ["9G-", "Ghana"],
+  ["9H-", "Malta"],
+  ["9J-", "Zambia"],
+  ["9K-", "Kuwait"],
+  ["9L-", "Sierra Leone"],
+  ["9M-", "Malaysia"],
+  ["9N-", "Nepal"],
+  ["9Q-", "Democratic Republic of the Congo"],
+  ["9V-", "Singapore"],
+  ["9Y-", "Trinidad and Tobago"],
+  ["A2-", "Botswana"],
+  ["A3-", "Tonga"],
+  ["A5-", "Bhutan"],
+  ["A6-", "United Arab Emirates"],
+  ["A7-", "Qatar"],
+  ["AP-", "Pakistan"],
+  ["B-H", "Hong Kong"],
+  ["B-K", "Hong Kong"],
+  ["B-L", "Hong Kong"],
+  ["B-M", "Macau"],
+  ["C-F", "Canada"],
+  ["C-G", "Canada"],
+  ["C5-", "Gambia"],
+  ["C6-", "Bahamas"],
+  ["C9-", "Mozambique"],
+  ["CC-", "Chile"],
+  ["CN-", "Morocco"],
+  ["CP-", "Bolivia"],
+  ["CU-", "Cuba"],
+  ["CX-", "Uruguay"],
+  ["D2-", "Angola"],
+  ["D4-", "Cape Verde"],
+  ["D6-", "Comoros"],
+  ["E3-", "Eritrea"],
+  ["E5-", "Cook Islands"],
+  ["E7-", "Bosnia and Herzegovina"],
+  ["EC-", "Spain"],
+  ["EI-", "Ireland"],
+  ["EK-", "Armenia"],
+  ["EP-", "Iran"],
+  ["ER-", "Moldova"],
+  ["ES-", "Estonia"],
+  ["ET-", "Ethiopia"],
+  ["EW-", "Belarus"],
+  ["EX-", "Kyrgyzstan"],
+  ["EY-", "Tajikistan"],
+  ["EZ-", "Turkmenistan"],
+  ["HC-", "Ecuador"],
+  ["HH-", "Haiti"],
+  ["HI-", "Dominican Republic"],
+  ["HK-", "Colombia"],
+  ["HL", "South Korea"],
+  ["HP-", "Panama"],
+  ["HS-", "Thailand"],
+  ["HZ-", "Saudi Arabia"],
+  ["JA", "Japan"],
+  ["JY-", "Jordan"],
+  ["LX-", "Luxembourg"],
+  ["OD-", "Lebanon"],
+  ["P2-", "Papua New Guinea"],
+  ["P4-", "Aruba"],
+  ["PJ-", "Curaçao"],
+  ["PK-", "Indonesia"],
+  ["PP-", "Brazil"],
+  ["PR-", "Brazil"],
+  ["PS-", "Brazil"],
+  ["PT-", "Brazil"],
+  ["PU-", "Brazil"],
+  ["PZ-", "Suriname"],
+  ["RA-", "Russia"],
+  ["RF-", "Russia"],
+  ["RP-", "Philippines"],
+  ["S2-", "Bangladesh"],
+  ["S5-", "Slovenia"],
+  ["SE-", "Sweden"],
+  ["SP-", "Poland"],
+  ["SU-", "Egypt"],
+  ["SX-", "Greece"],
+  ["T7-", "San Marino"],
+  ["TC-", "Turkey"],
+  ["TG-", "Guatemala"],
+  ["TI-", "Costa Rica"],
+  ["TJ-", "Cameroon"],
+  ["TR-", "Gabon"],
+  ["TU-", "Cote d'Ivoire"],
+  ["TZ-", "Mali"],
+  ["UK-", "Uzbekistan"],
+  ["UN-", "Kazakhstan"],
+  ["UP-", "Kazakhstan"],
+  ["UR-", "Ukraine"],
+  ["VH-", "Australia"],
+  ["VN-", "Nepal"],
+  ["VT-", "India"],
+  ["XA-", "Mexico"],
+  ["XB-", "Mexico"],
+  ["XC-", "Mexico"],
+  ["YI-", "Iraq"],
+  ["YK-", "Syria"],
+  ["YL-", "Latvia"],
+  ["YN-", "Nicaragua"],
+  ["YR-", "Romania"],
+  ["YS-", "El Salvador"],
+  ["YU-", "Serbia"],
+  ["YV-", "Venezuela"],
+  ["Z3-", "North Macedonia"],
+  ["ZA-", "Albania"],
+  ["ZK-", "New Zealand"],
+  ["ZP-", "Paraguay"],
+  ["ZS-", "South Africa"],
+  ["ZT-", "South Africa"],
+  ["ZU-", "South Africa"],
+  ["LN-", "Norway"],
+  ["OY-", "Denmark"],
+  ["OH-", "Finland"],
+  ["TF-", "Iceland"],
+  ["LY-", "Lithuania"],
+  ["G-", "United Kingdom"],
+  ["D-", "Germany"],
+  ["F-", "France"],
+  ["I-", "Italy"],
+  ["PH-", "Netherlands"],
+  ["OO-", "Belgium"],
+  ["HB-", "Switzerland"],
+  ["OE-", "Austria"],
+  ["CS-", "Portugal"],
+  ["OK-", "Czechia"],
+  ["OM-", "Slovakia"],
+  ["HA-", "Hungary"],
+  ["LZ-", "Bulgaria"],
+  ["LV-", "Argentina"],
+  ["OB-", "Peru"],
+  ["B-", "China"],
+  ["B", "China"]
+];
+
+const AIRCRAFT_ICAO_COUNTRY_RANGES: Array<[number, number, string]> = [
+  [0x0a0000, 0x0a7fff, "South Africa"],
+  [0x140000, 0x1fffff, "Russia"],
+  [0x300000, 0x33ffff, "Italy"],
+  [0x340000, 0x37ffff, "Spain"],
+  [0x380000, 0x3bffff, "France"],
+  [0x3c0000, 0x3fffff, "Germany"],
+  [0x400000, 0x43ffff, "United Kingdom"],
+  [0x440000, 0x447fff, "Austria"],
+  [0x448000, 0x44ffff, "Belgium"],
+  [0x450000, 0x457fff, "Bulgaria"],
+  [0x458000, 0x45ffff, "Denmark"],
+  [0x460000, 0x467fff, "Finland"],
+  [0x468000, 0x46ffff, "Greece"],
+  [0x470000, 0x477fff, "Hungary"],
+  [0x478000, 0x47ffff, "Norway"],
+  [0x480000, 0x487fff, "Netherlands"],
+  [0x488000, 0x48ffff, "Poland"],
+  [0x490000, 0x497fff, "Portugal"],
+  [0x498000, 0x49ffff, "Czechia"],
+  [0x4a0000, 0x4a7fff, "Romania"],
+  [0x4a8000, 0x4affff, "Sweden"],
+  [0x4b0000, 0x4b7fff, "Switzerland"],
+  [0x4b8000, 0x4bffff, "Turkey"],
+  [0x4ca000, 0x4cafff, "Ireland"],
+  [0x4cc000, 0x4ccfff, "Iceland"],
+  [0x4d2000, 0x4d3fff, "Malta"],
+  [0x508000, 0x50ffff, "Ukraine"],
+  [0x700000, 0x700fff, "Afghanistan"],
+  [0x702000, 0x702fff, "Bangladesh"],
+  [0x710000, 0x717fff, "Saudi Arabia"],
+  [0x71ba00, 0x71bfff, "South Korea"],
+  [0x720000, 0x727fff, "Yemen"],
+  [0x730000, 0x737fff, "Iran"],
+  [0x738000, 0x73ffff, "Israel"],
+  [0x740000, 0x747fff, "Jordan"],
+  [0x748000, 0x74ffff, "Lebanon"],
+  [0x750000, 0x757fff, "Malaysia"],
+  [0x758000, 0x75ffff, "Philippines"],
+  [0x760000, 0x767fff, "Pakistan"],
+  [0x768000, 0x76ffff, "Singapore"],
+  [0x770000, 0x777fff, "Sri Lanka"],
+  [0x780000, 0x7bffff, "China"],
+  [0x7c0000, 0x7fffff, "Australia"],
+  [0x800000, 0x83ffff, "India"],
+  [0x840000, 0x87ffff, "Japan"],
+  [0x880000, 0x887fff, "Thailand"],
+  [0x888000, 0x88ffff, "Vietnam"],
+  [0x896000, 0x896fff, "United Arab Emirates"],
+  [0x899000, 0x899fff, "Taiwan"],
+  [0x8a0000, 0x8affff, "Indonesia"],
+  [0xa00000, 0xafffff, "United States"],
+  [0xc00000, 0xc3ffff, "Canada"],
+  [0xe00000, 0xe3ffff, "Argentina"],
+  [0xe40000, 0xe7ffff, "Brazil"],
+  [0xe80000, 0xebffff, "Chile"]
+];
+
+function aircraftModelLabel(type?: string) {
+  const normalized = type?.trim().toUpperCase();
+  if (!normalized) return undefined;
+  return AIRCRAFT_TYPE_LABELS[normalized] ?? normalized;
+}
+
+function aircraftDescriptionLabel(description?: string) {
+  if (!description || /^(n\/a|none|unknown|reserved)$/i.test(description)) return undefined;
+  return description;
+}
+
+const AIRCRAFT_OPERATOR_PREFIXES: Record<string, string> = {
+  AAL: "American Airlines",
+  ACA: "Air Canada",
+  AFR: "Air France",
+  AFL: "Aeroflot",
+  ANA: "All Nippon Airways",
+  AUA: "Austrian Airlines",
+  BAW: "British Airways",
+  BCS: "European Air Transport Leipzig",
+  BER: "Eurowings",
+  CFG: "Condor",
+  CPA: "Cathay Pacific",
+  DAL: "Delta Air Lines",
+  DLH: "Lufthansa",
+  DFL: "Babcock Scandinavian AirAmbulance",
+  EWG: "Eurowings",
+  EZY: "easyJet",
+  FIN: "Finnair",
+  IBE: "Iberia",
+  ICE: "Icelandair",
+  KLM: "KLM Royal Dutch Airlines",
+  LOT: "LOT Polish Airlines",
+  NSZ: "Norwegian Air Sweden",
+  NAX: "Norwegian Air Shuttle",
+  PGT: "Pegasus Airlines",
+  QFA: "Qantas",
+  QTR: "Qatar Airways",
+  RYR: "Ryanair",
+  SAS: "Scandinavian Airlines",
+  SDM: "Rossiya Airlines",
+  SIA: "Singapore Airlines",
+  SWR: "Swiss International Air Lines",
+  TAY: "ASL Airlines Belgium",
+  THY: "Turkish Airlines",
+  UAE: "Emirates",
+  UAL: "United Airlines",
+  UPS: "UPS Airlines",
+  WZZ: "Wizz Air"
+};
+
+function aircraftOperatorLabel(row: Record<string, unknown>, callsign?: string) {
+  const directValue =
+    stringValue(row.ownOp) ??
+    stringValue(row.operator) ??
+    stringValue(row.owner) ??
+    stringValue(row.airline) ??
+    stringValue(row.op);
+  if (directValue && !/^(n\/a|none|unknown|reserved)$/i.test(directValue)) return directValue;
+  return aircraftOperatorFromCallsign(callsign);
+}
+
+function aircraftOperatorFromCallsign(callsign?: string) {
+  const prefix = callsign?.replace(/[^a-zA-Z]/g, "").slice(0, 3).toUpperCase();
+  return prefix ? AIRCRAFT_OPERATOR_PREFIXES[prefix] : undefined;
+}
+
+function inferredAircraftOriginCountry(registration?: string, icaoHex?: string) {
+  const normalizedRegistration = registration?.replace(/\s+/g, "").toUpperCase();
+  if (normalizedRegistration) {
+    if (/^N[0-9]/.test(normalizedRegistration)) return "United States";
+    const match = AIRCRAFT_REGISTRATION_COUNTRIES.find(([prefix]) => normalizedRegistration.startsWith(prefix));
+    if (match) return match[1];
+  }
+
+  const hex = icaoHex?.trim().toLowerCase();
+  if (!hex || !/^[0-9a-f]{6}$/.test(hex)) return undefined;
+  const value = Number.parseInt(hex, 16);
+  return AIRCRAFT_ICAO_COUNTRY_RANGES.find(([start, end]) => value >= start && value <= end)?.[2];
+}
+
+function adsbLolCategoryLabel(category?: string) {
+  if (!category) return undefined;
+  const labels: Record<string, string> = {
+    A1: "Light aircraft",
+    A2: "Small aircraft",
+    A3: "Large aircraft",
+    A4: "High-vortex large",
+    A5: "Heavy aircraft",
+    A6: "High performance",
+    A7: "Rotorcraft",
+    B1: "Glider",
+    B2: "Lighter-than-air",
+    B3: "Parachutist",
+    B4: "Ultralight",
+    B6: "Unmanned aircraft"
+  };
+  return labels[category] ?? "Aircraft";
+}
+
 function normalizedAviationBounds(bounds?: AviationBounds): AviationBounds | undefined {
   if (!bounds) return undefined;
   const south = Math.max(-85, Math.min(85, Math.min(bounds.south, bounds.north)));
@@ -906,6 +1485,10 @@ function normalizeApiLongitude(longitude: number) {
 }
 
 function parseOpenSkyStates(text: string, options: { includeGround?: boolean } = {}): AircraftState[] {
+  if (/too many requests|rate limit/i.test(text)) {
+    throw new Error("Aircraft provider returned too many requests");
+  }
+
   const payload = JSON.parse(text) as { states?: unknown[][] };
   const now = Date.now();
   return (payload.states ?? [])
@@ -925,6 +1508,7 @@ function parseOpenSkyStates(text: string, options: { includeGround?: boolean } =
         id,
         callsign: stringValue(row[1]) || undefined,
         originCountry: stringValue(row[2]) || undefined,
+        operator: aircraftOperatorFromCallsign(stringValue(row[1])),
         lat,
         lon,
         altitude: numberValue(row[7]) ?? undefined,
@@ -1972,6 +2556,19 @@ async function withTimeoutSignal<T>(
   } finally {
     globalThis.clearTimeout(timeout);
     signal?.removeEventListener("abort", abort);
+  }
+}
+
+async function withPromiseTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timeout: ReturnType<typeof globalThis.setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = globalThis.setTimeout(() => reject(new Error("Request timed out")), timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeout !== undefined) globalThis.clearTimeout(timeout);
   }
 }
 

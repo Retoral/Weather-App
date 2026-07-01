@@ -430,6 +430,24 @@ function nodePopupOptions(className?: string): L.PopupOptions {
   return className ? { ...NODE_POPUP_OPTIONS, className } : NODE_POPUP_OPTIONS;
 }
 
+function bindPersistentNodePopup(
+  layer: L.Layer,
+  content: string | (() => string),
+  options: L.PopupOptions = NODE_POPUP_OPTIONS,
+  onOpen?: (popup: L.Popup) => void
+) {
+  layer.on("click", (event: L.LeafletMouseEvent) => {
+    const map = (event.target as L.Layer & { _map?: L.Map })._map;
+    if (!map) return;
+    const popup = L.popup(options)
+      .setLatLng(event.latlng)
+      .setContent(typeof content === "function" ? content() : content)
+      .openOn(map);
+    window.setTimeout(() => onOpen?.(popup), 0);
+  });
+  return layer;
+}
+
 type MapUiLanguage = keyof typeof MAP_UI_COPY;
 type MapUiCopy = typeof MAP_UI_COPY.en;
 
@@ -1803,7 +1821,7 @@ function makeEarthquakeLayer(earthquakes: EarthquakeEvent[]) {
     const magnitude = quake.magnitude ?? 0;
     const color = quake.tsunami || quake.alert === "red" ? "#ef4444" : magnitude >= 5 ? "#f59e0b" : "#38bdf8";
     WORLD_COPY_OFFSETS.forEach((copyOffset) => {
-      L.circleMarker([quake.lat, quake.lon + copyOffset], {
+      bindPersistentNodePopup(L.circleMarker([quake.lat, quake.lon + copyOffset], {
         radius: Math.max(4, magnitude * 2.4),
         bubblingMouseEvents: true,
         color: "#0f172a",
@@ -1811,8 +1829,7 @@ function makeEarthquakeLayer(earthquakes: EarthquakeEvent[]) {
         fillColor: color,
         fillOpacity: 0.86,
         opacity: 0.95
-      })
-        .bindPopup(earthquakePopup(quake), NODE_POPUP_OPTIONS)
+      }), earthquakePopup(quake))
         .addTo(group);
     });
   });
@@ -1995,15 +2012,14 @@ function makeRiskSignalLayer(events: RiskSignalEvent[], includeLocalTime = false
         fillOpacity: riskHeatOpacity(event)
       }).addTo(group);
 
-      L.circleMarker([event.lat, event.lon + copyOffset], {
+      bindPersistentNodePopup(L.circleMarker([event.lat, event.lon + copyOffset], {
         radius: riskMarkerRadius(event),
         color: "#111827",
         weight: 1,
         fillColor: color,
         fillOpacity: 0.9,
         opacity: 0.94
-      })
-        .bindPopup(riskPopup(event), NODE_POPUP_OPTIONS)
+      }), riskPopup(event))
         .addTo(group);
 
       targets.push({ event, lat: event.lat, lon: event.lon + copyOffset, radius: heatRadius });
@@ -2223,7 +2239,7 @@ function makeAviationLayer({
   if (showAircraftLocations) {
     aircraft.forEach((plane) => {
       WORLD_COPY_OFFSETS.forEach((copyOffset) => {
-        L.marker([plane.lat, plane.lon + copyOffset], {
+        bindPersistentNodePopup(L.marker([plane.lat, plane.lon + copyOffset], {
           title: plane.callsign ?? plane.id.toUpperCase(),
           bubblingMouseEvents: true,
           icon: L.divIcon({
@@ -2232,9 +2248,7 @@ function makeAviationLayer({
             iconSize: [26, 26],
             iconAnchor: [13, 13]
           })
-        })
-          .bindPopup(aircraftPopup(plane, trackedIds.has(plane.id)), NODE_POPUP_OPTIONS)
-          .on("popupopen", (event) => bindAircraftPopupActions((event as L.PopupEvent).popup, plane, onToggleAircraftTrack))
+        }), () => aircraftPopup(plane, trackedIds.has(plane.id)), nodePopupOptions("aircraft-node-popup"), (popup) => bindAircraftPopupActions(popup, plane, onToggleAircraftTrack))
           .addTo(group);
       });
     });
@@ -2243,7 +2257,7 @@ function makeAviationLayer({
   if (showAviationIncidents) {
     incidents.forEach((incident) => {
       WORLD_COPY_OFFSETS.forEach((copyOffset) => {
-        L.circleMarker([incident.lat, incident.lon + copyOffset], {
+        bindPersistentNodePopup(L.circleMarker([incident.lat, incident.lon + copyOffset], {
           radius: 9,
           bubblingMouseEvents: true,
           color: "#111827",
@@ -2251,8 +2265,7 @@ function makeAviationLayer({
           fillColor: "#f43f5e",
           fillOpacity: 0.9,
           opacity: 0.96
-        })
-          .bindPopup(aviationIncidentPopup(incident), NODE_POPUP_OPTIONS)
+        }), aviationIncidentPopup(incident))
           .addTo(group);
       });
     });
@@ -2313,7 +2326,10 @@ function aircraftPopup(plane: AircraftState, isTracked = false) {
         : undefined;
   return `${popupTable([
     ["Aircraft", escapeHtml(label)],
-    ["Type", plane.categoryLabel],
+    ["Model", plane.aircraftModel ?? plane.aircraftType],
+    ["Registration", plane.registration],
+    ["Operator", plane.operator],
+    ["Category", plane.categoryLabel],
     ["Origin", plane.originCountry],
     ["Altitude", altitude],
     ["Speed", speed],
@@ -2386,9 +2402,7 @@ function warningDetailHtml(warning: GdacsAlert, appLanguage: string) {
 }
 
 function bindWarningPopup(layer: L.Layer, warning: GdacsAlert, appLanguage: string) {
-  layer.bindPopup(warningPopup(warning, appLanguage), NODE_POPUP_OPTIONS);
-  layer.on("popupopen", (event) => {
-    const popup = (event as L.PopupEvent).popup;
+  bindPersistentNodePopup(layer, warningPopup(warning, appLanguage), NODE_POPUP_OPTIONS, (popup) => {
     void translateWarningPopup(popup.getElement(), warning, appLanguage);
   });
   return layer;
@@ -2541,6 +2555,7 @@ interface OverlapSelectableItem {
   lon: number;
   radiusPx: number;
   popupHtml: string;
+  popupClass?: string;
   bindPopup?: (popup: L.Popup) => void;
 }
 
@@ -2643,6 +2658,7 @@ function bindOverlapSelectorButtons(popup: L.Popup, items: OverlapSelectableItem
       const item = items[index];
       if (!item) return;
       popup.setContent(item.popupHtml);
+      popup.getElement()?.classList.toggle("aircraft-node-popup", item.popupClass === "aircraft-node-popup");
       window.setTimeout(() => item.bindPopup?.(popup), 0);
     });
   });
@@ -2734,11 +2750,12 @@ function selectableItemsForMap({
         id: `aircraft-${plane.id}`,
         kind: "Aircraft",
         label: plane.callsign || plane.id.toUpperCase(),
-        detail: [plane.originCountry, plane.flightStatus].filter(Boolean).join(" · "),
+        detail: [plane.operator, plane.aircraftModel ?? plane.aircraftType, plane.originCountry, plane.flightStatus].filter(Boolean).join(" · "),
         lat: plane.lat,
         lon: plane.lon,
         radiusPx: 22,
         popupHtml: aircraftPopup(plane, trackedIds.has(plane.id)),
+        popupClass: "aircraft-node-popup",
         bindPopup: (popup) => bindAircraftPopupActions(popup, plane, onToggleAircraftTrack)
       })
     );
@@ -2901,11 +2918,17 @@ export function WeatherMap({
     const map = mapRef.current;
     if (!map || !onViewportChange) return;
 
+    let publishTimer: number | undefined;
     const publishBounds = () => onViewportChange(leafletBoundsToAviationBounds(map.getBounds()));
+    const schedulePublishBounds = () => {
+      if (publishTimer !== undefined) window.clearTimeout(publishTimer);
+      publishTimer = window.setTimeout(publishBounds, 220);
+    };
     publishBounds();
-    map.on("moveend zoomend", publishBounds);
+    map.on("moveend zoomend", schedulePublishBounds);
     return () => {
-      map.off("moveend zoomend", publishBounds);
+      if (publishTimer !== undefined) window.clearTimeout(publishTimer);
+      map.off("moveend zoomend", schedulePublishBounds);
     };
   }, [onViewportChange]);
 
@@ -3211,7 +3234,7 @@ function flyToMapLocation(map: L.Map, location: MapLocationDetails) {
 
 function addLocationMarkers(group: L.LayerGroup, location: MapLocationDetails, className: string, iconHtml: string, units: UnitSettings, language: string) {
   WORLD_COPY_OFFSETS.forEach((copyOffset) => {
-    L.marker([location.latitude, location.longitude + copyOffset], {
+    bindPersistentNodePopup(L.marker([location.latitude, location.longitude + copyOffset], {
       title: location.name,
       bubblingMouseEvents: true,
       icon: L.divIcon({
@@ -3220,8 +3243,7 @@ function addLocationMarkers(group: L.LayerGroup, location: MapLocationDetails, c
         iconSize: [32, 32],
         iconAnchor: [16, 16]
       })
-    })
-      .bindPopup(locationPopup(location, units, language), NODE_POPUP_OPTIONS)
+    }), locationPopup(location, units, language))
       .addTo(group);
   });
 }

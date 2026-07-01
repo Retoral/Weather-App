@@ -38,6 +38,7 @@ import {
   fetchRainViewer,
   fetchRiskEvents,
   fetchWeatherGridWithMeta,
+  getCachedAircraftStates,
   getCachedWeatherGrid,
   searchCities
 } from "./services/weatherApi";
@@ -77,7 +78,7 @@ const LIVE_REFRESH_MS = {
   earthquakes: 60 * 1000,
   radar: 10 * 60 * 1000,
   risk: 60 * 1000,
-  aircraft: 30 * 1000,
+  aircraft: 60 * 1000,
   aviationIncidents: 10 * 60 * 1000,
   warnings: 60 * 1000,
   globalWeather: 10 * 60 * 1000,
@@ -87,7 +88,7 @@ const LIVE_REFRESH_MS = {
   focusedEarthquakes: 30 * 1000,
   focusedRadar: 10 * 60 * 1000,
   focusedRisk: 60 * 1000,
-  focusedAircraft: 22 * 1000,
+  focusedAircraft: 60 * 1000,
   focusedAviationIncidents: 5 * 60 * 1000,
   focusedWarnings: 60 * 1000,
   focusedWeatherGrid: 10 * 60 * 1000,
@@ -200,6 +201,8 @@ const appCopy = {
     aircraftTrails: "Airplane trails",
     aircraftDensity: "Aircraft density",
     aircraftOrigin: "Plane origin",
+    aircraftSearch: "Aircraft search",
+    aircraftSearchPlaceholder: "Flight, model, operator",
     aircraftVisible: "Visible aircraft",
     any: "Any",
     aviation: "Aviation",
@@ -297,6 +300,8 @@ const appCopy = {
     aircraftTrails: "Flygplansspår",
     aircraftDensity: "Flygplanstäthet",
     aircraftOrigin: "Planets ursprung",
+    aircraftSearch: "Flygplanssök",
+    aircraftSearchPlaceholder: "Flyg, modell, operatör",
     aircraftVisible: "Synliga flygplan",
     any: "Alla",
     aviation: "Flyg",
@@ -394,6 +399,8 @@ const appCopy = {
     aircraftTrails: "Flugzeugspuren",
     aircraftDensity: "Flugzeugdichte",
     aircraftOrigin: "Flugzeugherkunft",
+    aircraftSearch: "Flugzeugsuche",
+    aircraftSearchPlaceholder: "Flug, Modell, Betreiber",
     aircraftVisible: "Sichtbare Flugzeuge",
     any: "Alle",
     aviation: "Luftfahrt",
@@ -491,6 +498,8 @@ const appCopy = {
     aircraftTrails: "Trajets avions",
     aircraftDensity: "Densité avions",
     aircraftOrigin: "Origine avion",
+    aircraftSearch: "Recherche avion",
+    aircraftSearchPlaceholder: "Vol, modèle, opérateur",
     aircraftVisible: "Avions visibles",
     any: "Tous",
     aviation: "Aviation",
@@ -588,6 +597,8 @@ const appCopy = {
     aircraftTrails: "Rastros de aviones",
     aircraftDensity: "Densidad de aviones",
     aircraftOrigin: "Origen del avión",
+    aircraftSearch: "Buscar avión",
+    aircraftSearchPlaceholder: "Vuelo, modelo, operador",
     aircraftVisible: "Aviones visibles",
     any: "Cualquiera",
     aviation: "Aviación",
@@ -685,6 +696,8 @@ const appCopy = {
     aircraftTrails: "Tracce aerei",
     aircraftDensity: "Densità aerei",
     aircraftOrigin: "Origine aereo",
+    aircraftSearch: "Cerca aereo",
+    aircraftSearchPlaceholder: "Volo, modello, operatore",
     aircraftVisible: "Aerei visibili",
     any: "Qualsiasi",
     aviation: "Aviazione",
@@ -782,6 +795,8 @@ const appCopy = {
     aircraftTrails: "航空機の軌跡",
     aircraftDensity: "航空機密度",
     aircraftOrigin: "航空機の出発国",
+    aircraftSearch: "航空機検索",
+    aircraftSearchPlaceholder: "便名、機種、運航会社",
     aircraftVisible: "表示航空機",
     any: "すべて",
     aviation: "航空",
@@ -879,6 +894,8 @@ const appCopy = {
     aircraftTrails: "飞机轨迹",
     aircraftDensity: "飞机密度",
     aircraftOrigin: "飞机来源",
+    aircraftSearch: "搜索飞机",
+    aircraftSearchPlaceholder: "航班、机型、运营方",
     aircraftVisible: "可见飞机",
     any: "任意",
     aviation: "航空",
@@ -1118,6 +1135,7 @@ interface SavedViewSettings {
   showAviationIncidents?: boolean;
   aircraftLimit?: number;
   aircraftOriginCountry?: string;
+  aircraftSearchQuery?: string;
   hideUntrackedAircraft?: boolean;
   temperatureUnit?: TemperatureUnit;
   windUnit?: WindUnit;
@@ -1170,6 +1188,7 @@ function loadSavedViewSettings(): SavedViewSettings {
       showAviationIncidents: typeof saved.showAviationIncidents === "boolean" ? saved.showAviationIncidents : undefined,
       aircraftLimit: [50, 150, 400].includes(Number(saved.aircraftLimit)) ? Number(saved.aircraftLimit) : undefined,
       aircraftOriginCountry: typeof saved.aircraftOriginCountry === "string" ? saved.aircraftOriginCountry : undefined,
+      aircraftSearchQuery: typeof saved.aircraftSearchQuery === "string" ? saved.aircraftSearchQuery.slice(0, 80) : undefined,
       hideUntrackedAircraft: typeof saved.hideUntrackedAircraft === "boolean" ? saved.hideUntrackedAircraft : undefined,
       temperatureUnit: savedTemperatureUnit(saved.temperatureUnit),
       windUnit: savedWindUnit(saved.windUnit),
@@ -1391,6 +1410,30 @@ function aircraftDisplayScore(plane: AircraftState) {
   );
 }
 
+function normalizeAircraftFilterText(value?: string | number) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function aircraftMatchesSearch(plane: AircraftState, query: string) {
+  const normalizedQuery = normalizeAircraftFilterText(query);
+  if (!normalizedQuery) return true;
+  const haystack = [
+    plane.callsign,
+    plane.id,
+    plane.registration,
+    plane.aircraftModel,
+    plane.aircraftType,
+    plane.operator,
+    plane.originCountry,
+    plane.categoryLabel,
+    plane.flightStatus
+  ].map(normalizeAircraftFilterText).join(" ");
+  return normalizedQuery.split(/\s+/).every((token) => haystack.includes(token));
+}
+
 function pointInGeometry(geometry: NonNullable<GdacsAlert["geometry"]>, lon: number, lat: number): boolean {
   if (geometry.type === "Polygon") return pointInPolygon(geometry.coordinates, lon, lat);
   if (geometry.type === "MultiPolygon") return geometry.coordinates.some((polygon) => pointInPolygon(polygon, lon, lat));
@@ -1578,6 +1621,7 @@ export function App() {
   const [showAviationIncidents, setShowAviationIncidents] = useState(savedViewSettings.showAviationIncidents ?? false);
   const [aircraftLimit, setAircraftLimit] = useState(savedViewSettings.aircraftLimit ?? 150);
   const [aircraftOriginCountry, setAircraftOriginCountry] = useState(savedViewSettings.aircraftOriginCountry ?? "any");
+  const [aircraftSearchQuery, setAircraftSearchQuery] = useState(savedViewSettings.aircraftSearchQuery ?? "");
   const [trackedAircraftIds, setTrackedAircraftIds] = useState<string[]>(savedTrackedAircraft.ids);
   const [hideUntrackedAircraft, setHideUntrackedAircraft] = useState(savedViewSettings.hideUntrackedAircraft ?? false);
   const [trackedDockOpen, setTrackedDockOpen] = useState(savedTrackedAircraft.dockOpen || savedTrackedAircraft.ids.length > 0);
@@ -1628,6 +1672,8 @@ export function App() {
   const notifiedSignals = useRef<Set<string>>(new Set());
   const notifiedAircraftWarnings = useRef<Set<string>>(new Set());
   const aircraftTrackAttemptedAt = useRef<Record<string, number>>({});
+  const aviationBoundsRef = useRef<AviationBounds | undefined>();
+  const pendingAircraftRefresh = useRef(false);
   const mapViewMenuRef = useRef<HTMLDivElement | null>(null);
   const refreshInFlight = useRef({ weatherGrid: false, earthquakes: false, radar: false, warnings: false, risk: false, aircraft: false, aviationIncidents: false });
   const rainViewerRef = useRef<RainViewerState | undefined>();
@@ -1680,10 +1726,11 @@ export function App() {
       .filter((plane) => !tracked.has(plane.id))
       .filter((plane) => !aircraftIsProbablyLanded(plane))
       .filter((plane) => aircraftOriginCountry === "any" || plane.originCountry === aircraftOriginCountry)
+      .filter((plane) => aircraftMatchesSearch(plane, aircraftSearchQuery))
       .sort((left, right) => aircraftDisplayScore(right) - aircraftDisplayScore(left))
       .slice(0, Math.max(0, aircraftLimit - trackedPlanes.length));
     return [...trackedPlanes, ...otherPlanes].map(aircraftWithStatus);
-  }, [aircraft, aircraftById, aircraftLimit, aircraftOriginCountry, hideUntrackedAircraft, trackedAircraftIds, trackedAircraftSnapshots]);
+  }, [aircraft, aircraftById, aircraftLimit, aircraftOriginCountry, aircraftSearchQuery, hideUntrackedAircraft, trackedAircraftIds, trackedAircraftSnapshots]);
   const aircraftOriginOptions = useMemo(
     () =>
       Array.from(new Set(aircraft.map((plane) => plane.originCountry).filter(Boolean) as string[])).sort((left, right) =>
@@ -1768,6 +1815,10 @@ export function App() {
       setLastFeedDataRefresh((state) => ({ ...state, [feed]: timestamp }));
     }
   }
+
+  useEffect(() => {
+    aviationBoundsRef.current = aviationBounds;
+  }, [aviationBounds]);
 
   async function refreshWeatherGrid(focused = false, force = false) {
     if (refreshInFlight.current.weatherGrid) return;
@@ -1920,10 +1971,21 @@ export function App() {
   }
 
   async function refreshAircraftFeed(force = false) {
-    if (refreshInFlight.current.aircraft) return;
+    if (refreshInFlight.current.aircraft) {
+      pendingAircraftRefresh.current = true;
+      return;
+    }
     refreshInFlight.current.aircraft = true;
+    const bounds = aviationBoundsRef.current;
+    if (!force) {
+      const cachedAircraft = getCachedAircraftStates(bounds);
+      if (cachedAircraft.length) {
+        setAircraft(cachedAircraft);
+        rememberTrackedAircraft(cachedAircraft);
+      }
+    }
     try {
-      const aircraft = await fetchAircraftStates(aviationBounds, undefined, { freshMs: force ? 0 : LIVE_REFRESH_MS.aircraft });
+      const aircraft = await fetchAircraftStates(bounds, undefined, { freshMs: force ? 0 : LIVE_REFRESH_MS.aircraft });
       setAircraft(aircraft);
       rememberTrackedAircraft(aircraft);
       void refreshTrackedAircraftFeed(force);
@@ -1932,6 +1994,10 @@ export function App() {
       // Keep the last successful aircraft layer visible.
     } finally {
       refreshInFlight.current.aircraft = false;
+      if (pendingAircraftRefresh.current) {
+        pendingAircraftRefresh.current = false;
+        window.setTimeout(() => void refreshAircraftFeed(false), 0);
+      }
     }
   }
 
@@ -2128,7 +2194,18 @@ export function App() {
     return () => {
       timers.forEach((timer) => window.clearInterval(timer));
     };
-  }, [activeLayer, showEarthquakes, showWarnings, showAircraftLocations, showAircraftTrails, showAviationIncidents, aviationBounds, trackedAircraftIds.join(",")]);
+  }, [activeLayer, showEarthquakes, showWarnings, showAircraftLocations, showAircraftTrails, showAviationIncidents, trackedAircraftIds.join(",")]);
+
+  useEffect(() => {
+    if (!showAircraftLocations && !showAircraftTrails) return;
+    const cachedAircraft = getCachedAircraftStates(aviationBounds);
+    if (cachedAircraft.length) {
+      setAircraft(cachedAircraft);
+      rememberTrackedAircraft(cachedAircraft);
+    }
+    const timer = window.setTimeout(() => void refreshAircraftFeed(false), 500);
+    return () => window.clearTimeout(timer);
+  }, [aviationBounds, showAircraftLocations, showAircraftTrails]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setSolarTimestamp(Date.now()), LIVE_REFRESH_MS.dayNight);
@@ -2152,6 +2229,7 @@ export function App() {
       showAviationIncidents,
       aircraftLimit,
       aircraftOriginCountry,
+      aircraftSearchQuery,
       hideUntrackedAircraft,
       temperatureUnit,
       windUnit,
@@ -2169,6 +2247,7 @@ export function App() {
     showAviationIncidents,
     aircraftLimit,
     aircraftOriginCountry,
+    aircraftSearchQuery,
     hideUntrackedAircraft,
     temperatureUnit,
     windUnit,
@@ -2389,6 +2468,7 @@ export function App() {
       setTrackedAircraftSnapshots({});
       setHideUntrackedAircraft(false);
       setAircraftOriginCountry("any");
+      setAircraftSearchQuery("");
     }
   }
 
@@ -2645,6 +2725,24 @@ export function App() {
                     <span>{copy.hideUntrackedAircraft}</span>
                   </label>
                 </div>
+                <label className="aircraft-search-filter">
+                  <span className="settings-select-label">{copy.aircraftSearch}</span>
+                  <span className="aircraft-search-input-row">
+                    <Search size={15} />
+                    <input
+                      type="search"
+                      value={aircraftSearchQuery}
+                      onChange={(event) => setAircraftSearchQuery(event.target.value)}
+                      placeholder={copy.aircraftSearchPlaceholder}
+                      aria-label={copy.aircraftSearch}
+                    />
+                    {aircraftSearchQuery ? (
+                      <button type="button" onClick={() => setAircraftSearchQuery("")} aria-label={copy.close} title={copy.close}>
+                        <X size={14} />
+                      </button>
+                    ) : null}
+                  </span>
+                </label>
                 <label className="settings-select compact-select">
                   <span className="settings-select-label">{copy.aircraftOrigin}</span>
                   <span className="select-value">{aircraftOriginCountry === "any" ? copy.any : aircraftOriginCountry}</span>
@@ -2792,7 +2890,7 @@ export function App() {
                         <Plane size={16} />
                         <span>
                           <strong>{plane?.callsign || track?.callsign || id.toUpperCase()}</strong>
-                          <em>{[plane?.originCountry ?? track?.sourceLabel, status.label].filter(Boolean).join(" · ")}</em>
+                          <em>{[plane?.operator, plane?.aircraftModel ?? plane?.aircraftType, plane?.originCountry ?? track?.sourceLabel, status.label].filter(Boolean).join(" · ")}</em>
                         </span>
                       </button>
                       <button

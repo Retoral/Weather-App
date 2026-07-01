@@ -87,7 +87,11 @@ export interface AviationBounds {
 export interface AircraftState {
   id: string;
   callsign?: string;
+  registration?: string;
   originCountry?: string;
+  operator?: string;
+  aircraftType?: string;
+  aircraftModel?: string;
   lat: number;
   lon: number;
   altitude?: number;
