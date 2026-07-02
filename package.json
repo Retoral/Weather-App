@@ -1,6 +1,6 @@
 {
   "name": "weather-watch-desktop",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Cross-platform live global weather, warning, and earthquake map.",
   "main": "dist-electron/main.js",
   "author": {
@@ -22,7 +22,10 @@
     "preview": "vite preview --host 127.0.0.1",
     "package": "npm run build && electron-builder --dir",
     "dist": "npm run build && electron-builder",
-    "dist:mac": "npm run build && electron-builder --mac dmg zip --publish never",
+    "dist:mac": "npm run build && electron-builder --mac dmg zip --x64 --arm64 --publish never",
+    "dist:mac:x64": "npm run build && electron-builder --mac dmg zip --x64 --publish never",
+    "dist:mac:arm64": "npm run build && electron-builder --mac dmg zip --arm64 --publish never",
+    "dist:mac:universal": "npm run build && electron-builder --mac dmg zip --universal --publish never",
     "dist:win": "npm run build && electron-builder --win nsis portable --publish never",
     "dist:linux": "npm run build && electron-builder --linux AppImage deb --publish never"
   },
@@ -47,9 +50,13 @@
     "vite": "^6.0.5",
     "wait-on": "^8.0.1"
   },
+  "overrides": {
+    "@noble/hashes": "1.8.0"
+  },
   "build": {
     "appId": "com.weatherwatch.desktop",
     "productName": "Weather Watch",
+    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
     "files": [
       "dist/**/*",
       "dist-electron/**/*",
@@ -66,7 +73,12 @@
         "zip"
       ],
       "icon": "build/icon.icns",
-      "category": "public.app-category.weather"
+      "category": "public.app-category.weather",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.inherit.plist",
+      "notarize": true
     },
     "win": {
       "target": [

@@ -3,7 +3,6 @@ import type { CSSProperties } from "react";
 import {
   Activity,
   Bell,
-  BellRing,
   ChevronDown,
   CloudRain,
   Clock3,
@@ -1124,7 +1123,6 @@ function loadSavedAppLanguage(): AppLanguage {
 }
 
 interface SavedViewSettings {
-  activeLayer?: PrimaryLayer;
   showWarnings?: boolean;
   showEarthquakes?: boolean;
   showTimezones?: boolean;
@@ -1149,15 +1147,6 @@ interface SavedTrackedAircraft {
   dockOpen: boolean;
 }
 
-function isPrimaryLayer(value: unknown): value is PrimaryLayer {
-  return typeof value === "string" && mapViews.some((view) => view.id === value);
-}
-
-function savedPrimaryLayer(value: unknown): PrimaryLayer | undefined {
-  if (value === "rainForecast") return "radar";
-  return isPrimaryLayer(value) ? value : undefined;
-}
-
 function savedTemperatureUnit(value: unknown): TemperatureUnit | undefined {
   return temperatureUnitOptions.some((option) => option.id === value) ? value as TemperatureUnit : undefined;
 }
@@ -1177,7 +1166,6 @@ function loadSavedViewSettings(): SavedViewSettings {
   try {
     const saved = JSON.parse(raw) as SavedViewSettings;
     return {
-      activeLayer: savedPrimaryLayer(saved.activeLayer),
       showWarnings: typeof saved.showWarnings === "boolean" ? saved.showWarnings : undefined,
       showEarthquakes: typeof saved.showEarthquakes === "boolean" ? saved.showEarthquakes : undefined,
       showTimezones: typeof saved.showTimezones === "boolean" ? saved.showTimezones : undefined,
@@ -1349,9 +1337,16 @@ function radarFrameDetailLabel(frame?: RadarTimelineFrame, latestObservedTime?: 
   return `${radarFrameRelativeLabel(frame, latestObservedTime, language)} · ${radarFrameAbsoluteLabel(frame, language)} · ${source}`;
 }
 
-function notify(title: string, body: string) {
+function notify(title: string, body: string, onClick?: () => void) {
   if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
-  new Notification(title, { body, silent: false });
+  const notification = new Notification(title, { body, silent: false });
+  if (onClick) {
+    notification.onclick = () => {
+      window.focus();
+      onClick();
+      notification.close();
+    };
+  }
 }
 
 function warningSignalSeverity(warning: GdacsAlert): LocalSignal["severity"] {
@@ -1377,14 +1372,49 @@ function warningToSignal(warning: GdacsAlert): LocalSignal {
   };
 }
 
+function normalizeDedupeText(value?: string) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, "")
+    .replace(/\binvolved:\s*.*$/i, "")
+    .replace(/\binvolving\b.*?\bnear\b/gi, "near")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function roundedCoordinate(value: number, precision = 10) {
+  return Math.round(value * precision) / precision;
+}
+
+function riskEventSignalKey(event: RiskSignalEvent) {
+  const timeBucket = Math.floor(event.time / (6 * 60 * 60 * 1000));
+  return [
+    event.sourceLabel,
+    event.sourceDomain ?? "",
+    event.eventLabel,
+    normalizeDedupeText(event.place),
+    roundedCoordinate(event.lat),
+    roundedCoordinate(event.lon),
+    timeBucket
+  ].join(":");
+}
+
 function riskEventsNearLocation(events: RiskSignalEvent[], location: CityLocation) {
-  return events
+  const nearby = events
     .map((event) => ({
       event,
       distance: distanceKm(location.latitude, location.longitude, event.lat, event.lon)
     }))
     .filter(({ distance }) => distance <= 180)
-    .sort((left, right) => riskSignalSortScore(right.event, right.distance) - riskSignalSortScore(left.event, left.distance))
+    .sort((left, right) => riskSignalSortScore(right.event, right.distance) - riskSignalSortScore(left.event, left.distance));
+  const seen = new Set<string>();
+  return nearby
+    .filter(({ event }) => {
+      const key = riskEventSignalKey(event);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
     .map(({ event }) => event);
 }
 
@@ -1400,6 +1430,23 @@ function riskEventToSignal(event: RiskSignalEvent, label: string): LocalSignal {
     detail: [event.summary, event.actors ? `Involved: ${event.actors}` : undefined].filter(Boolean).join(" "),
     severity: event.severity
   };
+}
+
+function signalDedupeKey(signal: LocalSignal) {
+  const detail = signal.id.startsWith("risk-")
+    ? normalizeDedupeText(signal.detail)
+    : normalizeDedupeText(signal.detail);
+  return [signal.severity, normalizeDedupeText(signal.title), detail].join(":");
+}
+
+function dedupeSignals(signals: LocalSignal[]) {
+  const seen = new Set<string>();
+  return signals.filter((signal) => {
+    const key = signalDedupeKey(signal);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function aircraftDisplayScore(plane: AircraftState) {
@@ -1521,6 +1568,15 @@ function normalizeBearing(bearing: number) {
   return ((bearing % 360) + 360) % 360;
 }
 
+function hashLocationId(value: string | number) {
+  const text = String(value);
+  let hash = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    hash = Math.imul(31, hash) + text.charCodeAt(index) | 0;
+  }
+  return hash || -1;
+}
+
 function windArrowStyle(direction?: number): CSSProperties {
   const toDirection = typeof direction === "number" ? normalizeBearing(direction + 180) : 0;
   return { "--wind-dir": `${toDirection}deg` } as CSSProperties;
@@ -1619,10 +1675,25 @@ function plusWindLabel(speed: number, unit: WindUnit) {
   return suffix ? `${value}+ ${suffix}` : `${value}+`;
 }
 
+function useMediaQuery(query: string) {
+  const [matches, setMatches] = useState(() => typeof window !== "undefined" && window.matchMedia(query).matches);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const mediaQuery = window.matchMedia(query);
+    const updateMatches = () => setMatches(mediaQuery.matches);
+    updateMatches();
+    mediaQuery.addEventListener("change", updateMatches);
+    return () => mediaQuery.removeEventListener("change", updateMatches);
+  }, [query]);
+
+  return matches;
+}
+
 export function App() {
   const savedViewSettings = useMemo(() => loadSavedViewSettings(), []);
   const savedTrackedAircraft = useMemo(() => loadSavedTrackedAircraft(), []);
-  const [activeLayer, setActiveLayer] = useState<PrimaryLayer>(savedViewSettings.activeLayer ?? "normal");
+  const [activeLayer, setActiveLayer] = useState<PrimaryLayer>("normal");
   const [showWarnings, setShowWarnings] = useState(savedViewSettings.showWarnings ?? true);
   const [showEarthquakes, setShowEarthquakes] = useState(savedViewSettings.showEarthquakes ?? true);
   const [showTimezones, setShowTimezones] = useState(savedViewSettings.showTimezones ?? false);
@@ -1681,9 +1752,12 @@ export function App() {
   const [lastFeedCheck, setLastFeedCheck] = useState<Partial<Record<FeedKey, string>>>({});
   const [lastFeedDataRefresh, setLastFeedDataRefresh] = useState<Partial<Record<FeedKey, string>>>({});
   const [solarTimestamp, setSolarTimestamp] = useState(Date.now());
+  const mobileControlPanels = useMediaQuery("(max-width: 620px)");
   const notifiedSignals = useRef<Set<string>>(new Set());
   const notifiedAircraftWarnings = useRef<Set<string>>(new Set());
   const aircraftTrackAttemptedAt = useRef<Record<string, number>>({});
+  const homePressTimer = useRef<number | undefined>();
+  const homeLongPressTriggered = useRef(false);
   const activeLayerStateRef = useRef<PrimaryLayer>(activeLayer);
   const aviationBoundsRef = useRef<AviationBounds | undefined>();
   const pendingWeatherRefresh = useRef(false);
@@ -1715,9 +1789,9 @@ export function App() {
     () => (inspectedLocation ? riskEventsNearLocation(riskEvents, inspectedLocation).slice(0, 3).map((event) => riskEventToSignal(event, copy.riskNearby)) : []),
     [riskEvents, inspectedLocation?.id, inspectedLocation?.latitude, inspectedLocation?.longitude, copy.riskNearby]
   );
-  const localSignals = useMemo(() => [...localWarningSignals, ...localRiskSignals, ...weatherSignals], [localWarningSignals, localRiskSignals, weatherSignals]);
+  const localSignals = useMemo(() => dedupeSignals([...localWarningSignals, ...localRiskSignals, ...weatherSignals]), [localWarningSignals, localRiskSignals, weatherSignals]);
   const inspectedSignals = useMemo(
-    () => [...inspectedWarningSignals, ...inspectedRiskSignals, ...inspectedWeatherSignals],
+    () => dedupeSignals([...inspectedWarningSignals, ...inspectedRiskSignals, ...inspectedWeatherSignals]),
     [inspectedWarningSignals, inspectedRiskSignals, inspectedWeatherSignals]
   );
   const activeWarnings = warnings.filter((warning) => warning.geometry || typeof warning.lat === "number" && typeof warning.lon === "number");
@@ -2166,6 +2240,16 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (filtersOpen && mapViewMenuOpen) setMapViewMenuOpen(false);
+  }, [filtersOpen, mapViewMenuOpen]);
+
+  useEffect(() => {
+    if (!mobileControlPanels || !settingsOpen) return;
+    if (filtersOpen) setFiltersOpen(false);
+    if (mapViewMenuOpen) setMapViewMenuOpen(false);
+  }, [mobileControlPanels, settingsOpen, filtersOpen, mapViewMenuOpen]);
+
+  useEffect(() => {
     if (!mapViewMenuOpen) return;
 
     function handlePointerDown(event: PointerEvent) {
@@ -2264,8 +2348,20 @@ export function App() {
   }, [appLanguage]);
 
   useEffect(() => {
+    document.title = homeCurrent ? `${formatTemperature(homeCurrent.temperature_2m, temperatureUnit)} · Weather Watch` : "Weather Watch";
+  }, [homeCurrent?.temperature_2m, temperatureUnit]);
+
+  useEffect(() => {
+    if (!homeLocation || notificationPermission !== "default") return;
+    void enableNotifications();
+  }, [homeLocation?.id, notificationPermission]);
+
+  useEffect(() => () => {
+    if (homePressTimer.current !== undefined) window.clearTimeout(homePressTimer.current);
+  }, []);
+
+  useEffect(() => {
     saveViewSettings({
-      activeLayer,
       showWarnings,
       showEarthquakes,
       showTimezones,
@@ -2283,7 +2379,6 @@ export function App() {
       rainUnit
     });
   }, [
-    activeLayer,
     showWarnings,
     showEarthquakes,
     showTimezones,
@@ -2376,12 +2471,15 @@ export function App() {
     localSignals
       .filter((signal) => signal.severity === "warning" || signal.severity === "danger")
       .forEach((signal) => {
-        const key = `${homeLocation?.id}:${signal.id}:${signal.detail}`;
+        const key = `${homeLocation?.id}:${signalDedupeKey(signal)}`;
         if (notifiedSignals.current.has(key)) return;
         notifiedSignals.current.add(key);
-        notify(signal.title, `${locationLabel(homeLocation, unitText.noCitySet)}: ${signal.detail}`);
+        notify(signal.title, `${locationLabel(homeLocation, unitText.noCitySet)}: ${signal.detail}`, () => {
+          setLocalOpen(true);
+          focusSignal(signal);
+        });
       });
-  }, [localSignals, notificationPermission, homeLocation?.id]);
+  }, [localSignals, notificationPermission, homeLocation?.id, warnings, riskEvents]);
 
   useEffect(() => {
     if (notificationPermission !== "granted") return;
@@ -2487,6 +2585,106 @@ export function App() {
     setAircraftFocusRequest({ id: plane.id, request: Date.now() });
   }
 
+  function focusSignal(signal: LocalSignal) {
+    if (signal.id.startsWith("warning-")) {
+      const warning = warnings.find((item) => `warning-${item.id}` === signal.id);
+      if (warning && typeof warning.lat === "number" && typeof warning.lon === "number") {
+        setShowWarnings(true);
+        setInspectedLocation({
+          id: -Math.abs(hashLocationId(warning.id)),
+          name: warning.title || warning.sourceLabel || copy.warnings,
+          admin1: warning.areaName,
+          country: warning.sourceLabel,
+          latitude: warning.lat,
+          longitude: warning.lon
+        });
+        setInspectedFocusRequest((value) => value + 1);
+        return;
+      }
+    }
+
+    if (signal.id.startsWith("risk-")) {
+      const event = riskEvents.find((item) => `risk-${item.id}` === signal.id);
+      if (event) {
+        setActiveLayer("risk");
+        setInspectedLocation({
+          id: -Math.abs(hashLocationId(event.id)),
+          name: event.title || copy.riskNearby,
+          admin1: event.place,
+          latitude: event.lat,
+          longitude: event.lon
+        });
+        setInspectedFocusRequest((value) => value + 1);
+        return;
+      }
+    }
+
+    focusHomeLocation();
+  }
+
+  function startHomePress() {
+    homeLongPressTriggered.current = false;
+    if (homePressTimer.current !== undefined) window.clearTimeout(homePressTimer.current);
+    homePressTimer.current = window.setTimeout(() => {
+      homeLongPressTriggered.current = true;
+      focusHomeLocation();
+    }, 1000);
+  }
+
+  function cancelHomePress() {
+    if (homePressTimer.current !== undefined) window.clearTimeout(homePressTimer.current);
+    homePressTimer.current = undefined;
+  }
+
+  function toggleHomePanelFromPress() {
+    if (homeLongPressTriggered.current) {
+      homeLongPressTriggered.current = false;
+      return;
+    }
+    setLocalOpen((value) => !value);
+  }
+
+  function toggleMapViewMenu() {
+    setMapViewMenuOpen((open) => {
+      const nextOpen = !open;
+      if (nextOpen) {
+        setFiltersOpen(false);
+        if (mobileControlPanels) setSettingsOpen(false);
+      }
+      return nextOpen;
+    });
+  }
+
+  function toggleFiltersPanel() {
+    setFiltersOpen((open) => {
+      const nextOpen = !open;
+      if (nextOpen) {
+        setMapViewMenuOpen(false);
+        if (mobileControlPanels) setSettingsOpen(false);
+      }
+      return nextOpen;
+    });
+  }
+
+  function openSettingsPanel() {
+    if (mobileControlPanels) {
+      setMapViewMenuOpen(false);
+      setFiltersOpen(false);
+    }
+    setSettingsOpen(true);
+  }
+
+  function toggleSettingsPanel() {
+    setSettingsOpen((open) => {
+      const nextOpen = !open;
+      if (nextOpen && mobileControlPanels) {
+        setMapViewMenuOpen(false);
+        setFiltersOpen(false);
+      }
+      return nextOpen;
+    });
+  }
+
   function chooseMapLanguage(language: string) {
     setMapLanguage(language);
     saveMapLanguage(language);
@@ -2521,7 +2719,7 @@ export function App() {
 
   function focusHomeLocation() {
     if (!homeLocation) {
-      setSettingsOpen(true);
+      openSettingsPanel();
       setLocalOpen(true);
       return;
     }
@@ -2541,6 +2739,10 @@ export function App() {
     showAviationIncidents
   ].filter(Boolean).length;
   const showPlaceResults = placeSearchOpen && (placeQuery.trim().length >= 2 || loading.placeSearch);
+  const controlStackClass = [
+    "map-control-stack",
+    settingsOpen && (filtersOpen || mapViewMenuOpen) ? "settings-sidecar" : ""
+  ].filter(Boolean).join(" ");
 
   return (
     <main className="app-shell">
@@ -2605,7 +2807,7 @@ export function App() {
           }
         />
 
-        <div className="map-control-stack" ref={mapViewMenuRef}>
+        <div className={controlStackClass} ref={mapViewMenuRef}>
           <div className="map-filter-bar">
             <div className={mapViewMenuOpen ? "map-view-control open" : "map-view-control"}>
               <button
@@ -2614,7 +2816,7 @@ export function App() {
                 aria-label={copy.mapView}
                 aria-haspopup="listbox"
                 aria-expanded={mapViewMenuOpen}
-                onClick={() => setMapViewMenuOpen((value) => !value)}
+                onClick={toggleMapViewMenu}
               >
                 <ActiveMapViewIcon size={18} />
                 <span className="select-value">{layerLabel}</span>
@@ -2650,7 +2852,7 @@ export function App() {
             <button
               className={filtersOpen ? "toolbar-button active" : "toolbar-button"}
               type="button"
-              onClick={() => setFiltersOpen((value) => !value)}
+              onClick={toggleFiltersPanel}
               aria-expanded={filtersOpen}
             >
               <SlidersHorizontal size={18} />
@@ -2698,7 +2900,7 @@ export function App() {
               )}
             </div>
 
-            <button className="toolbar-button icon-only" type="button" title={copy.homeCitySettings} aria-label={copy.homeCitySettings} onClick={() => setSettingsOpen((value) => !value)}>
+            <button className="toolbar-button icon-only" type="button" title={copy.homeCitySettings} aria-label={copy.homeCitySettings} onClick={toggleSettingsPanel}>
               <Settings size={18} />
             </button>
           </div>
@@ -2718,6 +2920,9 @@ export function App() {
                     {copy.none}
                   </button>
                 </div>
+                <button className="mobile-filter-close" type="button" title={copy.close} aria-label={copy.close} onClick={() => setFiltersOpen(false)}>
+                  <X size={20} />
+                </button>
               </div>
 
               <div className="filter-grid">
@@ -3079,7 +3284,17 @@ export function App() {
               >
                 <LocateFixed size={17} />
               </button>
-              <button className="local-dock-collapse" type="button" onClick={() => setLocalOpen((value) => !value)} aria-expanded={localOpen}>
+              <button
+                className="local-dock-collapse"
+                type="button"
+                onPointerDown={startHomePress}
+                onPointerUp={cancelHomePress}
+                onPointerCancel={cancelHomePress}
+                onPointerLeave={cancelHomePress}
+                onClick={toggleHomePanelFromPress}
+                aria-expanded={localOpen}
+              >
+                <Home size={17} className="mobile-home-button-icon" />
                 <span>{homeLocation ? homeLocation.name : copy.setCity}</span>
                 <ChevronDown size={16} />
               </button>
@@ -3093,15 +3308,15 @@ export function App() {
                     <h2>{homeLocation ? homeLocation.name : copy.setCity}</h2>
                     <p>{locationLabel(homeLocation, unitText.noCitySet)}</p>
                   </div>
-                  <div className="local-dock-actions">
-                    <button className="small-icon-button" type="button" title={copy.refreshLocalWeather} aria-label={copy.refreshLocalWeather} onClick={() => void refreshLocal(homeLocation, true)}>
-                      <RefreshCw size={17} className={loading.local ? "spin" : ""} />
+                  <div className="local-dock-actions mobile-home-actions">
+                    <button className="small-icon-button mobile-home-close" type="button" title={copy.close} aria-label={copy.close} onClick={() => setLocalOpen(false)}>
+                      <X size={17} />
                     </button>
                   </div>
                 </div>
 
                 {!homeLocation ? (
-                  <button className="primary-action" type="button" onClick={() => setSettingsOpen(true)}>
+                  <button className="primary-action" type="button" onClick={openSettingsPanel}>
                     <LocateFixed size={18} />
                     {copy.setHomeCity}
                   </button>
@@ -3146,22 +3361,19 @@ export function App() {
                       <strong>{localError ? copy.weatherUnavailable : copy.refreshingWeather}</strong>
                       <span>{localError ?? copy.fetchingConditions}</span>
                     </div>
-                    <button type="button" onClick={() => void refreshLocal(homeLocation, true)} disabled={loading.local}>
-                      {copy.retry}
-                    </button>
                   </div>
                 )}
 
                 <div className="signal-list">
                   {localSignals.length > 0 ? (
                     localSignals.map((signal) => (
-                      <div className={`signal ${signal.severity}`} key={signal.id}>
+                      <button className={`signal ${signal.severity}`} type="button" onClick={() => focusSignal(signal)} key={signal.id}>
                         <TriangleAlert size={17} />
                         <div>
                           <strong>{signal.title}</strong>
                           <span>{signal.detail}</span>
                         </div>
-                      </div>
+                      </button>
                     ))
                   ) : (
                     <div className="signal quiet">
@@ -3174,20 +3386,6 @@ export function App() {
                   )}
                 </div>
 
-                <div className="panel-footer">
-                  <span>{copy.updated} {homeUpdatedLabel}</span>
-                  {notificationPermission === "granted" ? (
-                    <span className="permission granted">
-                      <BellRing size={14} />
-                      {copy.desktopAlerts}
-                    </span>
-                  ) : (
-                    <button className="text-button" type="button" onClick={() => void enableNotifications()}>
-                      <Bell size={14} />
-                      {copy.enableAlerts}
-                    </button>
-                  )}
-                </div>
               </div>
             )}
           </section>
@@ -3294,29 +3492,6 @@ export function App() {
             </div>
           )}
           {showDayNight && <span>{copy.nightMask}</span>}
-        </div>
-
-        <div className="map-status-strip">
-          {activeLayer === "seismic" ? (
-            <>
-              <span>{copy.observedEvents} {earthquakes.length}</span>
-              <span>{copy.strongest} {strongestQuakeLabel}</span>
-              <span>{copy.strong} {strongQuakes.length}</span>
-            </>
-          ) : activeLayer === "risk" ? (
-            <>
-              <span>{copy.riskEvents} {riskEvents.length}</span>
-              <span>{copy.riskHigh} {highRiskEvents.length}</span>
-              <span>{copy.riskCritical} {criticalRiskEvents.length}</span>
-            </>
-          ) : (
-            <>
-              <span>{copy.quakes} {earthquakes.length}</span>
-              <span>{copy.strong} {strongQuakes.length}</span>
-              <span>{copy.warnings} {activeWarnings.length}</span>
-            </>
-          )}
-          <span>{loading.global ? copy.refreshing : activeUpdateLabel}</span>
         </div>
 
         {error && <div className="error-box">{error}</div>}

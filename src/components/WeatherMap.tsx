@@ -80,6 +80,7 @@ const MAX_MERCATOR_LAT = 85.05112878;
 const LONGITUDE_WRAP_LIMIT = 1_000_000;
 const WORLD_COPY_OFFSETS = [-720, -360, 0, 360, 720];
 const OPENFREEMAP_STYLE_URL = "https://tiles.openfreemap.org/styles/liberty";
+const MAP_MAX_ZOOM = 13;
 const HOME_MARKER_ICON = `<span aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><path d="M9 22V12h6v10"></path></svg></span>`;
 const PLACE_MARKER_ICON = `<span aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M20 10c0 5.25-8 12-8 12S4 15.25 4 10a8 8 0 1 1 16 0Z"></path><circle cx="12" cy="10" r="3"></circle></svg></span>`;
 const AIRCRAFT_MARKER_ICON = `<svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path d="M10.18 9"></path><path d="m21 16-8-5-8 5V8l8-5 8 5Z"></path><path d="m13 11 4 9h-8Z"></path></svg>`;
@@ -631,6 +632,7 @@ function makeTemperatureLayer(
       map.getPanes().tooltipPane.appendChild(this._tooltip);
       map.on("moveend zoomend resize", (this as unknown as { _reset: () => void })._reset, this);
       map.on("mousemove", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
+      map.on("click", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
       map.on("mouseout movestart zoomstart", (this as unknown as { _hideHover: () => void })._hideHover, this);
       (this as unknown as { _reset: () => void })._reset();
       (this as unknown as { _scheduleSettledReset: () => void })._scheduleSettledReset();
@@ -642,6 +644,7 @@ function makeTemperatureLayer(
       if (this._tooltip?.parentNode) this._tooltip.parentNode.removeChild(this._tooltip);
       this._weatherMap?.off("moveend zoomend resize", (this as unknown as { _reset: () => void })._reset, this);
       this._weatherMap?.off("mousemove", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
+      this._weatherMap?.off("click", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
       this._weatherMap?.off("mouseout movestart zoomstart", (this as unknown as { _hideHover: () => void })._hideHover, this);
       this._canvas = undefined;
       this._tooltip = undefined;
@@ -807,6 +810,7 @@ function makeWindLayer(
       map.getPanes().tooltipPane.appendChild(this._tooltip);
       map.on("moveend zoomend resize", (this as unknown as { _reset: () => void })._reset, this);
       map.on("mousemove", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
+      map.on("click", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
       map.on("mouseout movestart zoomstart", (this as unknown as { _hideHover: () => void })._hideHover, this);
       (this as unknown as { _reset: () => void })._reset();
       (this as unknown as { _scheduleSettledReset: () => void })._scheduleSettledReset();
@@ -818,6 +822,7 @@ function makeWindLayer(
       if (this._tooltip?.parentNode) this._tooltip.parentNode.removeChild(this._tooltip);
       this._weatherMap?.off("moveend zoomend resize", (this as unknown as { _reset: () => void })._reset, this);
       this._weatherMap?.off("mousemove", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
+      this._weatherMap?.off("click", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
       this._weatherMap?.off("mouseout movestart zoomstart", (this as unknown as { _hideHover: () => void })._hideHover, this);
       this._canvas = undefined;
       this._tooltip = undefined;
@@ -1493,11 +1498,13 @@ function makeLocalTimeHoverLayer() {
       this._tooltip = L.DomUtil.create("div", "map-hover-tooltip local-time") as HTMLDivElement;
       map.getPanes().tooltipPane.appendChild(this._tooltip);
       map.on("mousemove", this._moveHover, this);
+      map.on("click", this._moveHover, this);
       map.on("mouseout movestart zoomstart", this._hideHover, this);
     },
     onRemove(this: LocalTimeLayerInternal) {
       if (this._tooltip?.parentNode) this._tooltip.parentNode.removeChild(this._tooltip);
       this._weatherMap?.off("mousemove", this._moveHover, this);
+      this._weatherMap?.off("click", this._moveHover, this);
       this._weatherMap?.off("mouseout movestart zoomstart", this._hideHover, this);
     },
     _hideHover(this: LocalTimeLayerInternal) {
@@ -1547,7 +1554,7 @@ function makeRainRadarLayer(
   const makeTileLayer = (state: RainViewerState, radarFrame: RainFrame, opacity = 0.78) => L.tileLayer(`${state.host}${radarFrame.path}/512/{z}/{x}/{y}/2/1_1.png`, {
     opacity,
     maxNativeZoom: 7,
-    maxZoom: 9,
+    maxZoom: MAP_MAX_ZOOM,
     noWrap: false,
     keepBuffer: 4,
     crossOrigin: true,
@@ -1590,6 +1597,7 @@ function makeRainRadarLayer(
       this._tooltip = L.DomUtil.create("div", "map-hover-tooltip radar") as HTMLDivElement;
       map.getPanes().tooltipPane.appendChild(this._tooltip);
       map.on("mousemove", this._moveHover, this);
+      map.on("click", this._moveHover, this);
       map.on("mouseout movestart zoomstart", this._hideHover, this);
     },
     onRemove(this: RainRadarLayerInternal) {
@@ -1598,6 +1606,7 @@ function makeRainRadarLayer(
       if (this._pendingTileLayer && this._weatherMap) this._weatherMap.removeLayer(this._pendingTileLayer);
       if (this._tooltip?.parentNode) this._tooltip.parentNode.removeChild(this._tooltip);
       this._weatherMap?.off("mousemove", this._moveHover, this);
+      this._weatherMap?.off("click", this._moveHover, this);
       this._weatherMap?.off("mouseout movestart zoomstart", this._hideHover, this);
       this._tileCache?.clear();
       this._tileLayer = undefined;
@@ -2985,11 +2994,35 @@ function overlappingItemsAtPoint(map: L.Map, point: L.Point, referenceLongitude:
   const seen = new Set<string>();
   return candidates
     .filter((item) => {
-      if (seen.has(item.id)) return false;
-      seen.add(item.id);
+      const key = overlapSelectableDedupeKey(item);
+      if (seen.has(key)) return false;
+      seen.add(key);
       return true;
     })
     .slice(0, 10);
+}
+
+function overlapSelectableDedupeKey(item: OverlapSelectableItem) {
+  if (item.kind === "Aircraft" || item.kind === "Earthquake" || item.id === "home-location" || item.id === "inspected-location") {
+    return item.id;
+  }
+
+  return [
+    item.kind,
+    normalizeOverlapText(item.label),
+    normalizeOverlapText(item.detail),
+    Math.round(item.lat * 10) / 10,
+    Math.round(item.lon * 10) / 10
+  ].join(":");
+}
+
+function normalizeOverlapText(value?: string) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/\binvolving\b.*?\bnear\b/gi, "near")
+    .replace(/\binvolved:\s*.*$/i, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
 }
 
 function overlapSelectorContent(items: OverlapSelectableItem[]) {
@@ -3252,18 +3285,23 @@ export function WeatherMap({
     const map = L.map(container, {
       worldCopyJump: true,
       minZoom: 2,
-      maxZoom: 9,
+      maxZoom: MAP_MAX_ZOOM,
       zoomControl: false,
       closePopupOnClick: false,
       maxBounds: WORLD_BOUNDS,
       maxBoundsViscosity: 0.85
     }).setView([22, 4], 2);
 
+    map.attributionControl.setPrefix(false);
     L.control.zoom({ position: "bottomright" }).addTo(map);
     baseLayerRef.current = L.maplibreGL({
       style: OPENFREEMAP_STYLE_URL,
       interactive: false,
-      maxZoom: 9
+      maxZoom: MAP_MAX_ZOOM,
+      attributionControl: {
+        customAttribution:
+          '<a href="https://openmaptiles.org/" target="_blank" rel="noreferrer">© OpenMapTiles</a> · <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">© OpenStreetMap contributors</a>'
+      }
     }).addTo(map);
 
     mapRef.current = map;

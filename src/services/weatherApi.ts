@@ -45,12 +45,12 @@ const OPENSKY_STATES = "https://opensky-network.org/api/states/all";
 const OPENSKY_TRACKS = "https://opensky-network.org/api/tracks/all";
 const ADSB_LOL_AIRCRAFT = "https://api.adsb.lol/v2/lat";
 const WEATHER_GRID_CACHE_KEY = "weather-watch:weather-grid-cache:v3";
-const RISK_EVENTS_CACHE_KEY = "weather-watch:risk-events-cache:v3";
+const RISK_EVENTS_CACHE_KEY = "weather-watch:risk-events-cache:v4";
 const AIRCRAFT_CACHE_PREFIX = "weather-watch:aircraft-cache:v2";
 const AIRCRAFT_TRACK_CACHE_PREFIX = "weather-watch:aircraft-track-cache:v1";
 const AVIATION_INCIDENTS_CACHE_KEY = "weather-watch:aviation-incidents-cache:v1";
 const EARTHQUAKE_EVENTS_CACHE_KEY = "weather-watch:earthquake-events-cache:v1";
-const WARNING_EVENTS_CACHE_KEY = "weather-watch:warning-events-cache:v1";
+const WARNING_EVENTS_CACHE_KEY = "weather-watch:warning-events-cache:v2";
 const EVENT_RETENTION_MS = 21 * 24 * 60 * 60 * 1000;
 const WEATHER_GRID_FRESH_MS = 9 * 60 * 1000;
 const WEATHER_GRID_STALE_MS = 8 * 60 * 60 * 1000;
@@ -2176,19 +2176,39 @@ function gdeltRiskSeverity(
 function dedupeRiskEvents(events: RiskSignalEvent[]) {
   const seen = new Map<string, RiskSignalEvent>();
   events.forEach((event) => {
-    const key = [
-      event.eventCode,
-      event.actor1 ?? "",
-      event.actor2 ?? "",
-      Math.round(event.lat * 5) / 5,
-      Math.round(event.lon * 5) / 5
-    ].join(":");
+    const key = riskEventDedupeKey(event);
     const existing = seen.get(key);
     if (!existing || riskEventScore(event) > riskEventScore(existing)) {
       seen.set(key, event);
     }
   });
   return Array.from(seen.values());
+}
+
+function riskEventDedupeKey(event: RiskSignalEvent) {
+  const sourceKey = event.sourceUrl && event.sourceUrl !== event.fetchedAt ? normalizeEventDedupeText(event.sourceUrl) : "";
+  const timeBucket = Math.floor(event.time / (6 * 60 * 60 * 1000));
+  return [
+    event.sourceLabel,
+    event.sourceDomain ?? "",
+    sourceKey,
+    event.eventLabel,
+    normalizeEventDedupeText(event.place),
+    Math.round(event.lat * 5) / 5,
+    Math.round(event.lon * 5) / 5,
+    timeBucket
+  ].join(":");
+}
+
+function normalizeEventDedupeText(value?: string) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/[?#].*$/, "")
+    .replace(/\binvolving\b.*?\bnear\b/gi, "near")
+    .replace(/\binvolved:\s*.*$/i, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
 }
 
 function sortRiskEvents(left: RiskSignalEvent, right: RiskSignalEvent) {
@@ -2822,11 +2842,27 @@ export async function fetchGdacsAlerts(signal?: AbortSignal): Promise<GdacsAlert
 function dedupeAlerts(alerts: GdacsAlert[]) {
   const seen = new Set<string>();
   return alerts.filter((alert) => {
-    const key = `${alert.source ?? "unknown"}:${alert.id}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
+    const keys = alertDedupeKeys(alert);
+    if (keys.some((key) => seen.has(key))) return false;
+    keys.forEach((key) => seen.add(key));
     return true;
   });
+}
+
+function alertDedupeKeys(alert: GdacsAlert) {
+  const source = alert.source ?? alert.sourceLabel ?? "unknown";
+  const exactKey = alert.id ? `${source}:id:${alert.id}` : "";
+  const semanticKey = [
+    source,
+    "semantic",
+    normalizeEventDedupeText(alert.eventType ?? alert.title),
+    normalizeEventDedupeText(alert.title),
+    normalizeEventDedupeText(alert.areaName),
+    alert.startsAt ?? alert.date ?? "",
+    typeof alert.lat === "number" ? Math.round(alert.lat * 10) / 10 : "",
+    typeof alert.lon === "number" ? Math.round(alert.lon * 10) / 10 : ""
+  ].join(":");
+  return [exactKey, semanticKey].filter(Boolean);
 }
 
 function sortAlertsByDate(left: GdacsAlert, right: GdacsAlert) {

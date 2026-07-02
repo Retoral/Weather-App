@@ -442,6 +442,21 @@ button {
   pointer-events: auto;
 }
 
+.settings-panel {
+  max-height: calc(100vh - 92px);
+  overflow-y: auto;
+}
+
+@media (min-width: 900px) {
+  .map-control-stack.settings-sidecar .settings-panel {
+    position: absolute;
+    z-index: 110;
+    top: 54px;
+    left: 416px;
+    width: min(360px, calc(100vw - 444px));
+  }
+}
+
 .floating-heading {
   justify-content: space-between;
   gap: 12px;
@@ -490,6 +505,12 @@ button {
   align-items: center;
   justify-content: center;
   width: 30px;
+}
+
+.mobile-filter-close,
+.mobile-home-button-icon,
+.mobile-home-actions {
+  display: none;
 }
 
 .filter-grid {
@@ -662,7 +683,7 @@ button {
   white-space: nowrap;
 }
 
-.local-dock.open .local-dock-collapse svg {
+.local-dock.open .local-dock-collapse > svg:last-child {
   transform: rotate(180deg);
 }
 
@@ -833,10 +854,23 @@ button {
   grid-template-columns: 20px minmax(0, 1fr);
   gap: 7px;
   align-items: start;
+  width: 100%;
   min-height: 44px;
   padding: 8px;
+  border: 0;
   border-radius: 7px;
   background: rgba(255, 250, 241, 0.1);
+  color: #fffaf1;
+  cursor: default;
+  text-align: left;
+}
+
+button.signal {
+  cursor: pointer;
+}
+
+button.signal:hover {
+  filter: brightness(1.08);
 }
 
 .signal strong,
@@ -1896,24 +1930,315 @@ button {
 }
 
 @media (max-width: 620px) {
+  .map-control-stack {
+    top: max(10px, env(safe-area-inset-top));
+    right: 10px;
+    left: 10px;
+    z-index: 980;
+    gap: 7px;
+  }
+
+  .map-filter-bar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 42px;
+    gap: 6px;
+    align-items: center;
+    width: 100%;
+  }
+
   .toolbar-search-wrap {
-    flex-basis: 100%;
+    order: 1;
+    grid-column: 1;
+    width: 100%;
     min-width: 0;
+  }
+
+  .toolbar-button.icon-only {
+    order: 2;
+    grid-column: 2;
+    width: 38px;
+    height: 38px;
+  }
+
+  .map-view-control {
+    order: 3;
+    grid-column: 1;
+    width: 100%;
+    flex-basis: auto;
+  }
+
+  .map-view-select {
+    width: 100%;
+    min-width: 0;
+    min-height: 38px;
+  }
+
+  .map-filter-bar > .toolbar-button:not(.icon-only) {
+    order: 4;
+    grid-column: 2;
+    width: 38px;
+    min-height: 38px;
+    padding: 0;
+    gap: 3px;
+    font-size: 0;
+  }
+
+  .map-filter-bar > .toolbar-button:not(.icon-only) svg,
+  .map-filter-bar > .toolbar-button:not(.icon-only) span {
+    font-size: 0.68rem;
+  }
+
+  .map-view-menu-panel {
+    z-index: 1250;
+    width: 100%;
+  }
+
+  .place-result-panel {
+    max-height: min(42vh, 320px);
+    overflow-y: auto;
+  }
+
+  .filter-panel {
+    position: fixed;
+    z-index: 1300;
+    inset: 0;
+    width: auto;
+    max-width: none;
+    padding: max(16px, env(safe-area-inset-top)) 14px max(18px, env(safe-area-inset-bottom));
+    border-radius: 0;
+    overflow-y: auto;
+  }
+
+  .filter-panel .floating-heading {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    padding: 0 0 10px;
+    background: linear-gradient(rgba(25, 27, 26, 0.98), rgba(25, 27, 26, 0.82));
+  }
+
+  .filter-panel .mini-actions {
+    margin-left: auto;
+  }
+
+  .mobile-filter-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 38px;
+    height: 38px;
+    border-radius: 999px;
+    background: rgba(255, 250, 241, 0.12);
+    color: #fffaf1;
   }
 
   .filter-grid {
     grid-template-columns: 1fr;
   }
 
+  .filter-grid label {
+    min-height: 52px;
+    padding: 0 12px;
+    font-size: 0.96rem;
+  }
+
   .metric-row {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .legend {
+  .location-dock-stack {
+    top: calc(max(10px, env(safe-area-inset-top)) + 98px);
+    bottom: auto;
+    left: 10px;
+    width: auto;
+    max-width: calc(100vw - 20px);
+    z-index: 890;
+  }
+
+  .home-dock,
+  .inspected-dock {
+    width: 48px;
+    border: 0;
+    background: transparent;
+    box-shadow: none;
+    backdrop-filter: none;
+  }
+
+  .home-dock.open,
+  .inspected-dock {
+    width: min(340px, calc(100vw - 20px));
+  }
+
+  .home-dock .local-dock-toggle {
+    width: 48px;
+    min-height: 48px;
+    padding: 0;
+    background: transparent;
+  }
+
+  .home-dock .local-home-focus {
     display: none;
   }
 
-  .map-status-strip {
+  .home-dock .local-dock-collapse {
+    justify-content: center;
+    width: 48px;
+    min-height: 48px;
+    height: 48px;
+    padding: 0;
+    border-radius: 999px;
+    background: rgba(25, 27, 26, 0.92);
+    box-shadow: 0 14px 32px rgba(0, 0, 0, 0.24);
+    backdrop-filter: blur(14px);
+  }
+
+  .home-dock .local-dock-collapse span,
+  .home-dock .local-dock-collapse > svg:last-child {
     display: none;
+  }
+
+  .home-dock .mobile-home-button-icon {
+    display: block;
+  }
+
+  .home-dock.open .local-dock-body,
+  .inspected-dock .local-dock-body {
+    max-height: min(62vh, calc(100vh - 185px));
+    margin-top: 8px;
+    padding: 12px;
+    overflow-y: auto;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 8px;
+    background: rgba(25, 27, 26, 0.92);
+    box-shadow: 0 14px 32px rgba(0, 0, 0, 0.24);
+    backdrop-filter: blur(14px);
+  }
+
+  .mobile-home-actions {
+    display: flex;
+  }
+
+  .temp-value {
+    min-width: 74px;
+    font-size: 2rem;
+  }
+
+  .current-weather {
+    gap: 8px;
+  }
+
+  .weather-metrics {
+    min-width: 96px;
+  }
+
+  .tracked-flight-dock {
+    top: calc(max(10px, env(safe-area-inset-top)) + 98px);
+    right: 10px;
+    bottom: auto;
+    left: auto;
+    width: 48px;
+    z-index: 890;
+  }
+
+  .tracked-flight-toggle {
+    position: relative;
+    justify-content: center;
+    width: 48px;
+    min-height: 48px;
+    height: 48px;
+    padding: 0;
+    border-radius: 999px;
+  }
+
+  .tracked-flight-toggle strong,
+  .tracked-flight-toggle > svg:last-child {
+    display: none;
+  }
+
+  .tracked-flight-toggle span {
+    position: absolute;
+    bottom: -2px;
+    left: -2px;
+    min-width: 18px;
+    height: 18px;
+    box-shadow: 0 0 0 2px rgba(25, 27, 26, 0.95);
+  }
+
+  .tracked-flight-dock:not(.open) .tracked-flight-list {
+    display: none;
+  }
+
+  .tracked-flight-dock.open {
+    top: auto;
+    right: 10px;
+    bottom: max(12px, env(safe-area-inset-bottom));
+    left: 10px;
+    width: auto;
+  }
+
+  .tracked-flight-dock.open .tracked-flight-toggle {
+    justify-self: end;
+  }
+
+  .tracked-flight-dock.open .tracked-flight-list {
+    max-height: 36vh;
+    overflow: auto;
+  }
+
+  .legend {
+    right: 10px;
+    bottom: max(10px, env(safe-area-inset-bottom));
+    display: grid;
+    max-width: min(260px, calc(100vw - 20px));
+    max-height: 34vh;
+    padding: 8px;
+    overflow-y: auto;
+    font-size: 0.7rem;
+  }
+
+  .legend.radar-legend {
+    bottom: max(10px, env(safe-area-inset-bottom));
+  }
+
+  .radar-scale,
+  .wind-scale,
+  .risk-scale,
+  .seismic-scale {
+    min-width: min(220px, calc(100vw - 44px));
+  }
+
+  .leaflet-bottom.leaflet-right .leaflet-control-zoom {
+    display: none;
+  }
+
+  .leaflet-popup {
+    max-width: calc(100vw - 20px) !important;
+  }
+
+  .leaflet-popup-content-wrapper {
+    max-height: 72vh;
+    overflow: hidden;
+  }
+
+  .leaflet-popup-content {
+    max-width: calc(100vw - 58px);
+    max-height: 64vh;
+    overflow-y: auto;
+  }
+
+  .map-hover-tooltip,
+  .map-hover-tooltip.radar,
+  .map-hover-tooltip.wind,
+  .map-hover-tooltip.seismic,
+  .map-hover-tooltip.risk {
+    max-width: calc(100vw - 28px);
+    white-space: normal;
+  }
+
+  .error-box {
+    right: 10px;
+    left: 10px;
+    top: calc(max(10px, env(safe-area-inset-top)) + 96px);
+    max-width: none;
   }
 }
