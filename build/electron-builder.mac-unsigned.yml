@@ -1,0 +1,20 @@
+appId: com.weatherwatch.desktop
+productName: Weather Watch
+artifactName: ${productName}-${version}-${os}-${arch}-unsigned.${ext}
+files:
+  - dist/**/*
+  - dist-electron/**/*
+  - package.json
+directories:
+  buildResources: build
+  output: release
+icon: build/icon.png
+mac:
+  target:
+    - zip
+  icon: build/icon.icns
+  category: public.app-category.weather
+  identity: null
+  hardenedRuntime: false
+  gatekeeperAssess: false
+  notarize: false

@@ -72,7 +72,7 @@ jobs:
           NOTARIZATION_READY=false
 
           if [[ -z "$CSC_LINK" || -z "$CSC_KEY_PASSWORD" ]]; then
-            echo "::warning::macOS release package skipped: missing MAC_CSC_LINK and/or MAC_CSC_KEY_PASSWORD secrets for Developer ID signing."
+            echo "::warning::macOS signed release package unavailable: missing MAC_CSC_LINK and/or MAC_CSC_KEY_PASSWORD secrets for Developer ID signing. Building unsigned macOS test zips instead."
           else
             SIGNING_READY=true
           fi
@@ -90,7 +90,7 @@ jobs:
           fi
 
           if [[ "$NOTARIZATION_READY" != "true" ]]; then
-            echo "::warning::macOS release package skipped: missing notarization secrets."
+            echo "::warning::macOS signed release package unavailable: missing notarization secrets. Building unsigned macOS test zips instead."
           fi
 
           if [[ "$SIGNING_READY" == "true" && "$NOTARIZATION_READY" == "true" ]]; then
@@ -99,9 +99,18 @@ jobs:
           fi
 
           cat > release/macos-signing-required.txt <<'EOF'
-          macOS package was not built for this release.
+          Unsigned macOS test packages are included in this release.
 
-          Weather Watch macOS downloads must be signed with an Apple Developer ID certificate and notarized by Apple. Releasing an unsigned macOS app can make Gatekeeper show "Weather Watch is damaged and can't be opened."
+          These zips contain a real Weather Watch.app for Intel and Apple Silicon Macs, but they are not signed or notarized. macOS may block them until the user explicitly trusts the app or removes the quarantine flag.
+
+          To test manually:
+          1. Download and unzip the macOS file for your Mac.
+          2. Move Weather Watch.app into /Applications.
+          3. Right-click Weather Watch.app and choose Open.
+          4. If macOS still blocks it, run:
+             xattr -dr com.apple.quarantine "/Applications/Weather Watch.app"
+
+          Public macOS releases should still be signed with an Apple Developer ID certificate and notarized by Apple. Releasing an unsigned macOS app can make Gatekeeper show "Weather Watch is damaged and can't be opened."
 
           Add these GitHub repository secrets to enable Intel and Apple Silicon macOS builds:
           - MAC_CSC_LINK
@@ -132,6 +141,12 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_KEYCHAIN: ${{ secrets.APPLE_KEYCHAIN }}
           APPLE_KEYCHAIN_PROFILE: ${{ secrets.APPLE_KEYCHAIN_PROFILE }}
+
+      - name: Build unsigned macOS test package
+        if: matrix.name == 'macOS' && steps.mac_credentials.outputs.can_build != 'true'
+        run: npm run dist:mac:unsigned
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
 
       - name: Upload package artifacts
         uses: actions/upload-artifact@v4
