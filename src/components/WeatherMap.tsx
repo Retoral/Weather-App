@@ -86,6 +86,7 @@ const AIRCRAFT_MARKER_ICON = `<svg viewBox="0 0 24 24" focusable="false" aria-hi
 const SURFACE_GRID_MIN_LAT = -80;
 const SURFACE_GRID_MAX_LAT = 80;
 const SURFACE_RASTER_MAX_PIXELS = 340_000;
+const SURFACE_RASTER_CACHE_LIMIT = 18;
 const WARNING_TRANSLATION_CACHE_PREFIX = "weather-watch:warning-translation:v1";
 const DEFAULT_UNIT_SETTINGS: UnitSettings = {
   temperatureUnit: "celsius",
@@ -112,6 +113,10 @@ const MAP_UI_COPY = {
     updated: "Updated",
     localTime: "Local time",
     direction: "Direction",
+    from: "From",
+    toward: "Toward",
+    surfaceWind: "Surface wind",
+    tenMeterWind: "10 m surface wind",
     blowingFrom: "Blowing from",
     forecastTime: "Forecast time",
     chance: "Chance",
@@ -152,6 +157,10 @@ const MAP_UI_COPY = {
     updated: "Uppdaterad",
     localTime: "Lokal tid",
     direction: "Riktning",
+    from: "Från",
+    toward: "Mot",
+    surfaceWind: "Ytvind",
+    tenMeterWind: "10 m ytvind",
     blowingFrom: "Blåser från",
     forecastTime: "Prognostid",
     chance: "Sannolikhet",
@@ -192,6 +201,10 @@ const MAP_UI_COPY = {
     updated: "Aktualisiert",
     localTime: "Ortszeit",
     direction: "Richtung",
+    from: "Aus",
+    toward: "Nach",
+    surfaceWind: "Bodenwind",
+    tenMeterWind: "10 m Bodenwind",
     blowingFrom: "Weht aus",
     forecastTime: "Prognosezeit",
     chance: "Wahrscheinlichkeit",
@@ -232,6 +245,10 @@ const MAP_UI_COPY = {
     updated: "Mis à jour",
     localTime: "Heure locale",
     direction: "Direction",
+    from: "De",
+    toward: "Vers",
+    surfaceWind: "Vent de surface",
+    tenMeterWind: "Vent de surface 10 m",
     blowingFrom: "Vient de",
     forecastTime: "Heure prévue",
     chance: "Probabilité",
@@ -272,6 +289,10 @@ const MAP_UI_COPY = {
     updated: "Actualizado",
     localTime: "Hora local",
     direction: "Dirección",
+    from: "Desde",
+    toward: "Hacia",
+    surfaceWind: "Viento de superficie",
+    tenMeterWind: "Viento de superficie 10 m",
     blowingFrom: "Sopla desde",
     forecastTime: "Hora prevista",
     chance: "Probabilidad",
@@ -312,6 +333,10 @@ const MAP_UI_COPY = {
     updated: "Aggiornato",
     localTime: "Ora locale",
     direction: "Direzione",
+    from: "Da",
+    toward: "Verso",
+    surfaceWind: "Vento al suolo",
+    tenMeterWind: "Vento al suolo 10 m",
     blowingFrom: "Soffia da",
     forecastTime: "Ora prevista",
     chance: "Probabilità",
@@ -352,6 +377,10 @@ const MAP_UI_COPY = {
     updated: "更新",
     localTime: "現地時刻",
     direction: "方向",
+    from: "風上",
+    toward: "風下",
+    surfaceWind: "地表風",
+    tenMeterWind: "10 m地表風",
     blowingFrom: "吹いてくる方向",
     forecastTime: "予報時刻",
     chance: "確率",
@@ -392,6 +421,10 @@ const MAP_UI_COPY = {
     updated: "已更新",
     localTime: "当地时间",
     direction: "方向",
+    from: "来自",
+    toward: "吹向",
+    surfaceWind: "地面风",
+    tenMeterWind: "10米地面风",
     blowingFrom: "来自",
     forecastTime: "预报时间",
     chance: "概率",
@@ -550,19 +583,45 @@ function makeTemperatureLayer(
   includeLocalTime = false,
   units: UnitSettings = DEFAULT_UNIT_SETTINGS
 ) {
-  const surfaceGrid = makeSurfaceGrid(points);
-  const liveStations = makeSurfaceStations(livePoints);
+  let surfaceGrid = makeSurfaceGrid(points);
+  let detailGrid = makeSurfaceGrid(surfaceDetailPoints(livePoints));
+  let liveStations = makeSurfaceStations(surfaceStationPoints(livePoints));
+  let surfaceSignature = surfaceGridSignature("temperature", surfaceGrid, detailGrid);
+  let currentIncludeLocalTime = includeLocalTime;
+  let currentUnits = units;
 
   interface TemperatureLayerInternal extends L.Layer {
     _canvas?: HTMLCanvasElement;
+    _lastRenderKey?: string;
     _tooltip?: HTMLDivElement;
     _weatherMap?: L.Map;
+    _resetFrame?: number;
+    _resetTimer?: number;
     _hideHover: () => void;
     _moveHover: (event: L.LeafletMouseEvent) => void;
     _reset: () => void;
+    _scheduleSettledReset: () => void;
+    updateSurfaceLayer: (nextPoints: WeatherGridPoint[], nextLivePoints: WeatherGridPoint[], nextIncludeLocalTime: boolean, nextUnits: UnitSettings) => void;
   }
 
   const CanvasLayer = L.Layer.extend({
+    updateSurfaceLayer(
+      this: TemperatureLayerInternal,
+      nextPoints: WeatherGridPoint[],
+      nextLivePoints: WeatherGridPoint[] = [],
+      nextIncludeLocalTime = false,
+      nextUnits: UnitSettings = DEFAULT_UNIT_SETTINGS
+    ) {
+      surfaceGrid = makeSurfaceGrid(nextPoints);
+      detailGrid = makeSurfaceGrid(surfaceDetailPoints(nextLivePoints));
+      liveStations = makeSurfaceStations(surfaceStationPoints(nextLivePoints));
+      surfaceSignature = surfaceGridSignature("temperature", surfaceGrid, detailGrid);
+      this._lastRenderKey = undefined;
+      currentIncludeLocalTime = nextIncludeLocalTime;
+      currentUnits = nextUnits;
+      this._reset();
+      this._scheduleSettledReset();
+    },
     onAdd(this: TemperatureLayerInternal, map: L.Map) {
       this._weatherMap = map;
       this._canvas = L.DomUtil.create("canvas", "temperature-canvas") as HTMLCanvasElement;
@@ -574,8 +633,11 @@ function makeTemperatureLayer(
       map.on("mousemove", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
       map.on("mouseout movestart zoomstart", (this as unknown as { _hideHover: () => void })._hideHover, this);
       (this as unknown as { _reset: () => void })._reset();
+      (this as unknown as { _scheduleSettledReset: () => void })._scheduleSettledReset();
     },
     onRemove(this: TemperatureLayerInternal) {
+      if (this._resetFrame !== undefined) window.cancelAnimationFrame(this._resetFrame);
+      if (this._resetTimer !== undefined) window.clearTimeout(this._resetTimer);
       if (this._canvas?.parentNode) this._canvas.parentNode.removeChild(this._canvas);
       if (this._tooltip?.parentNode) this._tooltip.parentNode.removeChild(this._tooltip);
       this._weatherMap?.off("moveend zoomend resize", (this as unknown as { _reset: () => void })._reset, this);
@@ -584,6 +646,8 @@ function makeTemperatureLayer(
       this._canvas = undefined;
       this._tooltip = undefined;
       this._weatherMap = undefined;
+      this._resetFrame = undefined;
+      this._resetTimer = undefined;
     },
     _hideHover(this: TemperatureLayerInternal) {
       if (this._tooltip) this._tooltip.classList.remove("visible");
@@ -591,15 +655,29 @@ function makeTemperatureLayer(
     _moveHover(this: TemperatureLayerInternal, event: L.LeafletMouseEvent) {
       if (!this._weatherMap || !this._tooltip || surfaceGrid.samples.size === 0 && liveStations.length === 0) return;
       const map = this._weatherMap;
-      const sample = interpolatedSurfaceSample(surfaceGrid, event.latlng.lat, event.latlng.lng, liveStations);
+      const sample = interpolatedSurfaceSample(surfaceGrid, detailGrid, event.latlng.lat, event.latlng.lng, liveStations);
       if (!sample) {
         this._hideHover();
         return;
       }
 
       positionHoverReadout(map, event, this._tooltip);
-      this._tooltip.innerHTML = `<strong>${formatTemperature(sample.temperature, units.temperatureUnit)}</strong>${includeLocalTime ? `<span>${localTimeSummary(event.latlng.lat, event.latlng.lng, Date.now())}</span>` : ""}<em>${event.latlng.lat.toFixed(1)}°, ${normalizeLongitude(event.latlng.lng).toFixed(1)}°</em>`;
+      this._tooltip.innerHTML = `<strong>${formatTemperature(sample.temperature, currentUnits.temperatureUnit)}</strong>${currentIncludeLocalTime ? `<span>${localTimeSummary(event.latlng.lat, event.latlng.lng, Date.now())}</span>` : ""}<em>${event.latlng.lat.toFixed(1)}°, ${normalizeLongitude(event.latlng.lng).toFixed(1)}°</em>`;
       showHoverReadout(this._tooltip);
+    },
+    _scheduleSettledReset(this: TemperatureLayerInternal) {
+      if (this._resetFrame !== undefined) window.cancelAnimationFrame(this._resetFrame);
+      if (this._resetTimer !== undefined) window.clearTimeout(this._resetTimer);
+      this._resetFrame = window.requestAnimationFrame(() => {
+        this._resetFrame = undefined;
+        this._weatherMap?.invalidateSize({ pan: false });
+        this._reset();
+      });
+      this._resetTimer = window.setTimeout(() => {
+        this._resetTimer = undefined;
+        this._weatherMap?.invalidateSize({ pan: false });
+        this._reset();
+      }, 180);
     },
     _reset(this: TemperatureLayerInternal) {
       if (!this._weatherMap || !this._canvas) return;
@@ -611,24 +689,36 @@ function makeTemperatureLayer(
       const width = Math.max(1, Math.ceil(size.x * scale));
       const height = Math.max(1, Math.ceil(size.y * scale));
       L.DomUtil.setPosition(canvas, topLeft);
-      canvas.width = width;
-      canvas.height = height;
       canvas.style.width = `${size.x}px`;
       canvas.style.height = `${size.y}px`;
+      const renderKey = surfaceRasterCacheKey("temperature", surfaceSignature, map, width, height, scale);
+      if (this._lastRenderKey === renderKey && canvas.width === width && canvas.height === height) return;
+      canvas.width = width;
+      canvas.height = height;
 
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
       ctx.imageSmoothingEnabled = true;
       ctx.clearRect(0, 0, width, height);
 
-      if (surfaceGrid.samples.size === 0 && liveStations.length === 0) return;
+      if (surfaceGrid.samples.size === 0 && detailGrid.samples.size === 0 && liveStations.length === 0) {
+        this._lastRenderKey = undefined;
+        return;
+      }
+
+      const cached = getSurfaceRasterCache(renderKey, width, height);
+      if (cached) {
+        ctx.putImageData(cached, 0, 0);
+        this._lastRenderKey = renderKey;
+        return;
+      }
 
       const image = ctx.createImageData(width, height);
       const { lats, lons } = surfaceRasterCoordinates(map, width, height, scale);
       for (let y = 0; y < height; y += 1) {
         const lat = lats[y];
         for (let x = 0; x < width; x += 1) {
-          const sample = interpolatedSurfacePaintSample(surfaceGrid, lat, lons[x]);
+          const sample = interpolatedSurfacePaintSample(surfaceGrid, detailGrid, lat, lons[x]);
           if (!sample) {
             const index = (y * width + x) * 4;
             image.data[index + 3] = 0;
@@ -644,7 +734,9 @@ function makeTemperatureLayer(
         }
       }
 
+      setSurfaceRasterCache(renderKey, width, height, image);
       ctx.putImageData(image, 0, 0);
+      this._lastRenderKey = renderKey;
     }
   });
 
@@ -658,19 +750,54 @@ function makeWindLayer(
   units: UnitSettings = DEFAULT_UNIT_SETTINGS,
   language = "en"
 ) {
-  const surfaceGrid = makeSurfaceGrid(points);
-  const liveStations = makeSurfaceStations(livePoints);
+  let surfaceGrid = makeSurfaceGrid(points);
+  let detailGrid = makeSurfaceGrid(surfaceDetailPoints(livePoints));
+  let liveStations = makeSurfaceStations(surfaceStationPoints(livePoints));
+  let surfaceSignature = surfaceGridSignature("wind", surfaceGrid, detailGrid);
+  let currentIncludeLocalTime = includeLocalTime;
+  let currentUnits = units;
+  let currentLanguage = language;
 
   interface WindLayerInternal extends L.Layer {
     _canvas?: HTMLCanvasElement;
+    _lastRenderKey?: string;
     _tooltip?: HTMLDivElement;
     _weatherMap?: L.Map;
+    _resetFrame?: number;
+    _resetTimer?: number;
     _hideHover: () => void;
     _moveHover: (event: L.LeafletMouseEvent) => void;
     _reset: () => void;
+    _scheduleSettledReset: () => void;
+    updateSurfaceLayer: (
+      nextPoints: WeatherGridPoint[],
+      nextLivePoints: WeatherGridPoint[],
+      nextIncludeLocalTime: boolean,
+      nextUnits: UnitSettings,
+      nextLanguage: string
+    ) => void;
   }
 
   const CanvasLayer = L.Layer.extend({
+    updateSurfaceLayer(
+      this: WindLayerInternal,
+      nextPoints: WeatherGridPoint[],
+      nextLivePoints: WeatherGridPoint[] = [],
+      nextIncludeLocalTime = false,
+      nextUnits: UnitSettings = DEFAULT_UNIT_SETTINGS,
+      nextLanguage = "en"
+    ) {
+      surfaceGrid = makeSurfaceGrid(nextPoints);
+      detailGrid = makeSurfaceGrid(surfaceDetailPoints(nextLivePoints));
+      liveStations = makeSurfaceStations(surfaceStationPoints(nextLivePoints));
+      surfaceSignature = surfaceGridSignature("wind", surfaceGrid, detailGrid);
+      this._lastRenderKey = undefined;
+      currentIncludeLocalTime = nextIncludeLocalTime;
+      currentUnits = nextUnits;
+      currentLanguage = nextLanguage;
+      this._reset();
+      this._scheduleSettledReset();
+    },
     onAdd(this: WindLayerInternal, map: L.Map) {
       this._weatherMap = map;
       this._canvas = L.DomUtil.create("canvas", "wind-canvas") as HTMLCanvasElement;
@@ -682,8 +809,11 @@ function makeWindLayer(
       map.on("mousemove", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
       map.on("mouseout movestart zoomstart", (this as unknown as { _hideHover: () => void })._hideHover, this);
       (this as unknown as { _reset: () => void })._reset();
+      (this as unknown as { _scheduleSettledReset: () => void })._scheduleSettledReset();
     },
     onRemove(this: WindLayerInternal) {
+      if (this._resetFrame !== undefined) window.cancelAnimationFrame(this._resetFrame);
+      if (this._resetTimer !== undefined) window.clearTimeout(this._resetTimer);
       if (this._canvas?.parentNode) this._canvas.parentNode.removeChild(this._canvas);
       if (this._tooltip?.parentNode) this._tooltip.parentNode.removeChild(this._tooltip);
       this._weatherMap?.off("moveend zoomend resize", (this as unknown as { _reset: () => void })._reset, this);
@@ -692,21 +822,37 @@ function makeWindLayer(
       this._canvas = undefined;
       this._tooltip = undefined;
       this._weatherMap = undefined;
+      this._resetFrame = undefined;
+      this._resetTimer = undefined;
     },
     _hideHover(this: WindLayerInternal) {
       hideHoverReadout(this._tooltip);
     },
     _moveHover(this: WindLayerInternal, event: L.LeafletMouseEvent) {
       if (!this._weatherMap || !this._tooltip || surfaceGrid.samples.size === 0 && liveStations.length === 0) return;
-      const sample = interpolatedSurfaceSample(surfaceGrid, event.latlng.lat, event.latlng.lng, liveStations);
+      const sample = interpolatedSurfaceSample(surfaceGrid, detailGrid, event.latlng.lat, event.latlng.lng, liveStations);
       if (!sample) {
         this._hideHover();
         return;
       }
 
       positionHoverReadout(this._weatherMap, event, this._tooltip);
-      this._tooltip.innerHTML = windHoverContent(sample, event.latlng.lat, event.latlng.lng, units, language, includeLocalTime ? forecastSampleTimestamp(sample) : undefined);
+      this._tooltip.innerHTML = windHoverContent(sample, event.latlng.lat, event.latlng.lng, currentUnits, currentLanguage, currentIncludeLocalTime ? forecastSampleTimestamp(sample) : undefined);
       showHoverReadout(this._tooltip);
+    },
+    _scheduleSettledReset(this: WindLayerInternal) {
+      if (this._resetFrame !== undefined) window.cancelAnimationFrame(this._resetFrame);
+      if (this._resetTimer !== undefined) window.clearTimeout(this._resetTimer);
+      this._resetFrame = window.requestAnimationFrame(() => {
+        this._resetFrame = undefined;
+        this._weatherMap?.invalidateSize({ pan: false });
+        this._reset();
+      });
+      this._resetTimer = window.setTimeout(() => {
+        this._resetTimer = undefined;
+        this._weatherMap?.invalidateSize({ pan: false });
+        this._reset();
+      }, 180);
     },
     _reset(this: WindLayerInternal) {
       if (!this._weatherMap || !this._canvas) return;
@@ -718,24 +864,36 @@ function makeWindLayer(
       const width = Math.max(1, Math.ceil(size.x * scale));
       const height = Math.max(1, Math.ceil(size.y * scale));
       L.DomUtil.setPosition(canvas, topLeft);
-      canvas.width = width;
-      canvas.height = height;
       canvas.style.width = `${size.x}px`;
       canvas.style.height = `${size.y}px`;
+      const renderKey = surfaceRasterCacheKey("wind", surfaceSignature, map, width, height, scale);
+      if (this._lastRenderKey === renderKey && canvas.width === width && canvas.height === height) return;
+      canvas.width = width;
+      canvas.height = height;
 
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
       ctx.imageSmoothingEnabled = true;
       ctx.clearRect(0, 0, width, height);
 
-      if (surfaceGrid.samples.size === 0 && liveStations.length === 0) return;
+      if (surfaceGrid.samples.size === 0 && detailGrid.samples.size === 0 && liveStations.length === 0) {
+        this._lastRenderKey = undefined;
+        return;
+      }
+
+      const cached = getSurfaceRasterCache(renderKey, width, height);
+      if (cached) {
+        ctx.putImageData(cached, 0, 0);
+        this._lastRenderKey = renderKey;
+        return;
+      }
 
       const image = ctx.createImageData(width, height);
       const { lats, lons } = surfaceRasterCoordinates(map, width, height, scale);
       for (let y = 0; y < height; y += 1) {
         const lat = lats[y];
         for (let x = 0; x < width; x += 1) {
-          const sample = interpolatedSurfacePaintSample(surfaceGrid, lat, lons[x]);
+          const sample = interpolatedSurfacePaintSample(surfaceGrid, detailGrid, lat, lons[x]);
           if (!sample) {
             const index = (y * width + x) * 4;
             image.data[index + 3] = 0;
@@ -750,11 +908,27 @@ function makeWindLayer(
         }
       }
 
+      setSurfaceRasterCache(renderKey, width, height, image);
       ctx.putImageData(image, 0, 0);
+      this._lastRenderKey = renderKey;
     }
   });
 
   return new CanvasLayer();
+}
+
+interface SurfaceCanvasLayerInstance extends L.Layer {
+  updateSurfaceLayer: (
+    points: WeatherGridPoint[],
+    livePoints: WeatherGridPoint[],
+    includeLocalTime: boolean,
+    units: UnitSettings,
+    language?: string
+  ) => void;
+}
+
+function isSurfaceCanvasLayer(layer: L.Layer | null): layer is SurfaceCanvasLayerInstance {
+  return Boolean(layer && "updateSurfaceLayer" in layer && typeof (layer as SurfaceCanvasLayerInstance).updateSurfaceLayer === "function");
 }
 
 function windHoverContent(sample: SurfaceSample, lat: number, lon: number, units: UnitSettings, language = "en", timestamp?: number) {
@@ -764,14 +938,15 @@ function windHoverContent(sample: SurfaceSample, lat: number, lon: number, units
   const toDirection = normalizeBearing(fromDirection + 180);
   const strength = windStrengthLabel(sample.windSpeed, language);
   const fromLabel = windCompassLabel(fromDirection);
-  const toLabel = windCompassLabel(toDirection);
+  const towardLabel = windCompassLabel(toDirection);
   const arrow = `<span class="wind-arrow" style="--wind-dir: ${toDirection}deg" aria-hidden="true">&uarr;</span>`;
 
-  return `<strong class="wind-title">${arrow}<span>${text.wind} ${formatWind(sample.windSpeed, units.windUnit)} · ${strength}</span></strong><div class="hover-metrics">
-    <span>${text.direction}</span><b><span class="wind-direction-readout">${toLabel}</span></b>
+  return `<strong class="wind-title">${arrow}<span>${text.surfaceWind} ${formatWind(sample.windSpeed, units.windUnit)} · ${strength}</span></strong><div class="hover-metrics">
+    <span>${text.from}</span><b><span class="wind-direction-readout">${fromLabel}</span></b>
+    <span>${text.toward}</span><b><span class="wind-direction-readout">${towardLabel}</span></b>
     <span>${text.pressure}</span><b>${Math.round(sample.pressure)} hPa</b>
     ${localTimeRow}
-  </div><em>${text.blowingFrom} ${fromLabel} · ${lat.toFixed(1)}°, ${normalizeLongitude(lon).toFixed(1)}°</em>`;
+  </div><em>${text.tenMeterWind} · ${lat.toFixed(1)}°, ${normalizeLongitude(lon).toFixed(1)}°</em>`;
 }
 
 function windCompassLabel(direction: number) {
@@ -834,6 +1009,16 @@ interface SurfaceGrid {
   lonStep: number;
 }
 
+type SurfaceRasterKind = "temperature" | "wind";
+
+interface SurfaceRasterCacheEntry {
+  width: number;
+  height: number;
+  image: ImageData;
+}
+
+const surfaceRasterCache = new Map<string, SurfaceRasterCacheEntry>();
+
 function makeSurfaceGrid(points: WeatherGridPoint[]) {
   const grid: SurfaceGrid = {
     samples: new Map<string, SurfaceSample>(),
@@ -856,6 +1041,18 @@ function makeSurfaceGrid(points: WeatherGridPoint[]) {
     });
   });
   return grid;
+}
+
+function surfaceDetailPoints(points: WeatherGridPoint[]) {
+  return points.filter((point) => !isSurfaceStationPoint(point));
+}
+
+function surfaceStationPoints(points: WeatherGridPoint[]) {
+  return points.filter(isSurfaceStationPoint);
+}
+
+function isSurfaceStationPoint(point: WeatherGridPoint) {
+  return point.id.startsWith("live-");
 }
 
 function inferredCoordinateStep(values: number[], fallback: number) {
@@ -910,6 +1107,91 @@ function surfaceRasterCoordinates(map: L.Map, width: number, height: number, sca
   return { lats, lons };
 }
 
+function surfaceGridSignature(kind: SurfaceRasterKind, grid: SurfaceGrid, detailGrid: SurfaceGrid) {
+  let hash = 2166136261;
+  hash = hashSurfaceGrid(hash, kind, "base", grid);
+  hash = hashSurfaceGrid(hash, kind, "detail", detailGrid);
+  return (hash >>> 0).toString(36);
+}
+
+function hashSurfaceGrid(hash: number, kind: SurfaceRasterKind, label: string, grid: SurfaceGrid) {
+  let nextHash = hashSurfaceValue(hash, label);
+  nextHash = hashSurfaceValue(nextHash, grid.latStep);
+  nextHash = hashSurfaceValue(nextHash, grid.lonStep);
+  nextHash = hashSurfaceValue(nextHash, grid.samples.size);
+
+  Array.from(grid.samples.entries())
+    .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
+    .forEach(([key, sample]) => {
+      nextHash = hashSurfaceValue(nextHash, key);
+      nextHash = hashSurfaceValue(nextHash, sample.time);
+      if (kind === "temperature") {
+        nextHash = hashSurfaceValue(nextHash, sample.temperature);
+        return;
+      }
+
+      nextHash = hashSurfaceValue(nextHash, sample.windSpeed);
+      nextHash = hashSurfaceValue(nextHash, sample.windDirection);
+    });
+
+  return nextHash;
+}
+
+function hashSurfaceValue(hash: number, value: string | number | undefined) {
+  const text =
+    typeof value === "number"
+      ? Number.isFinite(value)
+        ? `${Math.round(value * 1000)}`
+        : "nan"
+      : value ?? "";
+  let nextHash = hash;
+  for (let index = 0; index < text.length; index += 1) {
+    nextHash ^= text.charCodeAt(index);
+    nextHash = Math.imul(nextHash, 16777619);
+  }
+  nextHash ^= 124;
+  return Math.imul(nextHash, 16777619);
+}
+
+function surfaceRasterCacheKey(kind: SurfaceRasterKind, dataSignature: string, map: L.Map, width: number, height: number, scale: number) {
+  const size = map.getSize();
+  const northWest = map.containerPointToLatLng([0, 0]);
+  const southEast = map.containerPointToLatLng([size.x, size.y]);
+  return [
+    kind,
+    dataSignature,
+    width,
+    height,
+    scale.toFixed(4),
+    map.getZoom().toFixed(3),
+    surfaceRasterCacheCoordinate(northWest.lat),
+    surfaceRasterCacheCoordinate(normalizeLongitude(northWest.lng)),
+    surfaceRasterCacheCoordinate(southEast.lat),
+    surfaceRasterCacheCoordinate(normalizeLongitude(southEast.lng))
+  ].join(":");
+}
+
+function surfaceRasterCacheCoordinate(value: number) {
+  return (Math.round(value * 100_000) / 100_000).toFixed(5);
+}
+
+function getSurfaceRasterCache(key: string, width: number, height: number) {
+  const cached = surfaceRasterCache.get(key);
+  if (!cached || cached.width !== width || cached.height !== height) return undefined;
+  surfaceRasterCache.delete(key);
+  surfaceRasterCache.set(key, cached);
+  return cached.image;
+}
+
+function setSurfaceRasterCache(key: string, width: number, height: number, image: ImageData) {
+  surfaceRasterCache.set(key, { width, height, image });
+  while (surfaceRasterCache.size > SURFACE_RASTER_CACHE_LIMIT) {
+    const oldestKey = surfaceRasterCache.keys().next().value;
+    if (!oldestKey) break;
+    surfaceRasterCache.delete(oldestKey);
+  }
+}
+
 function gridCell(grid: SurfaceGrid, lat: number, lon: number) {
   const latStep = grid.latStep;
   const lonStep = grid.lonStep;
@@ -930,13 +1212,19 @@ function gridCell(grid: SurfaceGrid, lat: number, lon: number) {
   return { south, north, west, east, latRatio, lonRatio };
 }
 
-function interpolatedSurfaceSample(grid: SurfaceGrid, lat: number, lon: number, stations: SurfaceStation[] = []): SurfaceSample | undefined {
-  const base = interpolatedGridSample(grid, lat, lon);
+function interpolatedSurfaceSample(
+  grid: SurfaceGrid,
+  detailGrid: SurfaceGrid,
+  lat: number,
+  lon: number,
+  stations: SurfaceStation[] = []
+): SurfaceSample | undefined {
+  const base = interpolatedGridSample(detailGrid, lat, lon) ?? interpolatedGridSample(grid, lat, lon);
   return blendSurfaceStations(base, stations, lat, lon);
 }
 
-function interpolatedSurfacePaintSample(grid: SurfaceGrid, lat: number, lon: number): SurfaceSample | undefined {
-  return interpolatedGridCellSample(grid, lat, lon);
+function interpolatedSurfacePaintSample(grid: SurfaceGrid, detailGrid: SurfaceGrid, lat: number, lon: number): SurfaceSample | undefined {
+  return interpolatedGridCellSample(detailGrid, lat, lon) ?? interpolatedGridCellSample(grid, lat, lon);
 }
 
 function interpolatedGridSample(grid: SurfaceGrid, lat: number, lon: number): SurfaceSample | undefined {
@@ -957,7 +1245,18 @@ function interpolatedGridCellSample(grid: SurfaceGrid, lat: number, lon: number)
   const northwest = readSurfaceGrid(grid, north, west);
   const northeast = readSurfaceGrid(grid, north, east);
 
-  if (!southwest || !southeast || !northwest || !northeast) return undefined;
+  if (!southwest || !southeast || !northwest || !northeast) {
+    return weightedSurfaceCornerSample(
+      [
+        southwest ? { sample: southwest, x: 0, y: 0 } : undefined,
+        southeast ? { sample: southeast, x: 1, y: 0 } : undefined,
+        northwest ? { sample: northwest, x: 0, y: 1 } : undefined,
+        northeast ? { sample: northeast, x: 1, y: 1 } : undefined
+      ],
+      lonRatio,
+      latRatio
+    );
+  }
 
   const interpolate = (key: keyof Omit<SurfaceSample, "time" | "weatherCode" | "windDirection">, fallback = 0) => {
     const southValue = lerp(southwest[key] ?? fallback, southeast[key] ?? fallback, lonRatio);
@@ -976,6 +1275,48 @@ function interpolatedGridCellSample(grid: SurfaceGrid, lat: number, lon: number)
     precipitationProbability: interpolate("precipitationProbability"),
     pressure: interpolate("pressure"),
     cloudCover: interpolate("cloudCover")
+  };
+}
+
+function weightedSurfaceCornerSample(
+  corners: Array<{ sample: SurfaceSample; x: number; y: number } | undefined>,
+  lonRatio: number,
+  latRatio: number
+): SurfaceSample | undefined {
+  const validCorners = corners.filter((corner): corner is { sample: SurfaceSample; x: number; y: number } => Boolean(corner));
+  if (validCorners.length === 0) return undefined;
+  if (validCorners.length === 1) return validCorners[0].sample;
+
+  const weighted = validCorners.map((corner) => {
+    const distanceSquared = (lonRatio - corner.x) ** 2 + (latRatio - corner.y) ** 2;
+    return { ...corner, weight: 1 / Math.max(0.0001, distanceSquared) };
+  });
+  const nearest = weighted.reduce((best, corner) => (corner.weight > best.weight ? corner : best), weighted[0]);
+  const totalWeight = weighted.reduce((sum, corner) => sum + corner.weight, 0);
+  const mix = (key: keyof Omit<SurfaceSample, "time" | "weatherCode" | "windDirection">) =>
+    weighted.reduce((sum, { sample, weight }) => sum + (sample[key] ?? 0) * weight, 0) / totalWeight;
+  const windVector = weighted.reduce(
+    (vector, { sample, weight }) => {
+      const sampleVector = windDirectionVector(sample.windDirection);
+      return {
+        x: vector.x + sampleVector.x * weight,
+        y: vector.y + sampleVector.y * weight
+      };
+    },
+    { x: 0, y: 0 }
+  );
+
+  return {
+    temperature: mix("temperature"),
+    time: nearest.sample.time,
+    weatherCode: nearest.sample.weatherCode,
+    windSpeed: mix("windSpeed"),
+    windGust: mix("windGust"),
+    windDirection: normalizeBearing((Math.atan2(windVector.x, windVector.y) * 180) / Math.PI),
+    precipitation: mix("precipitation"),
+    precipitationProbability: mix("precipitationProbability"),
+    pressure: mix("pressure"),
+    cloudCover: mix("cloudCover")
   };
 }
 
@@ -1219,7 +1560,8 @@ function makeRainRadarLayer(
   let currentRainViewer = rainViewer;
   let currentFrame = frame;
   let currentSurfaceGrid = makeSurfaceGrid(weatherGrid);
-  let currentSurfaceStations = makeSurfaceStations(liveWeatherPoints);
+  let currentSurfaceDetailGrid = makeSurfaceGrid(surfaceDetailPoints(liveWeatherPoints));
+  let currentSurfaceStations = makeSurfaceStations(surfaceStationPoints(liveWeatherPoints));
   let currentIncludeLocalTime = includeLocalTime;
   let currentUnits = units;
   let currentLanguage = language;
@@ -1276,7 +1618,8 @@ function makeRainRadarLayer(
       currentRainViewer = nextRainViewer;
       currentFrame = nextFrame;
       currentSurfaceGrid = makeSurfaceGrid(nextWeatherGrid);
-      currentSurfaceStations = makeSurfaceStations(nextLiveWeatherPoints);
+      currentSurfaceDetailGrid = makeSurfaceGrid(surfaceDetailPoints(nextLiveWeatherPoints));
+      currentSurfaceStations = makeSurfaceStations(surfaceStationPoints(nextLiveWeatherPoints));
       currentIncludeLocalTime = nextIncludeLocalTime;
       currentUnits = nextUnits;
       currentLanguage = nextLanguage;
@@ -1309,7 +1652,7 @@ function makeRainRadarLayer(
     _moveHover(this: RainRadarLayerInternal, event: L.LeafletMouseEvent) {
       if (!this._weatherMap || !this._tooltip) return;
       const lookup = radarTileLookup(this._weatherMap, currentRainViewer, currentFrame, event.latlng);
-      const surface = interpolatedSurfaceSample(currentSurfaceGrid, event.latlng.lat, event.latlng.lng, currentSurfaceStations);
+      const surface = interpolatedSurfaceSample(currentSurfaceGrid, currentSurfaceDetailGrid, event.latlng.lat, event.latlng.lng, currentSurfaceStations);
       const serial = (this._hoverSerial ?? 0) + 1;
       this._hoverSerial = serial;
       positionHoverReadout(this._weatherMap, event, this._tooltip);
@@ -1592,7 +1935,7 @@ function radarHoverContent(
   const localTimeRow = timestamp !== undefined ? `<span>${text.localTime}</span><b>${localTimeSummary(lat, lon, timestamp)}</b>` : "";
   const temperatureRow = surface?.temperature !== undefined ? `<span>${text.estTemp}</span><b>${formatTemperature(surface.temperature, units.temperatureUnit)}</b>` : "";
   const windRows = surface
-    ? `<span>${text.wind}</span><b>${windReadoutHtml(surface.windSpeed, surface.windDirection, units, language)}</b>`
+    ? `<span>${text.surfaceWind}</span><b>${windReadoutHtml(surface.windSpeed, surface.windDirection, units, language)}</b>`
     : "";
   if (!sample) {
     const title = sample === null ? text.radarUnavailable : text.readingRadar;
@@ -2581,7 +2924,13 @@ function makeOverlapSelectorLayer(getItems: () => OverlapSelectableItem[]) {
       if (!this._weatherMap) return;
       if (Date.now() - (this._lastPopupOpenAt ?? 0) < 120) return;
       const candidates = overlappingItemsAtPoint(this._weatherMap, event.containerPoint, event.latlng.lng, getItems());
-      if (candidates.length < 2) return;
+      if (candidates.length === 0) return;
+      L.DomEvent.stop(event.originalEvent);
+
+      if (candidates.length === 1) {
+        openSelectableItemPopup(this._weatherMap, event.latlng, candidates[0]);
+        return;
+      }
 
       const popup = L.popup(nodePopupOptions("selector-popup"))
         .setLatLng(event.latlng)
@@ -2610,6 +2959,15 @@ function makeOverlapSelectorLayer(getItems: () => OverlapSelectableItem[]) {
   });
 
   return new SelectorLayer();
+}
+
+function openSelectableItemPopup(map: L.Map, latlng: L.LatLng, item: OverlapSelectableItem) {
+  const popup = L.popup(nodePopupOptions(item.popupClass))
+    .setLatLng(latlng)
+    .setContent(item.popupHtml)
+    .openOn(map);
+  window.setTimeout(() => item.bindPopup?.(popup), 0);
+  return popup;
 }
 
 function overlappingItemsAtPoint(map: L.Map, point: L.Point, referenceLongitude: number, items: OverlapSelectableItem[]) {
@@ -2865,6 +3223,13 @@ export function WeatherMap({
   const baseLayerRef = useRef<L.MaplibreGL | null>(null);
   const activeLayerRef = useRef<L.Layer | null>(null);
   const activeLayerKindRef = useRef<PrimaryLayer>("normal");
+  const surfaceLayerInputsRef = useRef<{
+    weatherGrid: WeatherGridPoint[];
+    liveWeatherPoints: WeatherGridPoint[];
+    showDayNight: boolean;
+    unitSettings: UnitSettings;
+    appLanguage: string;
+  } | null>(null);
   const earthquakeLayerRef = useRef<L.Layer | null>(null);
   const warningLayerRef = useRef<L.Layer | null>(null);
   const aviationLayerRef = useRef<L.Layer | null>(null);
@@ -2881,9 +3246,10 @@ export function WeatherMap({
   const selectedRainFrame = useMemo(() => selectedRainViewerFrame(rainViewer, rainFrameTime), [rainViewer, rainFrameTime]);
 
   useEffect(() => {
-    if (!containerRef.current || mapRef.current) return;
+    const container = containerRef.current;
+    if (!container || mapRef.current) return;
 
-    const map = L.map(containerRef.current, {
+    const map = L.map(container, {
       worldCopyJump: true,
       minZoom: 2,
       maxZoom: 9,
@@ -2901,8 +3267,21 @@ export function WeatherMap({
     }).addTo(map);
 
     mapRef.current = map;
+    const invalidateMapSize = () => map.invalidateSize({ pan: false });
+    const launchFrame = window.requestAnimationFrame(invalidateMapSize);
+    const launchTimer = window.setTimeout(invalidateMapSize, 180);
+    const resizeObserver =
+      typeof ResizeObserver !== "undefined"
+        ? new ResizeObserver(() => {
+            invalidateMapSize();
+          })
+        : undefined;
+    resizeObserver?.observe(container);
 
     return () => {
+      window.cancelAnimationFrame(launchFrame);
+      window.clearTimeout(launchTimer);
+      resizeObserver?.disconnect();
       map.remove();
       mapRef.current = null;
     };
@@ -2925,8 +3304,12 @@ export function WeatherMap({
       publishTimer = window.setTimeout(publishBounds, 220);
     };
     publishBounds();
+    const launchFrame = window.requestAnimationFrame(publishBounds);
+    const launchTimer = window.setTimeout(publishBounds, 240);
     map.on("moveend zoomend", schedulePublishBounds);
     return () => {
+      window.cancelAnimationFrame(launchFrame);
+      window.clearTimeout(launchTimer);
       if (publishTimer !== undefined) window.clearTimeout(publishTimer);
       map.off("moveend zoomend", schedulePublishBounds);
     };
@@ -2941,10 +3324,32 @@ export function WeatherMap({
       return;
     }
 
+    if (
+      (activeLayer === "temperature" || activeLayer === "wind") &&
+      activeLayerKindRef.current === activeLayer &&
+      isSurfaceCanvasLayer(activeLayerRef.current)
+    ) {
+      const previousSurfaceInputs = surfaceLayerInputsRef.current;
+      if (
+        previousSurfaceInputs &&
+        previousSurfaceInputs.weatherGrid === weatherGrid &&
+        previousSurfaceInputs.liveWeatherPoints === liveWeatherPoints &&
+        previousSurfaceInputs.showDayNight === showDayNight &&
+        previousSurfaceInputs.unitSettings === unitSettings &&
+        previousSurfaceInputs.appLanguage === appLanguage
+      ) {
+        return;
+      }
+      activeLayerRef.current.updateSurfaceLayer(weatherGrid, liveWeatherPoints, showDayNight, unitSettings, appLanguage);
+      surfaceLayerInputsRef.current = { weatherGrid, liveWeatherPoints, showDayNight, unitSettings, appLanguage };
+      return;
+    }
+
     if (activeLayerRef.current) {
       map.removeLayer(activeLayerRef.current);
       activeLayerRef.current = null;
       activeLayerKindRef.current = "normal";
+      surfaceLayerInputsRef.current = null;
     }
 
     let nextLayer: L.Layer | undefined;
@@ -2973,6 +3378,10 @@ export function WeatherMap({
       nextLayer.addTo(map);
       activeLayerRef.current = nextLayer;
       activeLayerKindRef.current = activeLayer;
+      surfaceLayerInputsRef.current =
+        activeLayer === "temperature" || activeLayer === "wind"
+          ? { weatherGrid, liveWeatherPoints, showDayNight, unitSettings, appLanguage }
+          : null;
     }
   }, [activeLayer, weatherGrid, liveWeatherPoints, rainViewer, selectedRainFrame, earthquakes, riskEvents, showDayNight, unitSettings, appLanguage]);
 

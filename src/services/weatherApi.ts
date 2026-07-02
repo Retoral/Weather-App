@@ -21,7 +21,8 @@ import type { RainUnit, TemperatureUnit, WindUnit } from "../utils/weatherCodes"
 const OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast";
 const OPEN_METEO_GEOCODING = "https://geocoding-api.open-meteo.com/v1/search";
 const OPEN_METEO_AIR = "https://air-quality-api.open-meteo.com/v1/air-quality";
-const USGS_EARTHQUAKES = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.geojson";
+const USGS_EARTHQUAKES = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_week.geojson";
+const USGS_MAJOR_EARTHQUAKES = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_month.geojson";
 const EMSC_EARTHQUAKES = "https://www.seismicportal.eu/fdsnws/event/1/query";
 const GEONET_EARTHQUAKES = "https://api.geonet.org.nz/quake?MMI=-1";
 const BMKG_M5_EARTHQUAKES = "https://data.bmkg.go.id/DataMKG/TEWS/gempaterkini.json";
@@ -48,6 +49,9 @@ const RISK_EVENTS_CACHE_KEY = "weather-watch:risk-events-cache:v3";
 const AIRCRAFT_CACHE_PREFIX = "weather-watch:aircraft-cache:v2";
 const AIRCRAFT_TRACK_CACHE_PREFIX = "weather-watch:aircraft-track-cache:v1";
 const AVIATION_INCIDENTS_CACHE_KEY = "weather-watch:aviation-incidents-cache:v1";
+const EARTHQUAKE_EVENTS_CACHE_KEY = "weather-watch:earthquake-events-cache:v1";
+const WARNING_EVENTS_CACHE_KEY = "weather-watch:warning-events-cache:v1";
+const EVENT_RETENTION_MS = 21 * 24 * 60 * 60 * 1000;
 const WEATHER_GRID_FRESH_MS = 9 * 60 * 1000;
 const WEATHER_GRID_STALE_MS = 8 * 60 * 60 * 1000;
 const RISK_EVENTS_FRESH_MS = 55 * 1000;
@@ -57,16 +61,16 @@ const AIRCRAFT_STALE_MS = 30 * 60 * 1000;
 const AIRCRAFT_TRACK_FRESH_MS = 2 * 60 * 1000;
 const AIRCRAFT_TRACK_STALE_MS = 20 * 60 * 1000;
 const AVIATION_INCIDENTS_FRESH_MS = 10 * 60 * 1000;
-const AVIATION_INCIDENTS_STALE_MS = 8 * 60 * 60 * 1000;
-const EARTHQUAKE_LOOKBACK_MS = 24 * 60 * 60 * 1000;
+const AVIATION_INCIDENTS_STALE_MS = EVENT_RETENTION_MS;
+const EARTHQUAKE_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
 const EARTHQUAKE_PROVIDER_TIMEOUT_MS = 9 * 1000;
 const LOCAL_WEATHER_CACHE_PREFIX = "weather-watch:local-weather-cache";
 const LOCAL_WEATHER_FRESH_MS = 9 * 60 * 1000;
 const LOCAL_WEATHER_STALE_MS = 6 * 60 * 60 * 1000;
-const PROVIDER_COOLDOWN_PREFIX = "weather-watch:provider-cooldown";
+const PROVIDER_COOLDOWN_PREFIX = "weather-watch:provider-cooldown:v3";
 const RATE_LIMIT_COOLDOWN_MS = 10 * 60 * 1000;
 const WEATHER_GRID_PROVIDER = "open-meteo-grid";
-const WEATHER_GRID_FAILURE_COOLDOWN_MS = 30 * 60 * 1000;
+const WEATHER_GRID_FAILURE_COOLDOWN_MS = 90 * 1000;
 const AIRCRAFT_PROVIDER = "opensky-states";
 const AIRCRAFT_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
 const ADSB_LOL_FALLBACK_RADIUS_KM = 350;
@@ -377,7 +381,7 @@ function shouldCooldownProvider(error: unknown) {
   if (error instanceof WeatherRequestError) return error.status === 429 || error.status === 403;
   return error instanceof Error && (
     /\b(?:400|403|429)\b/.test(error.message) ||
-    /forbidden|rate limit|too many requests|daily api request limit|cert_|certificate|ssl|handshake|fetch failed/i.test(error.message)
+    /forbidden|rate limit|too many requests|daily api request limit/i.test(error.message)
   );
 }
 
@@ -502,8 +506,8 @@ function makeGrid(options: { bounds?: AviationBounds; step?: number; maxPoints?:
 
 function makeGlobalGrid(): WeatherGridCoordinate[] {
   const points: WeatherGridCoordinate[] = [];
-  for (let lat = -80; lat <= 80; lat += 10) {
-    for (let lon = -180; lon < 180; lon += 10) {
+  for (let lat = -80; lat <= 80; lat += 20) {
+    for (let lon = -180; lon < 180; lon += 20) {
       points.push({ lat, lon });
     }
   }
@@ -603,7 +607,7 @@ export async function fetchWeatherGridWithMeta(
   }
 
   const grid = makeGrid(options);
-  const batchSize = forecastHourOffset > 0 ? 25 : 120;
+  const batchSize = forecastHourOffset > 0 ? 25 : 100;
   const result: WeatherGridPoint[] = [];
 
   try {
@@ -773,6 +777,39 @@ function writeWeatherGridCache(points: WeatherGridPoint[], forecastHourOffset = 
   }
 }
 
+function readRetainedEvents<T>(cacheKey: string) {
+  try {
+    const raw = localStorage.getItem(cacheKey);
+    if (!raw) return undefined;
+    const cached = JSON.parse(raw) as { fetchedAt: number; events: T[] };
+    if (!Array.isArray(cached.events) || Date.now() - cached.fetchedAt > EVENT_RETENTION_MS) return undefined;
+    return cached;
+  } catch {
+    return undefined;
+  }
+}
+
+function writeRetainedEvents<T>(cacheKey: string, events: T[]) {
+  try {
+    localStorage.setItem(cacheKey, JSON.stringify({ fetchedAt: Date.now(), events }));
+  } catch {
+    // Retained event history is useful, but should never block live updates.
+  }
+}
+
+function retainRecentEvents<T>(
+  events: T[],
+  eventTime: (event: T) => number | undefined,
+  fallbackTime = Date.now()
+) {
+  const now = Date.now();
+  return events.filter((event) => {
+    const time = eventTime(event);
+    const effectiveTime = time !== undefined && Number.isFinite(time) && time > 0 ? time : fallbackTime;
+    return now - effectiveTime <= EVENT_RETENTION_MS;
+  });
+}
+
 export async function fetchAircraftStates(
   bounds?: AviationBounds,
   signal?: AbortSignal,
@@ -799,9 +836,7 @@ export async function fetchAircraftStates(
     const rejected = responses.filter((response) => response.status === "rejected");
     const aircraft = dedupeAircraft(
       responses.flatMap((response) => response.status === "fulfilled" ? parseOpenSkyStates(response.value) : [])
-    )
-      .sort((left, right) => right.lastContact - left.lastContact)
-      .slice(0, 1_200);
+    ).sort((left, right) => right.lastContact - left.lastContact);
 
     if (rejected.length === responses.length || (aircraft.length === 0 && rejected.length > 0)) {
       throw rejected[0]?.reason ?? new Error("Aircraft provider request failed");
@@ -1652,13 +1687,19 @@ export async function fetchAviationIncidents(signal?: AbortSignal, options: { fr
     const exportUrls = gdeltExportUrls(gkgUrl, 12);
     const exports = await Promise.allSettled(exportUrls.map((url) => fetchZipText(url)));
     const fetchedAt = new Date().toISOString();
-    const incidents = dedupeAviationIncidents(
+    const fetchedIncidents = dedupeAviationIncidents(
       exports.flatMap((result, index) =>
         result.status === "fulfilled" ? parseGdeltAviationIncidents(result.value, exportUrls[index], fetchedAt) : []
       )
     )
       .sort((left, right) => right.time - left.time)
       .slice(0, 120);
+    const retainedCache = readAviationIncidentsCache(EVENT_RETENTION_MS);
+    const incidents = retainRecentEvents(
+      dedupeAviationIncidents([...fetchedIncidents, ...(retainedCache?.incidents ?? [])]),
+      (incident) => incident.time,
+      retainedCache?.fetchedAt
+    ).sort((left, right) => right.time - left.time);
 
     writeAviationIncidentsCache(incidents);
     return incidents;
@@ -1675,7 +1716,9 @@ function readAviationIncidentsCache(maxAgeMs: number) {
     if (!raw) return undefined;
     const cached = JSON.parse(raw) as { fetchedAt: number; incidents: AviationIncident[] };
     if (!Array.isArray(cached.incidents) || Date.now() - cached.fetchedAt > maxAgeMs) return undefined;
-    return cached;
+    const incidents = retainRecentEvents(cached.incidents, (incident) => incident.time, cached.fetchedAt)
+      .sort((left, right) => right.time - left.time);
+    return incidents.length > 0 ? { ...cached, incidents } : undefined;
   } catch {
     return undefined;
   }
@@ -1683,7 +1726,10 @@ function readAviationIncidentsCache(maxAgeMs: number) {
 
 function writeAviationIncidentsCache(incidents: AviationIncident[]) {
   try {
-    localStorage.setItem(AVIATION_INCIDENTS_CACHE_KEY, JSON.stringify({ fetchedAt: Date.now(), incidents }));
+    localStorage.setItem(
+      AVIATION_INCIDENTS_CACHE_KEY,
+      JSON.stringify({ fetchedAt: Date.now(), incidents: retainRecentEvents(incidents, (incident) => incident.time) })
+    );
   } catch {
     // Incident reports are useful if cached, but never required.
   }
@@ -2202,6 +2248,8 @@ const earthquakeSourcePriority: Record<string, number> = {
 };
 
 export async function fetchEarthquakes(signal?: AbortSignal): Promise<EarthquakeEvent[]> {
+  const retainedCache = readRetainedEvents<EarthquakeEvent>(EARTHQUAKE_EVENTS_CACHE_KEY);
+  const retainedEvents = retainRecentEvents(retainedCache?.events ?? [], (event) => event.time, retainedCache?.fetchedAt);
   const results = await Promise.allSettled(
     earthquakeProviders.map((provider) =>
       withTimeoutSignal(signal, EARTHQUAKE_PROVIDER_TIMEOUT_MS, (providerSignal) => provider.fetchEvents(providerSignal))
@@ -2210,16 +2258,35 @@ export async function fetchEarthquakes(signal?: AbortSignal): Promise<Earthquake
 
   const events = results.flatMap((result) => result.status === "fulfilled" ? result.value : []);
   if (events.length === 0) {
+    if (retainedEvents.length > 0) return retainedEvents.sort((a, b) => b.time - a.time);
     const failure = results.find((result) => result.status === "rejected");
     throw failure?.status === "rejected" && failure.reason instanceof Error ? failure.reason : new Error("Unable to refresh earthquake feeds");
   }
 
-  return dedupeEarthquakes(events)
-    .filter((event) => Date.now() - event.time <= EARTHQUAKE_LOOKBACK_MS || (event.magnitude ?? 0) >= 5)
+  const retained = retainRecentEvents(
+    dedupeEarthquakes([...events, ...retainedEvents]),
+    (event) => event.time,
+    retainedCache?.fetchedAt
+  )
     .sort((a, b) => b.time - a.time);
+  writeRetainedEvents(EARTHQUAKE_EVENTS_CACHE_KEY, retained);
+  return retained;
 }
 
 async function fetchUsgsEarthquakes(signal?: AbortSignal): Promise<EarthquakeEvent[]> {
+  const [allWeekResult, majorMonthResult] = await Promise.allSettled([
+    fetchUsgsEarthquakeFeed(USGS_EARTHQUAKES, signal),
+    fetchUsgsEarthquakeFeed(USGS_MAJOR_EARTHQUAKES, signal)
+  ]);
+
+  const events = [allWeekResult, majorMonthResult].flatMap((result) => result.status === "fulfilled" ? result.value : []);
+  if (events.length > 0) return events;
+
+  const failure = [allWeekResult, majorMonthResult].find((result) => result.status === "rejected");
+  throw failure?.status === "rejected" && failure.reason instanceof Error ? failure.reason : new Error("Unable to refresh USGS earthquake feed");
+}
+
+async function fetchUsgsEarthquakeFeed(url: string, signal?: AbortSignal): Promise<EarthquakeEvent[]> {
   const data = await fetchJson<{
     features: Array<{
       id: string;
@@ -2238,7 +2305,7 @@ async function fetchUsgsEarthquakes(signal?: AbortSignal): Promise<EarthquakeEve
       };
       geometry: { coordinates: [number, number, number | null] };
     }>;
-  }>(USGS_EARTHQUAKES, signal);
+  }>(url, signal);
 
   return data.features
     .filter((feature) => Array.isArray(feature.geometry.coordinates))
@@ -2266,8 +2333,8 @@ async function fetchUsgsEarthquakes(signal?: AbortSignal): Promise<EarthquakeEve
 async function fetchEmscEarthquakes(signal?: AbortSignal): Promise<EarthquakeEvent[]> {
   const url = new URL(EMSC_EARTHQUAKES);
   url.searchParams.set("format", "json");
-  url.searchParams.set("limit", "160");
-  url.searchParams.set("minmag", "2.5");
+  url.searchParams.set("limit", "500");
+  url.searchParams.set("minmag", "1.0");
   url.searchParams.set("starttime", new Date(Date.now() - EARTHQUAKE_LOOKBACK_MS).toISOString());
 
   const data = await fetchJsonViaText<{
@@ -2426,8 +2493,8 @@ function bmkgEarthquakeRowToEvent(row: BmkgEarthquakeRow): EarthquakeEvent | und
 async function fetchIngvEarthquakes(signal?: AbortSignal): Promise<EarthquakeEvent[]> {
   const url = new URL(INGV_EARTHQUAKES);
   url.searchParams.set("format", "text");
-  url.searchParams.set("limit", "120");
-  url.searchParams.set("minmagnitude", "2.0");
+  url.searchParams.set("limit", "240");
+  url.searchParams.set("minmagnitude", "1.0");
   url.searchParams.set("starttime", new Date(Date.now() - EARTHQUAKE_LOOKBACK_MS).toISOString());
 
   const text = await fetchText(url.toString(), signal);
@@ -2484,7 +2551,7 @@ function parseIngvTextEvents(text: string): EarthquakeEvent[] {
 
 async function fetchTaiwanCwaEarthquakes(signal?: AbortSignal): Promise<EarthquakeEvent[]> {
   const url = new URL(TAIWAN_CWA_EARTHQUAKES);
-  url.searchParams.set("$top", "80");
+  url.searchParams.set("$top", "200");
   url.searchParams.set("$orderby", "@iot.id desc");
   url.searchParams.set("$filter", "substringof('號地震',name)");
   url.searchParams.set("$select", "@iot.id,name,description,properties");
@@ -2730,13 +2797,23 @@ const warningProviders: WarningProvider[] = [
 ];
 
 export async function fetchGdacsAlerts(signal?: AbortSignal): Promise<GdacsAlert[]> {
+  const retainedCache = readRetainedEvents<GdacsAlert>(WARNING_EVENTS_CACHE_KEY);
+  const retainedAlerts = retainRecentEvents(retainedCache?.events ?? [], alertRetentionTime, retainedCache?.fetchedAt);
   const results = await Promise.allSettled(warningProviders.map((provider) => provider.fetchWarnings(signal)));
   const alerts = results.flatMap((result) => result.status === "fulfilled" ? result.value : []);
   const fulfilled = results.some((result) => result.status === "fulfilled");
 
   if (alerts.length > 0 || fulfilled) {
-    return dedupeAlerts(alerts).sort(sortAlertsByDate).slice(0, 1200);
+    const retained = retainRecentEvents(
+      dedupeAlerts([...alerts, ...retainedAlerts]),
+      alertRetentionTime,
+      retainedCache?.fetchedAt
+    ).sort(sortAlertsByDate);
+    writeRetainedEvents(WARNING_EVENTS_CACHE_KEY, retained);
+    return retained;
   }
+
+  if (retainedAlerts.length > 0) return retainedAlerts.sort(sortAlertsByDate);
 
   const reason = results.find((result) => result.status === "rejected")?.reason;
   throw reason instanceof Error ? reason : new Error("Unable to refresh weather warnings");
@@ -2760,6 +2837,13 @@ function alertTime(alert: GdacsAlert) {
   const value = alert.startsAt ?? alert.date ?? alert.endsAt;
   const time = value ? new Date(value).getTime() : 0;
   return Number.isFinite(time) ? time : 0;
+}
+
+function alertRetentionTime(alert: GdacsAlert) {
+  const times = [alert.endsAt, alert.startsAt, alert.date]
+    .map((value) => value ? new Date(value).getTime() : NaN)
+    .filter((time) => Number.isFinite(time));
+  return times.length > 0 ? Math.max(...times) : undefined;
 }
 
 async function fetchGdacsRssAlerts(signal?: AbortSignal): Promise<GdacsAlert[]> {

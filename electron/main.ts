@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, shell } from "electron";
+import { app, BrowserWindow, ipcMain, Menu, shell } from "electron";
 import path from "node:path";
 import zlib from "node:zlib";
 
@@ -17,6 +17,7 @@ function createWindow() {
     height: 940,
     minWidth: 1024,
     minHeight: 720,
+    autoHideMenuBar: true,
     backgroundColor: "#0e1726",
     title: "Weather Watch",
     webPreferences: {
@@ -25,6 +26,7 @@ function createWindow() {
       nodeIntegration: false
     }
   });
+  window.setMenuBarVisibility(false);
 
   window.webContents.setWindowOpenHandler(({ url }) => {
     void shell.openExternal(url);
@@ -39,6 +41,8 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  Menu.setApplicationMenu(null);
+
   ipcMain.handle("fetch-text", async (_event, url: string) => {
     try {
       const response = await fetchWithTimeout(url, "application/json,text/plain,*/*");

@@ -74,6 +74,7 @@ const MAP_LANGUAGE_KEY = "weather-watch:map-language";
 const APP_LANGUAGE_KEY = "weather-watch:app-language";
 const VIEW_SETTINGS_KEY = "weather-watch:view-settings:v1";
 const TRACKED_AIRCRAFT_KEY = "weather-watch:tracked-aircraft:v1";
+const AIRCRAFT_LIMIT_OPTIONS = [150, 400, 800, 1200, 0] as const;
 const LIVE_REFRESH_MS = {
   earthquakes: 60 * 1000,
   radar: 10 * 60 * 1000,
@@ -81,7 +82,6 @@ const LIVE_REFRESH_MS = {
   aircraft: 60 * 1000,
   aviationIncidents: 10 * 60 * 1000,
   warnings: 60 * 1000,
-  globalWeather: 10 * 60 * 1000,
   localWeather: 10 * 60 * 1000,
   localWeatherFresh: 9 * 60 * 1000,
   dayNight: 60 * 1000,
@@ -274,8 +274,8 @@ const appCopy = {
     strong: "Strong",
     strongest: "Strongest",
     seismicActivity: "Seismic movement",
-    seismicLegendNote: "Observed multi-source M2.5+ earthquakes from the past day. Glow size scales with magnitude and fades as events age.",
-    seismicMild: "Recent M2.5+",
+    seismicLegendNote: "Observed multi-source earthquakes from the past week, plus recent M4.5+ events. Glow size scales with magnitude and fades as events age.",
+    seismicMild: "Recent quakes",
     seismicSevere: "M5+ strong",
     timeZones: "Time zones",
     tsunamiAlert: "Tsunami/alert",
@@ -373,8 +373,8 @@ const appCopy = {
     strong: "Starka",
     strongest: "Starkast",
     seismicActivity: "Seismisk rörelse",
-    seismicLegendNote: "Observerade M2.5+-skalv från flera källor det senaste dygnet. Glödens storlek följer magnitud och bleknar med ålder.",
-    seismicMild: "Nyliga M2.5+",
+    seismicLegendNote: "Observerade skalv från flera källor den senaste veckan, plus nyliga M4.5+-händelser. Glödens storlek följer magnitud och bleknar med ålder.",
+    seismicMild: "Nyliga skalv",
     seismicSevere: "M5+ starka",
     timeZones: "Tidszoner",
     tsunamiAlert: "Tsunami/varning",
@@ -472,8 +472,8 @@ const appCopy = {
     strong: "Stark",
     strongest: "Stärkstes",
     seismicActivity: "Seismische Bewegung",
-    seismicLegendNote: "Beobachtete M2.5+-Erdbeben aus mehreren Quellen der letzten 24 Stunden. Die Leuchtgröße folgt der Magnitude und verblasst mit dem Alter.",
-    seismicMild: "Aktuelle M2.5+",
+    seismicLegendNote: "Beobachtete Erdbeben aus mehreren Quellen der letzten Woche plus aktuelle M4.5+-Ereignisse. Die Leuchtgröße folgt der Magnitude und verblasst mit dem Alter.",
+    seismicMild: "Aktuelle Beben",
     seismicSevere: "M5+ stark",
     timeZones: "Zeitzonen",
     tsunamiAlert: "Tsunami/Warnung",
@@ -571,8 +571,8 @@ const appCopy = {
     strong: "Forts",
     strongest: "Plus fort",
     seismicActivity: "Mouvement sismique",
-    seismicLegendNote: "Séismes M2.5+ observés via plusieurs sources sur les dernières 24 heures. La taille de la lueur suit la magnitude et s'estompe avec l'âge.",
-    seismicMild: "M2.5+ récents",
+    seismicLegendNote: "Séismes observés via plusieurs sources sur la dernière semaine, plus événements M4.5+ récents. La taille de la lueur suit la magnitude et s'estompe avec l'âge.",
+    seismicMild: "Séismes récents",
     seismicSevere: "M5+ forts",
     timeZones: "Fuseaux horaires",
     tsunamiAlert: "Tsunami/alerte",
@@ -670,8 +670,8 @@ const appCopy = {
     strong: "Fuertes",
     strongest: "Más fuerte",
     seismicActivity: "Movimiento sísmico",
-    seismicLegendNote: "Terremotos M2.5+ observados desde varias fuentes durante el último día. El brillo escala con la magnitud y se desvanece con la antigüedad.",
-    seismicMild: "M2.5+ recientes",
+    seismicLegendNote: "Terremotos observados desde varias fuentes durante la última semana, más eventos M4.5+ recientes. El brillo escala con la magnitud y se desvanece con la antigüedad.",
+    seismicMild: "Sismos recientes",
     seismicSevere: "M5+ fuertes",
     timeZones: "Zonas horarias",
     tsunamiAlert: "Tsunami/alerta",
@@ -769,8 +769,8 @@ const appCopy = {
     strong: "Forti",
     strongest: "Più forte",
     seismicActivity: "Movimento sismico",
-    seismicLegendNote: "Terremoti M2.5+ osservati da più fonti nell'ultimo giorno. La dimensione dell'alone segue la magnitudo e svanisce con il tempo.",
-    seismicMild: "M2.5+ recenti",
+    seismicLegendNote: "Terremoti osservati da più fonti nell'ultima settimana, più eventi M4.5+ recenti. La dimensione dell'alone segue la magnitudo e svanisce con il tempo.",
+    seismicMild: "Scosse recenti",
     seismicSevere: "M5+ forti",
     timeZones: "Fusi orari",
     tsunamiAlert: "Tsunami/allerta",
@@ -868,8 +868,8 @@ const appCopy = {
     strong: "強い",
     strongest: "最大",
     seismicActivity: "地震活動",
-    seismicLegendNote: "過去1日に複数ソースで観測されたM2.5以上の地震。光の大きさはマグニチュードに比例し、時間とともに薄くなります。",
-    seismicMild: "最近のM2.5+",
+    seismicLegendNote: "過去1週間に複数ソースで観測された地震と、最近のM4.5以上の地震。光の大きさはマグニチュードに比例し、時間とともに薄くなります。",
+    seismicMild: "最近の地震",
     seismicSevere: "M5+ 強い",
     timeZones: "タイムゾーン",
     tsunamiAlert: "津波/警報",
@@ -967,8 +967,8 @@ const appCopy = {
     strong: "强震",
     strongest: "最强",
     seismicActivity: "地震活动",
-    seismicLegendNote: "过去一天多个来源观测到的 M2.5+ 地震。光晕大小随震级变化，并会随时间淡出。",
-    seismicMild: "近期 M2.5+",
+    seismicLegendNote: "过去一周多个来源观测到的地震，以及近期 M4.5+ 事件。光晕大小随震级变化，并会随时间淡出。",
+    seismicMild: "近期地震",
     seismicSevere: "M5+ 强震",
     timeZones: "时区",
     tsunamiAlert: "海啸/警报",
@@ -1186,7 +1186,9 @@ function loadSavedViewSettings(): SavedViewSettings {
       showAircraftLocations: typeof saved.showAircraftLocations === "boolean" ? saved.showAircraftLocations : undefined,
       showAircraftTrails: typeof saved.showAircraftTrails === "boolean" ? saved.showAircraftTrails : undefined,
       showAviationIncidents: typeof saved.showAviationIncidents === "boolean" ? saved.showAviationIncidents : undefined,
-      aircraftLimit: [50, 150, 400].includes(Number(saved.aircraftLimit)) ? Number(saved.aircraftLimit) : undefined,
+      aircraftLimit: AIRCRAFT_LIMIT_OPTIONS.includes(Number(saved.aircraftLimit) as (typeof AIRCRAFT_LIMIT_OPTIONS)[number])
+        ? Number(saved.aircraftLimit)
+        : undefined,
       aircraftOriginCountry: typeof saved.aircraftOriginCountry === "string" ? saved.aircraftOriginCountry : undefined,
       aircraftSearchQuery: typeof saved.aircraftSearchQuery === "string" ? saved.aircraftSearchQuery.slice(0, 80) : undefined,
       hideUntrackedAircraft: typeof saved.hideUntrackedAircraft === "boolean" ? saved.hideUntrackedAircraft : undefined,
@@ -1597,6 +1599,16 @@ function viewportWeatherPointLimit(bounds: AviationBounds | undefined, highResol
   return 380;
 }
 
+function viewportWeatherBoundsKey(bounds: AviationBounds | undefined) {
+  if (!bounds) return "global";
+  return [
+    bounds.south.toFixed(2),
+    bounds.west.toFixed(2),
+    bounds.north.toFixed(2),
+    bounds.east.toFixed(2)
+  ].join(":");
+}
+
 function plusRateLabel(amount: number, unit: RainUnit) {
   const [value, suffix] = formatRainRate(amount, unit).split(" ");
   return suffix ? `${value}+ ${suffix}` : `${value}+`;
@@ -1619,7 +1631,7 @@ export function App() {
   const [showAircraftLocations, setShowAircraftLocations] = useState(savedViewSettings.showAircraftLocations ?? savedTrackedAircraft.ids.length > 0);
   const [showAircraftTrails, setShowAircraftTrails] = useState(savedViewSettings.showAircraftTrails ?? savedTrackedAircraft.ids.length > 0);
   const [showAviationIncidents, setShowAviationIncidents] = useState(savedViewSettings.showAviationIncidents ?? false);
-  const [aircraftLimit, setAircraftLimit] = useState(savedViewSettings.aircraftLimit ?? 150);
+  const [aircraftLimit, setAircraftLimit] = useState(savedViewSettings.aircraftLimit ?? 800);
   const [aircraftOriginCountry, setAircraftOriginCountry] = useState(savedViewSettings.aircraftOriginCountry ?? "any");
   const [aircraftSearchQuery, setAircraftSearchQuery] = useState(savedViewSettings.aircraftSearchQuery ?? "");
   const [trackedAircraftIds, setTrackedAircraftIds] = useState<string[]>(savedTrackedAircraft.ids);
@@ -1672,7 +1684,9 @@ export function App() {
   const notifiedSignals = useRef<Set<string>>(new Set());
   const notifiedAircraftWarnings = useRef<Set<string>>(new Set());
   const aircraftTrackAttemptedAt = useRef<Record<string, number>>({});
+  const activeLayerStateRef = useRef<PrimaryLayer>(activeLayer);
   const aviationBoundsRef = useRef<AviationBounds | undefined>();
+  const pendingWeatherRefresh = useRef(false);
   const pendingAircraftRefresh = useRef(false);
   const mapViewMenuRef = useRef<HTMLDivElement | null>(null);
   const refreshInFlight = useRef({ weatherGrid: false, earthquakes: false, radar: false, warnings: false, risk: false, aircraft: false, aviationIncidents: false });
@@ -1718,6 +1732,7 @@ export function App() {
   const aircraftById = useMemo(() => new Map(aircraft.map((plane) => [plane.id, plane])), [aircraft]);
   const visibleAircraft = useMemo(() => {
     const tracked = new Set(trackedAircraftIds);
+    const renderLimit = aircraftLimit === 0 ? Number.POSITIVE_INFINITY : aircraftLimit;
     const trackedPlanes = trackedAircraftIds
       .map((id) => aircraftById.get(id) ?? trackedAircraftSnapshots[id])
       .filter((plane): plane is AircraftState => Boolean(plane));
@@ -1728,7 +1743,7 @@ export function App() {
       .filter((plane) => aircraftOriginCountry === "any" || plane.originCountry === aircraftOriginCountry)
       .filter((plane) => aircraftMatchesSearch(plane, aircraftSearchQuery))
       .sort((left, right) => aircraftDisplayScore(right) - aircraftDisplayScore(left))
-      .slice(0, Math.max(0, aircraftLimit - trackedPlanes.length));
+      .slice(0, Math.max(0, renderLimit - trackedPlanes.length));
     return [...trackedPlanes, ...otherPlanes].map(aircraftWithStatus);
   }, [aircraft, aircraftById, aircraftLimit, aircraftOriginCountry, aircraftSearchQuery, hideUntrackedAircraft, trackedAircraftIds, trackedAircraftSnapshots]);
   const aircraftOriginOptions = useMemo(
@@ -1817,35 +1832,48 @@ export function App() {
   }
 
   useEffect(() => {
+    activeLayerStateRef.current = activeLayer;
+  }, [activeLayer]);
+
+  useEffect(() => {
     aviationBoundsRef.current = aviationBounds;
   }, [aviationBounds]);
 
   async function refreshWeatherGrid(focused = false, force = false) {
-    if (refreshInFlight.current.weatherGrid) return;
+    if (refreshInFlight.current.weatherGrid) {
+      if (focused) pendingWeatherRefresh.current = true;
+      return;
+    }
     refreshInFlight.current.weatherGrid = true;
     try {
+      const currentLayer = activeLayerStateRef.current;
+      const currentBounds = aviationBoundsRef.current;
+      const requestBoundsKey = viewportWeatherBoundsKey(currentBounds);
       const freshMs = force ? 0 : focused ? LIVE_REFRESH_MS.activeWeatherFresh : LIVE_REFRESH_MS.backgroundWeatherFresh;
-      const highResolutionWeatherLayer = activeLayer === "wind";
-      const viewportStep = focused ? viewportWeatherStep(aviationBounds, highResolutionWeatherLayer) : undefined;
-      const viewportMaxPoints = focused ? viewportWeatherPointLimit(aviationBounds, highResolutionWeatherLayer) : undefined;
+      const highResolutionWeatherLayer = currentLayer === "temperature" || currentLayer === "wind";
+      const viewportStep = focused ? viewportWeatherStep(currentBounds, highResolutionWeatherLayer) : undefined;
+      const viewportMaxPoints = focused ? viewportWeatherPointLimit(currentBounds, highResolutionWeatherLayer) : undefined;
       const cachedGlobalGrid = getCachedWeatherGrid();
       if (cachedGlobalGrid?.length) setWeatherGrid((current) => current.length > 0 ? current : cachedGlobalGrid);
-      if (focused && aviationBounds && viewportStep) {
+      if (focused && currentBounds && viewportStep) {
         const cachedViewportGrid = getCachedWeatherGrid({
-          bounds: aviationBounds,
+          bounds: currentBounds,
           step: viewportStep,
           maxPoints: viewportMaxPoints
         });
-        if (cachedViewportGrid?.length) setViewportWeatherGrid((current) => current.length > 0 ? current : cachedViewportGrid);
+        setViewportWeatherGrid(cachedViewportGrid?.length ? cachedViewportGrid : []);
       }
 
-      const globalRequest = fetchWeatherGridWithMeta(undefined, {
-        freshMs
-      });
-      const viewportRequest = focused && aviationBounds && viewportStep
+      const shouldFetchGlobalWeather = !focused || !currentBounds || !viewportStep;
+      const globalRequest = shouldFetchGlobalWeather
+        ? fetchWeatherGridWithMeta(undefined, {
+            freshMs
+          })
+        : undefined;
+      const viewportRequest = focused && currentBounds && viewportStep
         ? fetchWeatherGridWithMeta(undefined, {
             freshMs,
-            bounds: aviationBounds,
+            bounds: currentBounds,
             step: viewportStep,
             maxPoints: viewportMaxPoints
           })
@@ -1860,17 +1888,33 @@ export function App() {
         setWeatherGrid(globalResult.value.points);
         setWeatherGridError(undefined);
       }
-      if (viewportResult.status === "fulfilled" && viewportResult.value?.points.length) {
+      if (
+        viewportResult.status === "fulfilled" &&
+        viewportResult.value?.points.length &&
+        requestBoundsKey === viewportWeatherBoundsKey(aviationBoundsRef.current)
+      ) {
         setViewportWeatherGrid(viewportResult.value.points);
         setWeatherGridError(undefined);
       }
 
-      if (globalResult.status === "rejected" && viewportResult.status === "rejected") {
+      const viewportAttempted = Boolean(viewportRequest);
+      const globalAttempted = Boolean(globalRequest);
+      if (
+        globalAttempted &&
+        globalResult.status === "rejected" &&
+        (!viewportAttempted || viewportResult.status === "rejected")
+      ) {
         setWeatherGridError(globalResult.reason instanceof Error ? globalResult.reason.message : "Unable to refresh weather forecast");
         throw globalResult.reason;
       }
+      if (!globalAttempted && viewportAttempted && viewportResult.status === "rejected") {
+        setWeatherGridError(viewportResult.reason instanceof Error ? viewportResult.reason.message : "Unable to refresh weather forecast");
+        throw viewportResult.reason;
+      }
 
-      const weatherChecked = globalResult.status === "fulfilled" || viewportResult.status === "fulfilled";
+      const weatherChecked =
+        globalResult.status === "fulfilled" && globalResult.value !== undefined ||
+        viewportResult.status === "fulfilled" && viewportResult.value !== undefined;
       const weatherDataFresh =
         globalResult.status === "fulfilled" && globalResult.value !== undefined && !globalResult.value.fromCache ||
         viewportResult.status === "fulfilled" && viewportResult.value !== undefined && !viewportResult.value.fromCache;
@@ -1880,6 +1924,10 @@ export function App() {
       // Keep the last successful global weather layer visible.
     } finally {
       refreshInFlight.current.weatherGrid = false;
+      if (pendingWeatherRefresh.current) {
+        pendingWeatherRefresh.current = false;
+        window.setTimeout(() => void refreshWeatherGrid(true), 0);
+      }
     }
   }
 
@@ -2018,21 +2066,16 @@ export function App() {
     setLoading((state) => ({ ...state, global: true }));
     setError(undefined);
     try {
-      const [gridResult, quakeResult, rainResult, gdacsResult, riskResult] = await Promise.allSettled([
-        fetchWeatherGridWithMeta(undefined, { freshMs: force ? 0 : LIVE_REFRESH_MS.backgroundWeatherFresh }),
+      const cachedGlobalGrid = getCachedWeatherGrid();
+      if (cachedGlobalGrid?.length) setWeatherGrid((current) => current.length > 0 ? current : cachedGlobalGrid);
+
+      const [quakeResult, rainResult, gdacsResult, riskResult] = await Promise.allSettled([
         fetchEarthquakes(),
         fetchRainViewer(),
         fetchGdacsAlerts().catch(() => [] as GdacsAlert[]),
         fetchRiskEvents(undefined, { freshMs: force ? 0 : LIVE_REFRESH_MS.risk }).catch(() => [] as RiskSignalEvent[])
       ]);
 
-      if (gridResult.status === "fulfilled") {
-        setWeatherGrid(gridResult.value.points);
-        setWeatherGridError(undefined);
-        markLiveRefresh("weather", !gridResult.value.fromCache);
-      } else {
-        setWeatherGridError(gridResult.reason instanceof Error ? gridResult.reason.message : "Unable to refresh weather forecast");
-      }
       if (quakeResult.status === "fulfilled") {
         setEarthquakes(quakeResult.value);
         markLiveRefresh("earthquakes");
@@ -2052,8 +2095,8 @@ export function App() {
         markLiveRefresh("risk");
       }
 
-      const failedFeeds = [gridResult, quakeResult, rainResult, gdacsResult, riskResult].filter((result) => result.status === "rejected").length;
-      if (failedFeeds === 5) {
+      const failedFeeds = [quakeResult, rainResult, gdacsResult, riskResult].filter((result) => result.status === "rejected").length;
+      if (failedFeeds === 4) {
         setError("Unable to refresh live map feeds right now");
       }
       if (showAircraftLocations || showAircraftTrails) void refreshAircraftFeed(true);
@@ -2109,14 +2152,12 @@ export function App() {
 
   useEffect(() => {
     void refreshGlobal(true);
-    const weatherInterval = window.setInterval(() => void refreshWeatherGrid(), LIVE_REFRESH_MS.globalWeather);
     const quakeInterval = window.setInterval(() => void refreshEarthquakeFeed(), LIVE_REFRESH_MS.earthquakes);
     const radarInterval = window.setInterval(() => void refreshRadarFeed(), LIVE_REFRESH_MS.radar);
     const warningInterval = window.setInterval(() => void refreshWarningFeed(), LIVE_REFRESH_MS.warnings);
     const riskInterval = window.setInterval(() => void refreshRiskFeed(), LIVE_REFRESH_MS.risk);
 
     return () => {
-      window.clearInterval(weatherInterval);
       window.clearInterval(quakeInterval);
       window.clearInterval(radarInterval);
       window.clearInterval(warningInterval);
@@ -2195,6 +2236,12 @@ export function App() {
       timers.forEach((timer) => window.clearInterval(timer));
     };
   }, [activeLayer, showEarthquakes, showWarnings, showAircraftLocations, showAircraftTrails, showAviationIncidents, trackedAircraftIds.join(",")]);
+
+  useEffect(() => {
+    if (activeLayer !== "temperature" && activeLayer !== "wind" && activeLayer !== "radar") return;
+    const timer = window.setTimeout(() => void refreshWeatherGrid(true), 350);
+    return () => window.clearTimeout(timer);
+  }, [activeLayer, aviationBounds]);
 
   useEffect(() => {
     if (!showAircraftLocations && !showAircraftTrails) return;
@@ -2758,11 +2805,13 @@ export function App() {
                 </label>
                 <label className="settings-select compact-select">
                   <span className="settings-select-label">{copy.aircraftDensity}</span>
-                  <span className="select-value">{aircraftLimit}</span>
+                  <span className="select-value">{aircraftLimit === 0 ? copy.all : aircraftLimit}</span>
                   <select value={aircraftLimit} onChange={(event) => setAircraftLimit(Number(event.target.value))} aria-label={copy.aircraftDensity}>
-                    <option value={50}>50</option>
                     <option value={150}>150</option>
                     <option value={400}>400</option>
+                    <option value={800}>800</option>
+                    <option value={1200}>1200</option>
+                    <option value={0}>{copy.all}</option>
                   </select>
                   <ChevronDown size={15} />
                 </label>
