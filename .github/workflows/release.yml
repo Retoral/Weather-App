@@ -1,4 +1,4 @@
-name: Release Desktop Apps
+name: Release Apps
 
 on:
   push:
@@ -48,7 +48,7 @@ jobs:
           cache: npm
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install
 
       - name: Assess macOS release credentials
         id: mac_credentials
@@ -163,9 +163,74 @@ jobs:
             release/macos-signing-required.txt
           if-no-files-found: error
 
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build web app
+        run: npm run build
+
+      - name: Generate Android project
+        run: npx cap add android
+
+      - name: Sync Android project
+        run: npx cap sync android
+
+      - name: Build Android APK
+        shell: bash
+        run: |
+          cd android
+          ./gradlew assembleDebug
+
+      - name: Prepare Android artifact
+        shell: bash
+        run: |
+          TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          mkdir -p release
+          cp android/app/build/outputs/apk/debug/app-debug.apk "release/Weather-Watch-${TAG}-android-debug.apk"
+          cat > release/android-apk-note.txt <<'EOF'
+          Android APK status:
+
+          This release includes a debug-signed Android APK for sideload testing.
+          A production Android release should be signed with a dedicated upload/release keystore.
+          EOF
+          sed -i 's/^          //' release/android-apk-note.txt
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: weather-watch-android
+          path: |
+            release/*.apk
+            release/android-apk-note.txt
+          if-no-files-found: error
+
   release:
     name: Publish GitHub Release
-    needs: build
+    needs:
+      - build
+      - build-android
     runs-on: ubuntu-latest
 
     steps:
@@ -181,11 +246,15 @@ jobs:
           {
             echo "Weather Watch ${TAG}"
             echo
-            echo "Desktop packages produced by GitHub Actions."
+            echo "Desktop packages and Android APK produced by GitHub Actions."
             if find artifacts -name macos-signing-required.txt -print -quit | grep -q .; then
               echo
               echo "macOS package status:"
               cat "$(find artifacts -name macos-signing-required.txt -print -quit)"
+            fi
+            if find artifacts -name android-apk-note.txt -print -quit | grep -q .; then
+              echo
+              cat "$(find artifacts -name android-apk-note.txt -print -quit)"
             fi
           } > RELEASE_NOTES.md
 
