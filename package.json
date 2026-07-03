@@ -1,6 +1,6 @@
 {
   "name": "weather-watch-desktop",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "description": "Cross-platform live global weather, warning, and earthquake map.",
   "main": "dist-electron/main.js",
   "author": {
