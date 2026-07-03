@@ -59,6 +59,7 @@ export interface LocalSignal {
   title: string;
   detail: string;
   severity: Severity;
+  sourceUrl?: string;
 }
 
 export interface WeatherGridPoint {

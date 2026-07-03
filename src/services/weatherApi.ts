@@ -53,7 +53,7 @@ const EARTHQUAKE_EVENTS_CACHE_KEY = "weather-watch:earthquake-events-cache:v1";
 const WARNING_EVENTS_CACHE_KEY = "weather-watch:warning-events-cache:v2";
 const EVENT_RETENTION_MS = 21 * 24 * 60 * 60 * 1000;
 const WEATHER_GRID_FRESH_MS = 9 * 60 * 1000;
-const WEATHER_GRID_STALE_MS = 8 * 60 * 60 * 1000;
+const WEATHER_GRID_STALE_MS = 7 * 24 * 60 * 60 * 1000;
 const RISK_EVENTS_FRESH_MS = 55 * 1000;
 const RISK_EVENTS_STALE_MS = 45 * 60 * 1000;
 const AIRCRAFT_FRESH_MS = 55 * 1000;
@@ -71,6 +71,7 @@ const PROVIDER_COOLDOWN_PREFIX = "weather-watch:provider-cooldown:v3";
 const RATE_LIMIT_COOLDOWN_MS = 10 * 60 * 1000;
 const WEATHER_GRID_PROVIDER = "open-meteo-grid";
 const WEATHER_GRID_FAILURE_COOLDOWN_MS = 90 * 1000;
+const MET_NORWAY_GRID_FALLBACK_LIMIT = 48;
 const AIRCRAFT_PROVIDER = "opensky-states";
 const AIRCRAFT_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
 const ADSB_LOL_FALLBACK_RADIUS_KM = 350;
@@ -411,6 +412,8 @@ interface MetNorwayForecast {
   };
 }
 
+type MetNorwayTimeseriesRow = NonNullable<NonNullable<MetNorwayForecast["properties"]>["timeseries"]>[number];
+
 async function fetchMetNorwayLocalWeather(location: CityLocation, signal?: AbortSignal): Promise<LocalWeather> {
   const url = new URL("https://api.met.no/weatherapi/locationforecast/2.0/compact");
   url.searchParams.set("lat", location.latitude.toFixed(4));
@@ -514,6 +517,20 @@ function makeGlobalGrid(): WeatherGridCoordinate[] {
   return points;
 }
 
+function makeMetNorwayFallbackGrid(options: { bounds?: AviationBounds; step?: number; maxPoints?: number } = {}) {
+  if (options.bounds) {
+    return makeBoundedGrid(options.bounds, Math.max(5, options.step ?? 5), Math.min(options.maxPoints ?? MET_NORWAY_GRID_FALLBACK_LIMIT, MET_NORWAY_GRID_FALLBACK_LIMIT));
+  }
+
+  const points: WeatherGridCoordinate[] = [];
+  for (let lat = -80; lat <= 80; lat += 40) {
+    for (let lon = -180; lon < 180; lon += 40) {
+      points.push({ lat, lon });
+    }
+  }
+  return points;
+}
+
 function makeBoundedGrid(bounds: AviationBounds, requestedStep: number, maxPoints: number): WeatherGridCoordinate[] {
   const normalized = normalizedWeatherBounds(bounds);
   if (!normalized) return makeGlobalGrid();
@@ -600,6 +617,16 @@ export async function fetchWeatherGridWithMeta(
         points: staleCache,
         fromCache: true,
         stale: true,
+        fetchedAt: Date.now()
+      };
+    }
+    const fallback = await fetchMetNorwayWeatherGridFallback(options, forecastHourOffset, signal);
+    if (fallback.length) {
+      writeWeatherGridCache(fallback, forecastHourOffset, options);
+      return {
+        points: fallback,
+        fromCache: false,
+        stale: false,
         fetchedAt: Date.now()
       };
     }
@@ -704,8 +731,71 @@ export async function fetchWeatherGridWithMeta(
         fetchedAt: Date.now()
       };
     }
+    const fallback = await fetchMetNorwayWeatherGridFallback(options, forecastHourOffset, signal).catch(() => []);
+    if (fallback.length) {
+      writeWeatherGridCache(fallback, forecastHourOffset, options);
+      return {
+        points: fallback,
+        fromCache: false,
+        stale: false,
+        fetchedAt: Date.now()
+      };
+    }
     throw err;
   }
+}
+
+async function fetchMetNorwayWeatherGridFallback(
+  options: { bounds?: AviationBounds; step?: number; maxPoints?: number } = {},
+  forecastHourOffset = 0,
+  signal?: AbortSignal
+) {
+  const grid = makeMetNorwayFallbackGrid(options).slice(0, MET_NORWAY_GRID_FALLBACK_LIMIT);
+  const points: WeatherGridPoint[] = [];
+  const batchSize = 6;
+  for (let index = 0; index < grid.length; index += batchSize) {
+    const settled = await Promise.allSettled(
+      grid.slice(index, index + batchSize).map((coordinate) => fetchMetNorwayGridPoint(coordinate, forecastHourOffset, signal))
+    );
+    points.push(...settled.flatMap((result) => result.status === "fulfilled" ? [result.value] : []));
+  }
+  return points;
+}
+
+async function fetchMetNorwayGridPoint(coordinate: WeatherGridCoordinate, forecastHourOffset: number, signal?: AbortSignal): Promise<WeatherGridPoint> {
+  const url = new URL("https://api.met.no/weatherapi/locationforecast/2.0/compact");
+  url.searchParams.set("lat", coordinate.lat.toFixed(4));
+  url.searchParams.set("lon", coordinate.lon.toFixed(4));
+
+  const data = JSON.parse(await fetchText(url.toString(), signal, { preferBrowser: true })) as MetNorwayForecast;
+  const rows = data.properties?.timeseries ?? [];
+  const target = Date.now() + forecastHourOffset * 60 * 60 * 1000;
+  const row = rows.reduce<{ row?: MetNorwayTimeseriesRow; distance: number }>(
+    (best, candidate) => {
+      const parsed = Date.parse(candidate.time);
+      const distance = Number.isFinite(parsed) ? Math.abs(parsed - target) : Number.POSITIVE_INFINITY;
+      return distance < best.distance ? { row: candidate, distance } : best;
+    },
+    { distance: Number.POSITIVE_INFINITY }
+  ).row;
+  const details = row?.data?.instant?.details;
+  if (!row || !details) throw new Error("Unable to refresh fallback weather grid");
+
+  const weatherCode = symbolCodeToWeatherCode(row.data?.next_1_hours?.summary?.symbol_code);
+  return {
+    id: `met-no:${coordinate.lat}:${coordinate.lon}:${forecastHourOffset}`,
+    lat: coordinate.lat,
+    lon: coordinate.lon,
+    time: row.time,
+    temperature: details.air_temperature ?? 0,
+    weatherCode,
+    windSpeed: msToKmh(details.wind_speed),
+    windGust: msToKmh(details.wind_speed_of_gust ?? details.wind_speed),
+    windDirection: details.wind_from_direction ?? 0,
+    precipitation: row.data?.next_1_hours?.details?.precipitation_amount ?? 0,
+    pressure: details.air_pressure_at_sea_level ?? 0,
+    cloudCover: details.cloud_area_fraction ?? 0
+  };
 }
 
 export async function fetchWeatherGrid(

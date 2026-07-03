@@ -71,6 +71,15 @@ app.whenReady().then(() => {
     }
   });
 
+  ipcMain.handle("open-external", async (_event, url: string) => {
+    if (!isSafeExternalUrl(url)) {
+      return { ok: false, error: "Only http and https links can be opened" };
+    }
+
+    await shell.openExternal(url);
+    return { ok: true };
+  });
+
   createWindow();
 
   app.on("activate", () => {
@@ -91,6 +100,14 @@ async function fetchWithTimeout(url: string, accept: string) {
     });
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+function isSafeExternalUrl(url: string) {
+  try {
+    return ["http:", "https:"].includes(new URL(url).protocol);
+  } catch {
+    return false;
   }
 }
 

@@ -6,6 +6,8 @@ import {
   ChevronDown,
   CloudRain,
   Clock3,
+  Download,
+  ExternalLink,
   Globe2,
   Home,
   LocateFixed,
@@ -73,6 +75,9 @@ const MAP_LANGUAGE_KEY = "weather-watch:map-language";
 const APP_LANGUAGE_KEY = "weather-watch:app-language";
 const VIEW_SETTINGS_KEY = "weather-watch:view-settings:v1";
 const TRACKED_AIRCRAFT_KEY = "weather-watch:tracked-aircraft:v1";
+const LATEST_RELEASE_URL = "https://api.github.com/repos/Retoral/Weather-App/releases/latest";
+const RELEASES_PAGE_URL = "https://github.com/Retoral/Weather-App/releases";
+const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const AIRCRAFT_LIMIT_OPTIONS = [150, 400, 800, 1200, 0] as const;
 const LIVE_REFRESH_MS = {
   earthquakes: 60 * 1000,
@@ -172,6 +177,9 @@ const appLanguages = [
 
 type AppLanguage = (typeof appLanguages)[number]["id"];
 type FeedKey = "weather" | "radar" | "earthquakes" | "warnings" | "risk" | "aircraft" | "aviation";
+type UpdateCheckState =
+  | { status: "idle" | "checking" | "current" | "error"; checkedAt?: number; error?: string }
+  | { status: "available"; latestVersion: string; url: string; checkedAt: number };
 
 const temperatureUnitOptions: Array<{ id: TemperatureUnit; label: string }> = [
   { id: "celsius", label: "Celsius (°C)" },
@@ -1109,6 +1117,89 @@ const unitCopy = {
   }
 } satisfies Record<AppLanguage, Record<string, string>>;
 
+const updateCopy = {
+  en: {
+    check: "Check for updates",
+    checking: "Checking",
+    current: "Up to date",
+    available: "Update available",
+    failed: "Update check failed",
+    open: "Open release",
+    openLink: "Open source",
+    version: "Version"
+  },
+  sv: {
+    check: "Sök uppdateringar",
+    checking: "Kontrollerar",
+    current: "Uppdaterad",
+    available: "Uppdatering finns",
+    failed: "Uppdateringskontroll misslyckades",
+    open: "Öppna release",
+    openLink: "Öppna källa",
+    version: "Version"
+  },
+  de: {
+    check: "Nach Updates suchen",
+    checking: "Prüfe",
+    current: "Aktuell",
+    available: "Update verfügbar",
+    failed: "Update-Prüfung fehlgeschlagen",
+    open: "Release öffnen",
+    openLink: "Quelle öffnen",
+    version: "Version"
+  },
+  fr: {
+    check: "Rechercher des mises à jour",
+    checking: "Vérification",
+    current: "À jour",
+    available: "Mise à jour disponible",
+    failed: "Échec de la vérification",
+    open: "Ouvrir la version",
+    openLink: "Ouvrir la source",
+    version: "Version"
+  },
+  es: {
+    check: "Buscar actualizaciones",
+    checking: "Comprobando",
+    current: "Actualizado",
+    available: "Actualización disponible",
+    failed: "Error al comprobar",
+    open: "Abrir versión",
+    openLink: "Abrir fuente",
+    version: "Versión"
+  },
+  it: {
+    check: "Cerca aggiornamenti",
+    checking: "Controllo",
+    current: "Aggiornata",
+    available: "Aggiornamento disponibile",
+    failed: "Controllo non riuscito",
+    open: "Apri release",
+    openLink: "Apri fonte",
+    version: "Versione"
+  },
+  ja: {
+    check: "更新を確認",
+    checking: "確認中",
+    current: "最新",
+    available: "更新あり",
+    failed: "更新確認に失敗",
+    open: "リリースを開く",
+    openLink: "ソースを開く",
+    version: "バージョン"
+  },
+  zh: {
+    check: "检查更新",
+    checking: "正在检查",
+    current: "已是最新",
+    available: "有新版本",
+    failed: "检查更新失败",
+    open: "打开发布页",
+    openLink: "打开来源",
+    version: "版本"
+  }
+} satisfies Record<AppLanguage, Record<string, string>>;
+
 function loadSavedMapLanguage() {
   return localStorage.getItem(MAP_LANGUAGE_KEY) || "en";
 }
@@ -1257,6 +1348,62 @@ function saveAppLanguage(language: AppLanguage) {
   localStorage.setItem(APP_LANGUAGE_KEY, language);
 }
 
+function isSafeHttpUrl(url?: string) {
+  if (!url) return false;
+  try {
+    const protocol = new URL(url).protocol;
+    return protocol === "http:" || protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function openExternalUrl(url?: string) {
+  if (!isSafeHttpUrl(url)) return false;
+  const safeUrl = url as string;
+
+  if (window.weatherWatch?.openExternal) {
+    void window.weatherWatch.openExternal(safeUrl).catch(() => {
+      window.open(safeUrl, "_blank", "noopener,noreferrer");
+    });
+  } else {
+    window.open(safeUrl, "_blank", "noopener,noreferrer");
+  }
+
+  return true;
+}
+
+function normalizeVersionTag(tag: string) {
+  return tag.trim().replace(/^v/i, "");
+}
+
+function compareVersions(left: string, right: string) {
+  const leftParts = normalizeVersionTag(left).split(/[.-]/).map((part) => Number.parseInt(part, 10) || 0);
+  const rightParts = normalizeVersionTag(right).split(/[.-]/).map((part) => Number.parseInt(part, 10) || 0);
+  const length = Math.max(leftParts.length, rightParts.length, 3);
+  for (let index = 0; index < length; index += 1) {
+    const delta = (leftParts[index] ?? 0) - (rightParts[index] ?? 0);
+    if (delta !== 0) return delta;
+  }
+  return 0;
+}
+
+async function fetchLatestReleaseInfo() {
+  const text = window.weatherWatch?.fetchText
+    ? await window.weatherWatch.fetchText(LATEST_RELEASE_URL)
+    : await fetch(LATEST_RELEASE_URL, { headers: { Accept: "application/vnd.github+json" } }).then((response) => {
+        if (!response.ok) throw new Error(`Request failed with ${response.status}`);
+        return response.text();
+      });
+  const release = JSON.parse(text) as { tag_name?: string; html_url?: string; name?: string };
+  const latestVersion = normalizeVersionTag(release.tag_name || release.name || "");
+  if (!latestVersion) throw new Error("Release version was missing");
+  return {
+    latestVersion,
+    url: isSafeHttpUrl(release.html_url) ? release.html_url as string : RELEASES_PAGE_URL
+  };
+}
+
 function locationLabel(location?: CityLocation, fallback = "No city set") {
   if (!location) return fallback;
   return [location.name, location.admin1, location.country].filter(Boolean).join(", ");
@@ -1368,7 +1515,8 @@ function warningToSignal(warning: GdacsAlert): LocalSignal {
     id: `warning-${warning.id}`,
     title: `${level}${warning.sourceLabel ?? "Weather"} alert`.trim(),
     detail: [warning.title, warning.areaName].filter(Boolean).join(" - "),
-    severity: warningSignalSeverity(warning)
+    severity: warningSignalSeverity(warning),
+    sourceUrl: warning.link
   };
 }
 
@@ -1405,7 +1553,7 @@ function riskEventsNearLocation(events: RiskSignalEvent[], location: CityLocatio
       event,
       distance: distanceKm(location.latitude, location.longitude, event.lat, event.lon)
     }))
-    .filter(({ distance }) => distance <= 180)
+    .filter(({ event, distance }) => riskEventPassesLocationProximity(event, location, distance))
     .sort((left, right) => riskSignalSortScore(right.event, right.distance) - riskSignalSortScore(left.event, left.distance));
   const seen = new Set<string>();
   return nearby
@@ -1418,6 +1566,29 @@ function riskEventsNearLocation(events: RiskSignalEvent[], location: CityLocatio
     .map(({ event }) => event);
 }
 
+function riskEventPassesLocationProximity(event: RiskSignalEvent, location: CityLocation, distance: number) {
+  if (distance > 180) return false;
+  if (riskEventTextMatchesLocation(event, location)) return true;
+
+  const precision = event.geoType ?? 0;
+  if (precision <= 1) return distance <= 70;
+  if (precision === 2 || precision === 5) return distance <= 120;
+
+  if (event.country && location.country && normalizeDedupeText(event.country) !== normalizeDedupeText(location.country)) {
+    return distance <= 90;
+  }
+
+  return true;
+}
+
+function riskEventTextMatchesLocation(event: RiskSignalEvent, location: CityLocation) {
+  const text = normalizeDedupeText([event.place, event.country, event.title, event.summary].filter(Boolean).join(" "));
+  return [location.name, location.admin1, location.country]
+    .map((value) => normalizeDedupeText(value))
+    .filter((value) => value.length >= 3)
+    .some((value) => text.includes(value));
+}
+
 function riskSignalSortScore(event: RiskSignalEvent, distance: number) {
   const severity = event.severity === "danger" ? 3 : event.severity === "warning" ? 2 : 1;
   return severity * 120 - distance * 0.35 + Math.log2(event.articles + event.mentions + 1) * 7;
@@ -1428,7 +1599,8 @@ function riskEventToSignal(event: RiskSignalEvent, label: string): LocalSignal {
     id: `risk-${event.id}`,
     title: label,
     detail: [event.summary, event.actors ? `Involved: ${event.actors}` : undefined].filter(Boolean).join(" "),
-    severity: event.severity
+    severity: event.severity,
+    sourceUrl: event.sourceUrl
   };
 }
 
@@ -1749,6 +1921,7 @@ export function App() {
   const [weatherGridError, setWeatherGridError] = useState<string | undefined>();
   const [localError, setLocalError] = useState<string | undefined>();
   const [inspectedError, setInspectedError] = useState<string | undefined>();
+  const [updateCheck, setUpdateCheck] = useState<UpdateCheckState>({ status: "idle" });
   const [lastFeedCheck, setLastFeedCheck] = useState<Partial<Record<FeedKey, string>>>({});
   const [lastFeedDataRefresh, setLastFeedDataRefresh] = useState<Partial<Record<FeedKey, string>>>({});
   const [solarTimestamp, setSolarTimestamp] = useState(Date.now());
@@ -1766,6 +1939,7 @@ export function App() {
   const refreshInFlight = useRef({ weatherGrid: false, earthquakes: false, radar: false, warnings: false, risk: false, aircraft: false, aviationIncidents: false });
   const rainViewerRef = useRef<RainViewerState | undefined>();
   const copy = appCopy[appLanguage];
+  const updateText = updateCopy[appLanguage];
   const unitSettings = useMemo<UnitSettings>(() => ({ temperatureUnit, windUnit, rainUnit }), [temperatureUnit, windUnit, rainUnit]);
 
   const weatherSignals = useMemo(() => deriveLocalSignals(localWeather, { ...unitSettings, language: appLanguage }), [localWeather, unitSettings, appLanguage]);
@@ -1935,7 +2109,9 @@ export function App() {
           step: viewportStep,
           maxPoints: viewportMaxPoints
         });
-        setViewportWeatherGrid(cachedViewportGrid?.length ? cachedViewportGrid : []);
+        if (cachedViewportGrid?.length) {
+          setViewportWeatherGrid(cachedViewportGrid);
+        }
       }
 
       const shouldFetchGlobalWeather = !focused || !currentBounds || !viewportStep;
@@ -2476,10 +2652,16 @@ export function App() {
         notifiedSignals.current.add(key);
         notify(signal.title, `${locationLabel(homeLocation, unitText.noCitySet)}: ${signal.detail}`, () => {
           setLocalOpen(true);
-          focusSignal(signal);
+          activateSignal(signal);
         });
       });
   }, [localSignals, notificationPermission, homeLocation?.id, warnings, riskEvents]);
+
+  useEffect(() => {
+    void checkForUpdates();
+    const interval = window.setInterval(() => void checkForUpdates(), UPDATE_CHECK_INTERVAL_MS);
+    return () => window.clearInterval(interval);
+  }, []);
 
   useEffect(() => {
     if (notificationPermission !== "granted") return;
@@ -2499,6 +2681,25 @@ export function App() {
     if (typeof Notification === "undefined") return;
     const permission = await Notification.requestPermission();
     setNotificationPermission(permission);
+  }
+
+  async function checkForUpdates() {
+    setUpdateCheck((state) => ({ status: "checking", checkedAt: state.checkedAt }));
+    try {
+      const latest = await fetchLatestReleaseInfo();
+      if (compareVersions(latest.latestVersion, __APP_VERSION__) > 0) {
+        setUpdateCheck({ status: "available", latestVersion: latest.latestVersion, url: latest.url, checkedAt: Date.now() });
+        return;
+      }
+
+      setUpdateCheck({ status: "current", checkedAt: Date.now() });
+    } catch (err) {
+      setUpdateCheck({
+        status: "error",
+        checkedAt: Date.now(),
+        error: err instanceof Error ? err.message : "Unable to check for updates"
+      });
+    }
   }
 
   function chooseCity(location: CityLocation) {
@@ -2622,6 +2823,11 @@ export function App() {
     focusHomeLocation();
   }
 
+  function activateSignal(signal: LocalSignal) {
+    if (openExternalUrl(signal.sourceUrl)) return;
+    focusSignal(signal);
+  }
+
   function startHomePress() {
     homeLongPressTriggered.current = false;
     if (homePressTimer.current !== undefined) window.clearTimeout(homePressTimer.current);
@@ -2743,6 +2949,17 @@ export function App() {
     "map-control-stack",
     settingsOpen && (filtersOpen || mapViewMenuOpen) ? "settings-sidecar" : ""
   ].filter(Boolean).join(" ");
+  const updateStatusLabel =
+    updateCheck.status === "checking" ? updateText.checking :
+    updateCheck.status === "available" ? `${updateText.available} ${updateCheck.latestVersion}` :
+    updateCheck.status === "current" ? updateText.current :
+    updateCheck.status === "error" ? updateText.failed :
+    updateText.check;
+  const updateStatusTitle =
+    updateCheck.status === "available" ? `${updateText.open}: ${updateCheck.latestVersion}` :
+    updateCheck.status === "current" ? `${updateText.version} ${__APP_VERSION__}` :
+    updateCheck.status === "error" ? `${updateText.failed}${updateCheck.error ? `: ${updateCheck.error}` : ""}` :
+    updateText.check;
 
   return (
     <main className="app-shell">
@@ -2806,6 +3023,25 @@ export function App() {
               : undefined
           }
         />
+
+        <div className={`update-checker ${updateCheck.status}`}>
+          <button
+            type="button"
+            title={updateStatusTitle}
+            aria-label={updateStatusTitle}
+            onClick={() => {
+              if (updateCheck.status === "available") {
+                openExternalUrl(updateCheck.url);
+                return;
+              }
+              void checkForUpdates();
+            }}
+            disabled={updateCheck.status === "checking"}
+          >
+            {updateCheck.status === "available" ? <Download size={15} /> : updateCheck.status === "checking" ? <RefreshCw size={15} className="spin" /> : <ExternalLink size={15} />}
+            <span>{updateStatusLabel}</span>
+          </button>
+        </div>
 
         <div className={controlStackClass} ref={mapViewMenuRef}>
           <div className="map-filter-bar">
@@ -3240,13 +3476,20 @@ export function App() {
                 <div className="signal-list">
                   {inspectedSignals.length > 0 ? (
                     inspectedSignals.map((signal) => (
-                      <div className={`signal ${signal.severity}`} key={signal.id}>
+                      <button
+                        className={`signal ${signal.severity}${signal.sourceUrl ? " linked" : ""}`}
+                        type="button"
+                        onClick={() => activateSignal(signal)}
+                        title={signal.sourceUrl ? updateText.openLink : undefined}
+                        key={signal.id}
+                      >
                         <TriangleAlert size={17} />
                         <div>
                           <strong>{signal.title}</strong>
                           <span>{signal.detail}</span>
                         </div>
-                      </div>
+                        {signal.sourceUrl && <ExternalLink className="signal-link-icon" size={14} />}
+                      </button>
                     ))
                   ) : (
                     <div className="signal quiet">
@@ -3367,12 +3610,19 @@ export function App() {
                 <div className="signal-list">
                   {localSignals.length > 0 ? (
                     localSignals.map((signal) => (
-                      <button className={`signal ${signal.severity}`} type="button" onClick={() => focusSignal(signal)} key={signal.id}>
+                      <button
+                        className={`signal ${signal.severity}${signal.sourceUrl ? " linked" : ""}`}
+                        type="button"
+                        onClick={() => activateSignal(signal)}
+                        title={signal.sourceUrl ? updateText.openLink : undefined}
+                        key={signal.id}
+                      >
                         <TriangleAlert size={17} />
                         <div>
                           <strong>{signal.title}</strong>
                           <span>{signal.detail}</span>
                         </div>
+                        {signal.sourceUrl && <ExternalLink className="signal-link-icon" size={14} />}
                       </button>
                     ))
                   ) : (
