@@ -185,6 +185,9 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
       - name: Install dependencies
         run: npm install
 
@@ -200,8 +203,9 @@ jobs:
       - name: Build Android APK
         shell: bash
         run: |
+          chmod +x android/gradlew
           cd android
-          ./gradlew assembleDebug
+          ./gradlew assembleDebug --stacktrace
 
       - name: Prepare Android artifact
         shell: bash
