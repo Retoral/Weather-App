@@ -594,6 +594,7 @@ function makeTemperatureLayer(
   interface TemperatureLayerInternal extends L.Layer {
     _canvas?: HTMLCanvasElement;
     _lastRenderKey?: string;
+    _surfaceDraw?: SurfaceRasterDrawHandle;
     _tooltip?: HTMLDivElement;
     _weatherMap?: L.Map;
     _resetFrame?: number;
@@ -622,6 +623,8 @@ function makeTemperatureLayer(
       currentIncludeLocalTime = nextIncludeLocalTime;
       currentUnits = nextUnits;
       if (shouldRender) {
+        this._surfaceDraw?.cancel();
+        this._surfaceDraw = undefined;
         this._lastRenderKey = undefined;
         this._reset();
         this._scheduleSettledReset();
@@ -644,6 +647,7 @@ function makeTemperatureLayer(
     onRemove(this: TemperatureLayerInternal) {
       if (this._resetFrame !== undefined) window.cancelAnimationFrame(this._resetFrame);
       if (this._resetTimer !== undefined) window.clearTimeout(this._resetTimer);
+      this._surfaceDraw?.cancel();
       if (this._canvas?.parentNode) this._canvas.parentNode.removeChild(this._canvas);
       if (this._tooltip?.parentNode) this._tooltip.parentNode.removeChild(this._tooltip);
       this._weatherMap?.off("moveend zoomend resize", (this as unknown as { _reset: () => void })._reset, this);
@@ -655,6 +659,7 @@ function makeTemperatureLayer(
       this._weatherMap = undefined;
       this._resetFrame = undefined;
       this._resetTimer = undefined;
+      this._surfaceDraw = undefined;
     },
     _hideHover(this: TemperatureLayerInternal) {
       if (this._tooltip) this._tooltip.classList.remove("visible");
@@ -712,13 +717,16 @@ function makeTemperatureLayer(
       ctx.imageSmoothingEnabled = true;
 
       if (surfaceGrid.samples.size === 0 && detailGrid.samples.size === 0 && liveStations.length === 0) {
+        this._surfaceDraw?.cancel();
+        this._surfaceDraw = undefined;
         ctx.clearRect(0, 0, width, height);
         this._lastRenderKey = undefined;
         return;
       }
 
-      drawSurfaceRasterTiles(ctx, map, "temperature", surfaceSignature, profile, width, height, surfaceGrid, detailGrid, liveStations);
+      this._surfaceDraw?.cancel();
       this._lastRenderKey = renderKey;
+      this._surfaceDraw = drawSurfaceRasterTilesIncremental(ctx, map, "temperature", surfaceSignature, profile, width, height, surfaceGrid, detailGrid, liveStations);
     }
   });
 
@@ -744,6 +752,7 @@ function makeWindLayer(
   interface WindLayerInternal extends L.Layer {
     _canvas?: HTMLCanvasElement;
     _lastRenderKey?: string;
+    _surfaceDraw?: SurfaceRasterDrawHandle;
     _tooltip?: HTMLDivElement;
     _weatherMap?: L.Map;
     _resetFrame?: number;
@@ -784,6 +793,8 @@ function makeWindLayer(
       currentUnits = nextUnits;
       currentLanguage = nextLanguage;
       if (shouldRender) {
+        this._surfaceDraw?.cancel();
+        this._surfaceDraw = undefined;
         this._lastRenderKey = undefined;
         this._scheduleDataReset();
       }
@@ -806,6 +817,7 @@ function makeWindLayer(
       if (this._resetFrame !== undefined) window.cancelAnimationFrame(this._resetFrame);
       if (this._resetTimer !== undefined) window.clearTimeout(this._resetTimer);
       if (this._dataResetTimer !== undefined) window.clearTimeout(this._dataResetTimer);
+      this._surfaceDraw?.cancel();
       if (this._canvas?.parentNode) this._canvas.parentNode.removeChild(this._canvas);
       if (this._tooltip?.parentNode) this._tooltip.parentNode.removeChild(this._tooltip);
       this._weatherMap?.off("moveend zoomend resize", (this as unknown as { _reset: () => void })._reset, this);
@@ -818,6 +830,7 @@ function makeWindLayer(
       this._resetFrame = undefined;
       this._resetTimer = undefined;
       this._dataResetTimer = undefined;
+      this._surfaceDraw = undefined;
     },
     _hideHover(this: WindLayerInternal) {
       hideHoverReadout(this._tooltip);
@@ -882,14 +895,21 @@ function makeWindLayer(
       ctx.imageSmoothingEnabled = true;
 
       if (surfaceGrid.samples.size === 0 && detailGrid.samples.size === 0 && liveStations.length === 0) {
+        this._surfaceDraw?.cancel();
+        this._surfaceDraw = undefined;
         ctx.clearRect(0, 0, width, height);
         this._lastRenderKey = undefined;
         return;
       }
 
-      drawSurfaceRasterTiles(ctx, map, "wind", surfaceSignature, profile, width, height, surfaceGrid, detailGrid, liveStations);
-      drawWindDirectionStreaks(ctx, map, surfaceGrid, detailGrid, liveStations, streamSignature, profile.scale, width, height);
+      this._surfaceDraw?.cancel();
       this._lastRenderKey = renderKey;
+      this._surfaceDraw = drawSurfaceRasterTilesIncremental(ctx, map, "wind", surfaceSignature, profile, width, height, surfaceGrid, detailGrid, liveStations, {
+        onComplete: () => {
+          if (this._lastRenderKey !== renderKey || !this._weatherMap || !this._canvas) return;
+          drawWindDirectionStreaks(ctx, map, surfaceGrid, detailGrid, liveStations, streamSignature, profile.scale, width, height);
+        }
+      });
     }
   });
 
@@ -964,7 +984,30 @@ function windRgb(windSpeed: number): [number, number, number] {
   return stops[stops.length - 1][1];
 }
 
-function drawSurfaceRasterTiles(
+interface SurfaceRasterDrawHandle {
+  cancel: () => void;
+}
+
+interface SurfaceRasterDrawOptions {
+  frameBudgetMs?: number;
+  onComplete?: () => void;
+}
+
+interface SurfaceRasterDrawItem {
+  key: string;
+  tileZoom: number;
+  tileX: number;
+  tileY: number;
+  tileScale: number;
+  dest: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+}
+
+function drawSurfaceRasterTilesIncremental(
   ctx: CanvasRenderingContext2D,
   map: L.Map,
   kind: SurfaceRasterKind,
@@ -974,32 +1017,92 @@ function drawSurfaceRasterTiles(
   height: number,
   grid: SurfaceGrid,
   detailGrid: SurfaceGrid,
-  stations: SurfaceStation[]
-) {
+  stations: SurfaceStation[],
+  options: SurfaceRasterDrawOptions = {}
+): SurfaceRasterDrawHandle {
+  let cancelled = false;
+  let frameId: number | undefined;
   ctx.clearRect(0, 0, width, height);
   const zoom = map.getZoom();
   const tileZoom = surfaceTileZoom(zoom);
   const tileScale = profile.scale;
   const tileRange = visibleSurfaceTileRange(map, tileZoom);
+  const missingTiles: SurfaceRasterDrawItem[] = [];
 
   for (let tileY = tileRange.minY; tileY <= tileRange.maxY; tileY += 1) {
     for (let tileX = tileRange.minX; tileX <= tileRange.maxX; tileX += 1) {
-      const tile = getSurfaceRasterTile(kind, dataSignature, tileZoom, tileX, tileY, tileScale, grid, detailGrid, stations);
+      const key = surfaceRasterTileCacheKey(kind, dataSignature, tileZoom, tileX, tileY, tileScale);
       const dest = surfaceTileDestination(map, tileZoom, tileX, tileY, tileScale);
-      const bleed = Math.min(tile.gutter, 1.25);
-      ctx.drawImage(
-        tile.canvas,
-        tile.gutter - bleed,
-        tile.gutter - bleed,
-        tile.innerSize + bleed * 2,
-        tile.innerSize + bleed * 2,
-        dest.x,
-        dest.y,
-        dest.width,
-        dest.height
-      );
+      const cached = getCachedSurfaceRasterTile(key);
+      if (cached) {
+        drawSurfaceRasterTile(ctx, cached, dest);
+        continue;
+      }
+
+      missingTiles.push({ key, tileZoom, tileX, tileY, tileScale, dest });
     }
   }
+
+  const finish = () => {
+    if (!cancelled) options.onComplete?.();
+  };
+
+  const renderMissingTiles = () => {
+    frameId = undefined;
+    if (cancelled) return;
+
+    const budgetMs = options.frameBudgetMs ?? 7;
+    const startedAt = performance.now();
+
+    while (missingTiles.length > 0 && performance.now() - startedAt < budgetMs) {
+      const item = missingTiles.shift();
+      if (!item) break;
+      const cached = getCachedSurfaceRasterTile(item.key);
+      const tile = cached ?? renderSurfaceRasterTile(kind, item.tileZoom, item.tileX, item.tileY, item.tileScale, grid, detailGrid, stations);
+      if (!cached) setSurfaceRasterTileCache(item.key, tile);
+      if (cancelled) return;
+      drawSurfaceRasterTile(ctx, tile, item.dest);
+    }
+
+    if (missingTiles.length > 0) {
+      frameId = window.requestAnimationFrame(renderMissingTiles);
+      return;
+    }
+
+    finish();
+  };
+
+  if (missingTiles.length === 0) {
+    finish();
+  } else {
+    frameId = window.requestAnimationFrame(renderMissingTiles);
+  }
+
+  return {
+    cancel() {
+      cancelled = true;
+      if (frameId !== undefined) window.cancelAnimationFrame(frameId);
+    }
+  };
+}
+
+function drawSurfaceRasterTile(
+  ctx: CanvasRenderingContext2D,
+  tile: SurfaceRasterTile,
+  dest: { x: number; y: number; width: number; height: number }
+) {
+  const bleed = Math.min(tile.gutter, 1.25);
+  ctx.drawImage(
+    tile.canvas,
+    tile.gutter - bleed,
+    tile.gutter - bleed,
+    tile.innerSize + bleed * 2,
+    tile.innerSize + bleed * 2,
+    dest.x,
+    dest.y,
+    dest.width,
+    dest.height
+  );
 }
 
 function surfaceTileDestination(map: L.Map, tileZoom: number, tileX: number, tileY: number, scale: number) {
@@ -1055,6 +1158,27 @@ const surfaceTileCache = new Map<string, SurfaceTileCacheEntry>();
 const SURFACE_TILE_CACHE_LIMIT = 900;
 const SURFACE_TILE_GUTTER = 2;
 
+function surfaceRasterTileCacheKey(kind: SurfaceRasterKind, dataSignature: string, tileZoom: number, tileX: number, tileY: number, tileScale: number) {
+  return [kind, dataSignature, tileZoom, tileX, tileY, tileScale.toFixed(4)].join(":");
+}
+
+function getCachedSurfaceRasterTile(key: string) {
+  const cached = surfaceTileCache.get(key);
+  if (!cached) return undefined;
+  surfaceTileCache.delete(key);
+  surfaceTileCache.set(key, cached);
+  return cached.tile;
+}
+
+function setSurfaceRasterTileCache(key: string, tile: SurfaceRasterTile) {
+  surfaceTileCache.set(key, { tile });
+  while (surfaceTileCache.size > SURFACE_TILE_CACHE_LIMIT) {
+    const oldestKey = surfaceTileCache.keys().next().value;
+    if (!oldestKey) break;
+    surfaceTileCache.delete(oldestKey);
+  }
+}
+
 function getSurfaceRasterTile(
   kind: SurfaceRasterKind,
   dataSignature: string,
@@ -1066,21 +1190,12 @@ function getSurfaceRasterTile(
   detailGrid: SurfaceGrid,
   stations: SurfaceStation[]
 ) {
-  const key = [kind, dataSignature, tileZoom, tileX, tileY, tileScale.toFixed(4)].join(":");
-  const cached = surfaceTileCache.get(key);
-  if (cached) {
-    surfaceTileCache.delete(key);
-    surfaceTileCache.set(key, cached);
-    return cached.tile;
-  }
+  const key = surfaceRasterTileCacheKey(kind, dataSignature, tileZoom, tileX, tileY, tileScale);
+  const cached = getCachedSurfaceRasterTile(key);
+  if (cached) return cached;
 
   const tile = renderSurfaceRasterTile(kind, tileZoom, tileX, tileY, tileScale, grid, detailGrid, stations);
-  surfaceTileCache.set(key, { tile });
-  while (surfaceTileCache.size > SURFACE_TILE_CACHE_LIMIT) {
-    const oldestKey = surfaceTileCache.keys().next().value;
-    if (!oldestKey) break;
-    surfaceTileCache.delete(oldestKey);
-  }
+  setSurfaceRasterTileCache(key, tile);
   return tile;
 }
 
@@ -2695,13 +2810,16 @@ interface DayNightLayerInstance extends L.Layer {
 function makeDayNightLayer(timestamp: number): DayNightLayerInstance {
   interface DayNightLayerInternal extends DayNightLayerInstance {
     _canvas?: HTMLCanvasElement;
+    _lastRenderKey?: string;
     _weatherMap?: L.Map;
     _reset: () => void;
   }
 
   let position = solarPosition(timestamp);
+  let positionKey = Math.floor(timestamp / 60000);
   const NightMaskLayer = L.Layer.extend({
     updateDayNightLayer(this: DayNightLayerInternal, nextTimestamp: number) {
+      positionKey = Math.floor(nextTimestamp / 60000);
       position = solarPosition(nextTimestamp);
       this._reset();
     },
@@ -2716,6 +2834,9 @@ function makeDayNightLayer(timestamp: number): DayNightLayerInstance {
     onRemove(this: DayNightLayerInternal) {
       if (this._canvas?.parentNode) this._canvas.parentNode.removeChild(this._canvas);
       this._weatherMap?.off("moveend zoomend resize", this._reset, this);
+      this._canvas = undefined;
+      this._weatherMap = undefined;
+      this._lastRenderKey = undefined;
     },
     _reset(this: DayNightLayerInternal) {
       if (!this._weatherMap || !this._canvas) return;
@@ -2726,12 +2847,17 @@ function makeDayNightLayer(timestamp: number): DayNightLayerInstance {
       const sampleScale = 0.5;
       const width = Math.max(1, Math.ceil(size.x * sampleScale));
       const height = Math.max(1, Math.ceil(size.y * sampleScale));
+      const renderKey = dayNightRenderKey(map, width, height, sampleScale, positionKey);
+      const sizeChanged = canvas.width !== width || canvas.height !== height;
 
       L.DomUtil.setPosition(canvas, topLeft);
-      canvas.width = width;
-      canvas.height = height;
       canvas.style.width = `${size.x}px`;
       canvas.style.height = `${size.y}px`;
+      if (this._lastRenderKey === renderKey && !sizeChanged) return;
+      if (sizeChanged) {
+        canvas.width = width;
+        canvas.height = height;
+      }
 
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
@@ -2754,10 +2880,25 @@ function makeDayNightLayer(timestamp: number): DayNightLayerInstance {
       }
 
       ctx.putImageData(image, 0, 0);
+      this._lastRenderKey = renderKey;
     }
   });
 
   return new NightMaskLayer() as DayNightLayerInstance;
+}
+
+function dayNightRenderKey(map: L.Map, width: number, height: number, scale: number, positionKey: number) {
+  const center = map.getCenter();
+  return [
+    "day-night",
+    positionKey,
+    width,
+    height,
+    scale.toFixed(3),
+    map.getZoom().toFixed(4),
+    center.lat.toFixed(7),
+    center.lng.toFixed(7)
+  ].join(":");
 }
 
 function smoothstep(edge0: number, edge1: number, value: number) {

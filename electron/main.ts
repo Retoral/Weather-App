@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Menu, shell } from "electron";
+import { app, BrowserWindow, ipcMain, Menu, powerMonitor, shell } from "electron";
 import path from "node:path";
 import zlib from "node:zlib";
 
@@ -38,6 +38,14 @@ function createWindow() {
   } else {
     void window.loadFile(path.join(__dirname, "../dist/index.html"));
   }
+}
+
+function notifyRendererOfSystemResume() {
+  BrowserWindow.getAllWindows().forEach((window) => {
+    if (!window.isDestroyed()) {
+      window.webContents.send("system-resume");
+    }
+  });
 }
 
 app.whenReady().then(() => {
@@ -81,6 +89,9 @@ app.whenReady().then(() => {
   });
 
   createWindow();
+
+  powerMonitor.on("resume", notifyRendererOfSystemResume);
+  powerMonitor.on("unlock-screen", notifyRendererOfSystemResume);
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {
