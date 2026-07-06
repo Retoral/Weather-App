@@ -44,7 +44,10 @@ const GDELT_LAST_UPDATE = "http://data.gdeltproject.org/gdeltv2/lastupdate.txt";
 const OPENSKY_STATES = "https://opensky-network.org/api/states/all";
 const OPENSKY_TRACKS = "https://opensky-network.org/api/tracks/all";
 const ADSB_LOL_AIRCRAFT = "https://api.adsb.lol/v2/lat";
-const WEATHER_GRID_CACHE_KEY = "weather-watch:weather-grid-cache:v3";
+const WEATHER_GRID_CACHE_KEY = "weather-watch:weather-grid-cache:v11";
+const WEATHER_GRID_LEGACY_CACHE_KEYS = [
+  "weather-watch:weather-grid-cache:v3"
+];
 const RISK_EVENTS_CACHE_KEY = "weather-watch:risk-events-cache:v4";
 const AIRCRAFT_CACHE_PREFIX = "weather-watch:aircraft-cache:v2";
 const AIRCRAFT_TRACK_CACHE_PREFIX = "weather-watch:aircraft-track-cache:v1";
@@ -509,8 +512,9 @@ function makeGrid(options: { bounds?: AviationBounds; step?: number; maxPoints?:
 
 function makeGlobalGrid(): WeatherGridCoordinate[] {
   const points: WeatherGridCoordinate[] = [];
-  for (let lat = -80; lat <= 80; lat += 20) {
-    for (let lon = -180; lon < 180; lon += 20) {
+  const step = 7.5;
+  for (let lat = -80; lat <= 80; lat += step) {
+    for (let lon = -180; lon < 180; lon += step) {
       points.push({ lat, lon });
     }
   }
@@ -545,7 +549,7 @@ function makeBoundedGrid(bounds: AviationBounds, requestedStep: number, maxPoint
 }
 
 function nextWeatherGridStep(currentStep: number) {
-  const steps = [0.25, 0.5, 1, 2.5, 5, 7.5, 10];
+  const steps = [0.25, 0.5, 1, 1.5, 2, 2.5, 5, 7.5, 10];
   return steps.find((step) => step > currentStep + 0.001) ?? Math.min(10, currentStep * 2);
 }
 
@@ -620,7 +624,7 @@ export async function fetchWeatherGridWithMeta(
         fetchedAt: Date.now()
       };
     }
-    const fallback = await fetchMetNorwayWeatherGridFallback(options, forecastHourOffset, signal);
+    const fallback = options.bounds ? await fetchMetNorwayWeatherGridFallback(options, forecastHourOffset, signal) : [];
     if (fallback.length) {
       writeWeatherGridCache(fallback, forecastHourOffset, options);
       return {
@@ -692,7 +696,12 @@ export async function fetchWeatherGridWithMeta(
       const rows = Array.isArray(data) ? data : [data];
 
       rows.forEach((row, rowIndex) => {
-        const source = batch[rowIndex] ?? { lat: row.latitude, lon: row.longitude };
+        const responseLat = numberValue(row.latitude);
+        const responseLon = numberValue(row.longitude);
+        const source =
+          responseLat !== undefined && responseLon !== undefined
+            ? { lat: roundCoordinate(responseLat), lon: roundCoordinate(normalizeApiLongitude(responseLon)) }
+            : batch[rowIndex] ?? { lat: row.latitude, lon: row.longitude };
         const sample = forecastHourOffset <= 0 ? row.current : forecastGridSample(row.hourly, forecastHourOffset);
         if (!sample) return;
         result.push({
@@ -713,6 +722,10 @@ export async function fetchWeatherGridWithMeta(
       });
     }
 
+    if (!weatherGridCacheLooksUsable(result, options)) {
+      throw new Error("Weather provider returned an incomplete global weather grid");
+    }
+
     writeWeatherGridCache(result, forecastHourOffset, options);
     return {
       points: result,
@@ -731,7 +744,7 @@ export async function fetchWeatherGridWithMeta(
         fetchedAt: Date.now()
       };
     }
-    const fallback = await fetchMetNorwayWeatherGridFallback(options, forecastHourOffset, signal).catch(() => []);
+    const fallback = options.bounds ? await fetchMetNorwayWeatherGridFallback(options, forecastHourOffset, signal).catch(() => []) : [];
     if (fallback.length) {
       writeWeatherGridCache(fallback, forecastHourOffset, options);
       return {
@@ -830,12 +843,28 @@ function forecastGridSample(hourly: Record<string, Array<number | string>> | und
 }
 
 function weatherGridCacheKey(forecastHourOffset: number, options: { bounds?: AviationBounds; step?: number; maxPoints?: number } = {}) {
+  return weatherGridCacheKeyForBase(WEATHER_GRID_CACHE_KEY, forecastHourOffset, options);
+}
+
+function weatherGridCacheKeys(forecastHourOffset: number, options: { bounds?: AviationBounds; step?: number; maxPoints?: number } = {}) {
+  const currentKey = weatherGridCacheKey(forecastHourOffset, options);
+  if (normalizedWeatherBounds(options.bounds)) return [{ key: currentKey, legacyGlobal: false }];
+  return [
+    { key: currentKey, legacyGlobal: false },
+    ...WEATHER_GRID_LEGACY_CACHE_KEYS.map((cacheKey) => ({
+      key: weatherGridCacheKeyForBase(cacheKey, forecastHourOffset, options),
+      legacyGlobal: true
+    }))
+  ];
+}
+
+function weatherGridCacheKeyForBase(cacheKey: string, forecastHourOffset: number, options: { bounds?: AviationBounds; step?: number; maxPoints?: number } = {}) {
   const bounds = normalizedWeatherBounds(options.bounds);
-  if (!bounds) return `${WEATHER_GRID_CACHE_KEY}:global:${forecastHourOffset}`;
+  if (!bounds) return `${cacheKey}:global:${forecastHourOffset}`;
   const step = options.step ?? 2.5;
   const maxPoints = options.maxPoints ?? 220;
   return [
-    WEATHER_GRID_CACHE_KEY,
+    cacheKey,
     "viewport",
     forecastHourOffset,
     step.toFixed(2),
@@ -848,15 +877,27 @@ function weatherGridCacheKey(forecastHourOffset: number, options: { bounds?: Avi
 }
 
 function readWeatherGridCache(maxAgeMs: number, forecastHourOffset = 0, options: { bounds?: AviationBounds; step?: number; maxPoints?: number } = {}) {
-  try {
-    const raw = localStorage.getItem(weatherGridCacheKey(forecastHourOffset, options));
-    if (!raw) return undefined;
-    const cached = JSON.parse(raw) as { fetchedAt: number; points: WeatherGridPoint[] };
-    if (!Array.isArray(cached.points) || Date.now() - cached.fetchedAt > maxAgeMs) return undefined;
-    return cached.points;
-  } catch {
-    return undefined;
+  for (const { key, legacyGlobal } of weatherGridCacheKeys(forecastHourOffset, options)) {
+    try {
+      const raw = localStorage.getItem(key);
+      if (!raw) continue;
+      const cached = JSON.parse(raw) as { fetchedAt: number; points: WeatherGridPoint[] };
+      if (!Array.isArray(cached.points) || Date.now() - cached.fetchedAt > maxAgeMs) continue;
+      if (!weatherGridCacheLooksUsable(cached.points, options, legacyGlobal)) continue;
+      return cached.points;
+    } catch {
+      // Ignore invalid cache entries and try the next available cache generation.
+    }
   }
+  return undefined;
+}
+
+function weatherGridCacheLooksUsable(points: WeatherGridPoint[], options: { bounds?: AviationBounds } = {}, legacyGlobal = false) {
+  if (options.bounds) return points.length > 0;
+  if (points.length < (legacyGlobal ? 150 : 500)) return false;
+  const lats = points.map((point) => point.lat);
+  const lons = points.map((point) => point.lon);
+  return Math.min(...lats) <= -70 && Math.max(...lats) >= 70 && Math.min(...lons) <= -170 && Math.max(...lons) >= 170;
 }
 
 function writeWeatherGridCache(points: WeatherGridPoint[], forecastHourOffset = 0, options: { bounds?: AviationBounds; step?: number; maxPoints?: number } = {}) {
@@ -2433,8 +2474,8 @@ async function fetchUsgsEarthquakeFeed(url: string, signal?: AbortSignal): Promi
       lat: feature.geometry.coordinates[1],
       depth: numberOrUndefined(feature.geometry.coordinates[2]),
       feltReports: numberOrUndefined(feature.properties.felt),
-      feltIntensity: numberOrUndefined(feature.properties.cdi),
-      instrumentalIntensity: numberOrUndefined(feature.properties.mmi),
+      feltIntensity: shakingIntensityOrUndefined(feature.properties.cdi),
+      instrumentalIntensity: shakingIntensityOrUndefined(feature.properties.mmi),
       source: "usgs",
       sourceLabel: "USGS"
     }));
@@ -2515,7 +2556,7 @@ async function fetchGeoNetEarthquakes(signal?: AbortSignal): Promise<EarthquakeE
       const coordinates = feature.geometry?.coordinates;
       const time = properties?.time ? Date.parse(properties.time) : NaN;
       const magnitude = numberOrUndefined(properties?.magnitude);
-      const mmi = numberOrUndefined(properties?.mmi);
+      const mmi = shakingIntensityOrUndefined(properties?.mmi);
       if (!properties || !coordinates || !Number.isFinite(time) || properties.quality === "deleted") return undefined;
       if (Date.now() - time > EARTHQUAKE_LOOKBACK_MS || ((magnitude ?? 0) < 2.5 && (mmi ?? -1) < 3)) return undefined;
 
@@ -2594,7 +2635,7 @@ function bmkgEarthquakeRowToEvent(row: BmkgEarthquakeRow): EarthquakeEvent | und
     lat: coordinates.lat,
     lon: coordinates.lon,
     depth: numberFromText(row.Kedalaman?.replace(/[^\d.-]/g, "")),
-    feltIntensity: parseMmiFromText(row.Dirasakan),
+    feltIntensity: shakingIntensityOrUndefined(parseMmiFromText(row.Dirasakan)),
     source: "bmkg",
     sourceLabel: "BMKG"
   };
@@ -2790,8 +2831,8 @@ function mergeEarthquakeEvents(current: EarthquakeEvent, next: EarthquakeEvent):
     significance: Math.max(current.significance, next.significance),
     depth: preferred.depth ?? other.depth,
     feltReports: maxDefined(current.feltReports, next.feltReports),
-    feltIntensity: maxDefined(current.feltIntensity, next.feltIntensity),
-    instrumentalIntensity: maxDefined(current.instrumentalIntensity, next.instrumentalIntensity),
+    feltIntensity: maxDefined(shakingIntensityOrUndefined(current.feltIntensity), shakingIntensityOrUndefined(next.feltIntensity)),
+    instrumentalIntensity: maxDefined(shakingIntensityOrUndefined(current.instrumentalIntensity), shakingIntensityOrUndefined(next.instrumentalIntensity)),
     sourceLabel: mergeSourceLabels(current.sourceLabel, next.sourceLabel),
     source: mergeSourceLabels(current.source, next.source)
   };
@@ -2862,6 +2903,11 @@ function isDefined<T>(value: T | undefined): value is T {
 
 function numberOrUndefined(value: number | null | undefined) {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function shakingIntensityOrUndefined(value: number | null | undefined) {
+  const number = numberOrUndefined(value);
+  return number !== undefined && number >= 0 && number <= 12 ? number : undefined;
 }
 
 export async function fetchRainViewer(signal?: AbortSignal): Promise<RainViewerState> {

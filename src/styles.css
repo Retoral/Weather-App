@@ -1572,6 +1572,11 @@ button.signal.linked:hover {
   mix-blend-mode: multiply;
 }
 
+.surface-raster-tile {
+  mix-blend-mode: multiply;
+  pointer-events: none;
+}
+
 .map-hover-tooltip {
   position: absolute;
   pointer-events: none;

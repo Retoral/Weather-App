@@ -1803,31 +1803,35 @@ function viewportWeatherStep(bounds: AviationBounds | undefined, highResolutionL
   const rawLonSpan = Math.abs(bounds.east - bounds.west);
   const lonSpan = rawLonSpan > 180 ? 360 - rawLonSpan : rawLonSpan;
   const span = Math.max(latSpan, lonSpan);
+
   if (highResolutionLayer) {
-    if (span <= 14) return 0.5;
-    if (span <= 34) return 1;
-    if (span <= 65) return 2.5;
-    if (span <= 100) return 5;
-    return 7.5;
+    if (span <= 12) return 0.35;
+    if (span <= 24) return 0.5;
+    if (span <= 42) return 1;
+    if (span <= 75) return 2.5;
+    return 5;
   }
+
   if (span <= 10) return 0.5;
   if (span <= 28) return 1;
   if (span <= 55) return 2.5;
-  if (span <= 80) return 5;
+  if (span <= 85) return 5;
   return 7.5;
 }
 
 function viewportWeatherPointLimit(bounds: AviationBounds | undefined, highResolutionLayer: boolean) {
   if (!bounds) return undefined;
-  if (!highResolutionLayer) return 360;
   const latSpan = Math.abs(bounds.north - bounds.south);
   const rawLonSpan = Math.abs(bounds.east - bounds.west);
   const lonSpan = rawLonSpan > 180 ? 360 - rawLonSpan : rawLonSpan;
   const span = Math.max(latSpan, lonSpan);
-  if (span <= 14) return 900;
-  if (span <= 34) return 760;
-  if (span <= 65) return 560;
-  return 380;
+
+  if (!highResolutionLayer) return 360;
+  if (span <= 12) return 1200;
+  if (span <= 24) return 1000;
+  if (span <= 42) return 820;
+  if (span <= 75) return 620;
+  return 420;
 }
 
 function viewportWeatherBoundsKey(bounds: AviationBounds | undefined) {
@@ -1838,6 +1842,58 @@ function viewportWeatherBoundsKey(bounds: AviationBounds | undefined) {
     bounds.north.toFixed(2),
     bounds.east.toFixed(2)
   ].join(":");
+}
+
+function weatherGridPointKey(point: WeatherGridPoint) {
+  return `${point.lat.toFixed(3)}:${point.lon.toFixed(3)}`;
+}
+
+function weatherGridPointEquals(left: WeatherGridPoint, right: WeatherGridPoint) {
+  return (
+    left.id === right.id &&
+    left.time === right.time &&
+    left.temperature === right.temperature &&
+    left.weatherCode === right.weatherCode &&
+    left.windSpeed === right.windSpeed &&
+    left.windGust === right.windGust &&
+    left.windDirection === right.windDirection &&
+    left.precipitation === right.precipitation &&
+    left.precipitationProbability === right.precipitationProbability &&
+    left.pressure === right.pressure &&
+    left.cloudCover === right.cloudCover
+  );
+}
+
+function weatherGridPointsEqual(left: WeatherGridPoint[], right: WeatherGridPoint[]) {
+  if (left === right) return true;
+  if (left.length !== right.length) return false;
+  const rightByKey = new Map<string, WeatherGridPoint>();
+  right.forEach((point) => rightByKey.set(weatherGridPointKey(point), point));
+  return left.every((point) => {
+    const match = rightByKey.get(weatherGridPointKey(point));
+    return match ? weatherGridPointEquals(point, match) : false;
+  });
+}
+
+function mergeWeatherGridPoints(current: WeatherGridPoint[], incoming: WeatherGridPoint[], maxPoints = 6000) {
+  if (incoming.length === 0) return current;
+  const merged = new Map<string, WeatherGridPoint>();
+  let changed = false;
+  current.forEach((point) => merged.set(weatherGridPointKey(point), point));
+  incoming.forEach((point) => {
+    const key = weatherGridPointKey(point);
+    const existing = merged.get(key);
+    if (!existing || !weatherGridPointEquals(existing, point)) changed = true;
+    merged.set(key, point);
+  });
+  if (!changed) return current;
+  const points = Array.from(merged.values());
+  if (points.length <= maxPoints) return points;
+  return points.slice(points.length - maxPoints);
+}
+
+function replaceWeatherGridPoints(current: WeatherGridPoint[], incoming: WeatherGridPoint[]) {
+  return weatherGridPointsEqual(current, incoming) ? current : incoming;
 }
 
 function plusRateLabel(amount: number, unit: RainUnit) {
@@ -1934,8 +1990,8 @@ export function App() {
   const aircraftTrackAttemptedAt = useRef<Record<string, number>>({});
   const homePressTimer = useRef<number | undefined>();
   const homeLongPressTriggered = useRef(false);
-  const activeLayerStateRef = useRef<PrimaryLayer>(activeLayer);
   const aviationBoundsRef = useRef<AviationBounds | undefined>();
+  const activeLayerStateRef = useRef<PrimaryLayer>(activeLayer);
   const pendingWeatherRefresh = useRef(false);
   const pendingAircraftRefresh = useRef(false);
   const lifecycleRefreshAt = useRef(0);
@@ -2112,12 +2168,12 @@ export function App() {
   }
 
   useEffect(() => {
-    activeLayerStateRef.current = activeLayer;
-  }, [activeLayer]);
-
-  useEffect(() => {
     aviationBoundsRef.current = aviationBounds;
   }, [aviationBounds]);
+
+  useEffect(() => {
+    activeLayerStateRef.current = activeLayer;
+  }, [activeLayer]);
 
   async function refreshWeatherGrid(focused = false, force = false) {
     if (!beginRefreshLock("weatherGrid")) {
@@ -2132,74 +2188,57 @@ export function App() {
       const highResolutionWeatherLayer = currentLayer === "temperature" || currentLayer === "wind";
       const viewportStep = focused ? viewportWeatherStep(currentBounds, highResolutionWeatherLayer) : undefined;
       const viewportMaxPoints = focused ? viewportWeatherPointLimit(currentBounds, highResolutionWeatherLayer) : undefined;
-      const cachedGlobalGrid = getCachedWeatherGrid();
+      const cachedGlobalGrid = getCachedWeatherGrid({ maxAgeMs: freshMs });
       if (cachedGlobalGrid?.length) setWeatherGrid((current) => current.length > 0 ? current : cachedGlobalGrid);
+
       if (focused && currentBounds && viewportStep) {
         const cachedViewportGrid = getCachedWeatherGrid({
+          maxAgeMs: freshMs,
           bounds: currentBounds,
           step: viewportStep,
           maxPoints: viewportMaxPoints
         });
-        if (cachedViewportGrid?.length) {
-          setViewportWeatherGrid(cachedViewportGrid);
-        }
+        if (cachedViewportGrid?.length) setViewportWeatherGrid((current) => mergeWeatherGridPoints(current, cachedViewportGrid));
       }
 
-      const shouldFetchGlobalWeather = !focused || !currentBounds || !viewportStep;
-      const globalRequest = shouldFetchGlobalWeather
-        ? fetchWeatherGridWithMeta(undefined, {
-            freshMs
-          })
-        : undefined;
-      const viewportRequest = focused && currentBounds && viewportStep
-        ? fetchWeatherGridWithMeta(undefined, {
-            freshMs,
-            bounds: currentBounds,
-            step: viewportStep,
-            maxPoints: viewportMaxPoints
-          })
-        : undefined;
+      const globalRequest = fetchWeatherGridWithMeta(undefined, { freshMs });
+      const viewportRequest =
+        focused && currentBounds && viewportStep
+          ? fetchWeatherGridWithMeta(undefined, {
+              freshMs,
+              bounds: currentBounds,
+              step: viewportStep,
+              maxPoints: viewportMaxPoints
+            })
+          : undefined;
 
       const [globalResult, viewportResult] = await Promise.allSettled([
-        globalRequest ?? Promise.resolve(undefined),
+        globalRequest,
         viewportRequest ?? Promise.resolve(undefined)
       ]);
 
-      if (globalResult.status === "fulfilled" && globalResult.value?.points.length) {
-        setWeatherGrid(globalResult.value.points);
-        setWeatherGridError(undefined);
-      }
-      if (
-        viewportResult.status === "fulfilled" &&
-        viewportResult.value?.points.length &&
-        requestBoundsKey === viewportWeatherBoundsKey(aviationBoundsRef.current)
-      ) {
-        setViewportWeatherGrid(viewportResult.value.points);
-        setWeatherGridError(undefined);
+      let checkedWeather = false;
+      let fetchedFreshWeather = false;
+
+      if (globalResult.status === "fulfilled" && globalResult.value.points.length) {
+        setWeatherGrid((current) => replaceWeatherGridPoints(current, globalResult.value.points));
+        checkedWeather = true;
+        fetchedFreshWeather ||= !globalResult.value.fromCache;
       }
 
-      const viewportAttempted = Boolean(viewportRequest);
-      const globalAttempted = Boolean(globalRequest);
-      if (
-        globalAttempted &&
-        globalResult.status === "rejected" &&
-        (!viewportAttempted || viewportResult.status === "rejected")
-      ) {
-        setWeatherGridError(globalResult.reason instanceof Error ? globalResult.reason.message : "Unable to refresh weather forecast");
+      const viewportValue = viewportResult.status === "fulfilled" ? viewportResult.value : undefined;
+      if (viewportValue?.points.length && requestBoundsKey === viewportWeatherBoundsKey(aviationBoundsRef.current)) {
+        setViewportWeatherGrid((current) => mergeWeatherGridPoints(current, viewportValue.points));
+        checkedWeather = true;
+        fetchedFreshWeather ||= !viewportValue.fromCache;
+      }
+
+      if (checkedWeather) {
+        setWeatherGridError(undefined);
+        markLiveRefresh("weather", fetchedFreshWeather);
+      } else if (globalResult.status === "rejected") {
         throw globalResult.reason;
       }
-      if (!globalAttempted && viewportAttempted && viewportResult.status === "rejected") {
-        setWeatherGridError(viewportResult.reason instanceof Error ? viewportResult.reason.message : "Unable to refresh weather forecast");
-        throw viewportResult.reason;
-      }
-
-      const weatherChecked =
-        globalResult.status === "fulfilled" && globalResult.value !== undefined ||
-        viewportResult.status === "fulfilled" && viewportResult.value !== undefined;
-      const weatherDataFresh =
-        globalResult.status === "fulfilled" && globalResult.value !== undefined && !globalResult.value.fromCache ||
-        viewportResult.status === "fulfilled" && viewportResult.value !== undefined && !viewportResult.value.fromCache;
-      if (weatherChecked) markLiveRefresh("weather", weatherDataFresh);
     } catch (err) {
       setWeatherGridError(err instanceof Error ? err.message : "Unable to refresh weather forecast");
       // Keep the last successful global weather layer visible.

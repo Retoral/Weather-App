@@ -81,6 +81,10 @@ const LONGITUDE_WRAP_LIMIT = 1_000_000;
 const WORLD_COPY_OFFSETS = [-720, -360, 0, 360, 720];
 const OPENFREEMAP_STYLE_URL = "https://tiles.openfreemap.org/styles/liberty";
 const MAP_MAX_ZOOM = 13;
+const RAIN_RADAR_NATIVE_ZOOM = 7;
+const RAIN_RADAR_COVERAGE_ZOOM = 6;
+const RAIN_RADAR_OPACITY = 0.78;
+const RAIN_RADAR_COVERAGE_OPACITY = 0.28;
 const HOME_MARKER_ICON = `<span aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><path d="M9 22V12h6v10"></path></svg></span>`;
 const PLACE_MARKER_ICON = `<span aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M20 10c0 5.25-8 12-8 12S4 15.25 4 10a8 8 0 1 1 16 0Z"></path><circle cx="12" cy="10" r="3"></circle></svg></span>`;
 const AIRCRAFT_MARKER_ICON = `<svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path d="M10.18 9"></path><path d="m21 16-8-5-8 5V8l8-5 8 5Z"></path><path d="m13 11 4 9h-8Z"></path></svg>`;
@@ -584,153 +588,7 @@ function makeTemperatureLayer(
   includeLocalTime = false,
   units: UnitSettings = DEFAULT_UNIT_SETTINGS
 ) {
-  let surfaceGrid = makeSurfaceGrid(points);
-  let detailGrid = makeSurfaceGrid(surfaceDetailPoints(livePoints));
-  let liveStations = makeSurfaceStations(surfaceStationPoints(livePoints));
-  let surfaceSignature = surfaceGridSignature("temperature", surfaceGrid, detailGrid, liveStations);
-  let currentIncludeLocalTime = includeLocalTime;
-  let currentUnits = units;
-
-  interface TemperatureLayerInternal extends L.Layer {
-    _canvas?: HTMLCanvasElement;
-    _lastRenderKey?: string;
-    _surfaceDraw?: SurfaceRasterDrawHandle;
-    _tooltip?: HTMLDivElement;
-    _weatherMap?: L.Map;
-    _resetFrame?: number;
-    _resetTimer?: number;
-    _hideHover: () => void;
-    _moveHover: (event: L.LeafletMouseEvent) => void;
-    _reset: () => void;
-    _scheduleSettledReset: () => void;
-    updateSurfaceLayer: (nextPoints: WeatherGridPoint[], nextLivePoints: WeatherGridPoint[], nextIncludeLocalTime: boolean, nextUnits: UnitSettings) => void;
-  }
-
-  const CanvasLayer = L.Layer.extend({
-    updateSurfaceLayer(
-      this: TemperatureLayerInternal,
-      nextPoints: WeatherGridPoint[],
-      nextLivePoints: WeatherGridPoint[] = [],
-      nextIncludeLocalTime = false,
-      nextUnits: UnitSettings = DEFAULT_UNIT_SETTINGS
-    ) {
-      surfaceGrid = makeSurfaceGrid(nextPoints);
-      detailGrid = makeSurfaceGrid(surfaceDetailPoints(nextLivePoints));
-      liveStations = makeSurfaceStations(surfaceStationPoints(nextLivePoints));
-      const nextSignature = surfaceGridSignature("temperature", surfaceGrid, detailGrid, liveStations);
-      const shouldRender = nextSignature !== surfaceSignature || !this._lastRenderKey;
-      surfaceSignature = nextSignature;
-      currentIncludeLocalTime = nextIncludeLocalTime;
-      currentUnits = nextUnits;
-      if (shouldRender) {
-        this._surfaceDraw?.cancel();
-        this._surfaceDraw = undefined;
-        this._lastRenderKey = undefined;
-        this._reset();
-        this._scheduleSettledReset();
-      }
-    },
-    onAdd(this: TemperatureLayerInternal, map: L.Map) {
-      this._weatherMap = map;
-      this._canvas = L.DomUtil.create("canvas", "temperature-canvas") as HTMLCanvasElement;
-      this._canvas.style.pointerEvents = "none";
-      this._tooltip = L.DomUtil.create("div", "map-hover-tooltip temperature") as HTMLDivElement;
-      map.getPanes().overlayPane.appendChild(this._canvas);
-      map.getPanes().tooltipPane.appendChild(this._tooltip);
-      map.on("moveend zoomend resize", (this as unknown as { _reset: () => void })._reset, this);
-      map.on("mousemove", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
-      map.on("click", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
-      map.on("mouseout movestart zoomstart", (this as unknown as { _hideHover: () => void })._hideHover, this);
-      (this as unknown as { _reset: () => void })._reset();
-      (this as unknown as { _scheduleSettledReset: () => void })._scheduleSettledReset();
-    },
-    onRemove(this: TemperatureLayerInternal) {
-      if (this._resetFrame !== undefined) window.cancelAnimationFrame(this._resetFrame);
-      if (this._resetTimer !== undefined) window.clearTimeout(this._resetTimer);
-      this._surfaceDraw?.cancel();
-      if (this._canvas?.parentNode) this._canvas.parentNode.removeChild(this._canvas);
-      if (this._tooltip?.parentNode) this._tooltip.parentNode.removeChild(this._tooltip);
-      this._weatherMap?.off("moveend zoomend resize", (this as unknown as { _reset: () => void })._reset, this);
-      this._weatherMap?.off("mousemove", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
-      this._weatherMap?.off("click", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
-      this._weatherMap?.off("mouseout movestart zoomstart", (this as unknown as { _hideHover: () => void })._hideHover, this);
-      this._canvas = undefined;
-      this._tooltip = undefined;
-      this._weatherMap = undefined;
-      this._resetFrame = undefined;
-      this._resetTimer = undefined;
-      this._surfaceDraw = undefined;
-    },
-    _hideHover(this: TemperatureLayerInternal) {
-      if (this._tooltip) this._tooltip.classList.remove("visible");
-    },
-    _moveHover(this: TemperatureLayerInternal, event: L.LeafletMouseEvent) {
-      if (!this._weatherMap || !this._tooltip || surfaceGrid.samples.size === 0 && liveStations.length === 0) return;
-      const map = this._weatherMap;
-      const sample = interpolatedSurfaceSample(surfaceGrid, detailGrid, event.latlng.lat, event.latlng.lng, liveStations);
-      if (!sample) {
-        this._hideHover();
-        return;
-      }
-
-      positionHoverReadout(map, event, this._tooltip);
-      this._tooltip.innerHTML = `<strong>${formatTemperature(sample.temperature, currentUnits.temperatureUnit)}</strong>${currentIncludeLocalTime ? `<span>${localTimeSummary(event.latlng.lat, event.latlng.lng, Date.now())}</span>` : ""}<em>${event.latlng.lat.toFixed(1)}°, ${normalizeLongitude(event.latlng.lng).toFixed(1)}°</em>`;
-      showHoverReadout(this._tooltip);
-    },
-    _scheduleSettledReset(this: TemperatureLayerInternal) {
-      if (this._resetFrame !== undefined) window.cancelAnimationFrame(this._resetFrame);
-      if (this._resetTimer !== undefined) window.clearTimeout(this._resetTimer);
-      this._resetFrame = window.requestAnimationFrame(() => {
-        this._resetFrame = undefined;
-        this._weatherMap?.invalidateSize({ pan: false });
-        this._reset();
-      });
-      this._resetTimer = window.setTimeout(() => {
-        this._resetTimer = undefined;
-        this._weatherMap?.invalidateSize({ pan: false });
-        this._reset();
-      }, 180);
-    },
-    _reset(this: TemperatureLayerInternal) {
-      if (!this._weatherMap || !this._canvas) return;
-      const map = this._weatherMap;
-      const canvas = this._canvas;
-      const size = map.getSize();
-      const topLeft = map.containerPointToLayerPoint([0, 0]);
-      const profile = surfaceRasterProfile(size, map.getZoom());
-      const width = Math.max(1, Math.ceil(size.x * profile.scale));
-      const height = Math.max(1, Math.ceil(size.y * profile.scale));
-      L.DomUtil.setPosition(canvas, topLeft);
-      canvas.style.width = `${size.x}px`;
-      canvas.style.height = `${size.y}px`;
-      const renderKey = surfaceViewportRenderKey("temperature", surfaceSignature, map, width, height, profile);
-      const sizeChanged = canvas.width !== width || canvas.height !== height;
-      if (this._lastRenderKey === renderKey && !sizeChanged) return;
-
-      if (sizeChanged) {
-        canvas.width = width;
-        canvas.height = height;
-      }
-
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return;
-      ctx.imageSmoothingEnabled = true;
-
-      if (surfaceGrid.samples.size === 0 && detailGrid.samples.size === 0 && liveStations.length === 0) {
-        this._surfaceDraw?.cancel();
-        this._surfaceDraw = undefined;
-        ctx.clearRect(0, 0, width, height);
-        this._lastRenderKey = undefined;
-        return;
-      }
-
-      this._surfaceDraw?.cancel();
-      this._lastRenderKey = renderKey;
-      this._surfaceDraw = drawSurfaceRasterTilesIncremental(ctx, map, "temperature", surfaceSignature, profile, width, height, surfaceGrid, detailGrid, liveStations);
-    }
-  });
-
-  return new CanvasLayer();
+  return makeSurfaceCanvasLayer("temperature", points, livePoints, includeLocalTime, units);
 }
 
 function makeWindLayer(
@@ -740,28 +598,48 @@ function makeWindLayer(
   units: UnitSettings = DEFAULT_UNIT_SETTINGS,
   language = "en"
 ) {
+  return makeSurfaceCanvasLayer("wind", points, livePoints, includeLocalTime, units, language);
+}
+
+function makeSurfaceCanvasLayer(
+  kind: SurfaceRasterKind,
+  points: WeatherGridPoint[],
+  livePoints: WeatherGridPoint[] = [],
+  includeLocalTime = false,
+  units: UnitSettings = DEFAULT_UNIT_SETTINGS,
+  language = "en"
+) {
   let surfaceGrid = makeSurfaceGrid(points);
   let detailGrid = makeSurfaceGrid(surfaceDetailPoints(livePoints));
   let liveStations = makeSurfaceStations(surfaceStationPoints(livePoints));
-  let surfaceSignature = surfaceGridSignature("wind", surfaceGrid, detailGrid, liveStations);
-  let streamSignature = windStreamFieldSignature(surfaceGrid, detailGrid, liveStations);
+  let surfaceSignature = surfaceGridSignature(kind, surfaceGrid, detailGrid, liveStations);
+  let streamSignature = kind === "wind" ? windStreamFieldSignature(surfaceGrid, detailGrid, liveStations) : "";
   let currentIncludeLocalTime = includeLocalTime;
   let currentUnits = units;
   let currentLanguage = language;
 
-  interface WindLayerInternal extends L.Layer {
+  interface SurfaceCanvasInternal extends L.Layer {
     _canvas?: HTMLCanvasElement;
     _lastRenderKey?: string;
+    _lastState?: SurfaceCanvasState;
+    _scratch?: HTMLCanvasElement;
     _surfaceDraw?: SurfaceRasterDrawHandle;
     _tooltip?: HTMLDivElement;
     _weatherMap?: L.Map;
     _resetFrame?: number;
     _resetTimer?: number;
     _dataResetTimer?: number;
+    _settledRefreshTimer?: number;
+    _settledRefreshDraw?: SurfaceRasterDrawHandle;
+    _surfacePrewarm?: SurfaceRasterDrawHandle;
+    _lastPrewarmKey?: string;
+    _surfaceRenderComplete?: boolean;
     _hideHover: () => void;
     _moveHover: (event: L.LeafletMouseEvent) => void;
+    _prewarm: (layout: SurfaceCanvasLayout) => void;
     _reset: () => void;
     _scheduleDataReset: () => void;
+    _scheduleSettledSurfaceRefresh: (layout: SurfaceCanvasLayout, renderKey: string, expectedState: SurfaceCanvasState) => void;
     _scheduleSettledReset: () => void;
     updateSurfaceLayer: (
       nextPoints: WeatherGridPoint[],
@@ -774,7 +652,7 @@ function makeWindLayer(
 
   const CanvasLayer = L.Layer.extend({
     updateSurfaceLayer(
-      this: WindLayerInternal,
+      this: SurfaceCanvasInternal,
       nextPoints: WeatherGridPoint[],
       nextLivePoints: WeatherGridPoint[] = [],
       nextIncludeLocalTime = false,
@@ -784,8 +662,8 @@ function makeWindLayer(
       surfaceGrid = makeSurfaceGrid(nextPoints);
       detailGrid = makeSurfaceGrid(surfaceDetailPoints(nextLivePoints));
       liveStations = makeSurfaceStations(surfaceStationPoints(nextLivePoints));
-      const nextSignature = surfaceGridSignature("wind", surfaceGrid, detailGrid, liveStations);
-      const nextStreamSignature = windStreamFieldSignature(surfaceGrid, detailGrid, liveStations);
+      const nextSignature = surfaceGridSignature(kind, surfaceGrid, detailGrid, liveStations);
+      const nextStreamSignature = kind === "wind" ? windStreamFieldSignature(surfaceGrid, detailGrid, liveStations) : "";
       const shouldRender = nextSignature !== surfaceSignature || nextStreamSignature !== streamSignature || !this._lastRenderKey;
       surfaceSignature = nextSignature;
       streamSignature = nextStreamSignature;
@@ -793,31 +671,41 @@ function makeWindLayer(
       currentUnits = nextUnits;
       currentLanguage = nextLanguage;
       if (shouldRender) {
+        if (this._settledRefreshTimer !== undefined) {
+          window.clearTimeout(this._settledRefreshTimer);
+          this._settledRefreshTimer = undefined;
+        }
         this._surfaceDraw?.cancel();
+        this._settledRefreshDraw?.cancel();
         this._surfaceDraw = undefined;
+        this._settledRefreshDraw = undefined;
         this._lastRenderKey = undefined;
+        this._surfaceRenderComplete = false;
         this._scheduleDataReset();
       }
     },
-    onAdd(this: WindLayerInternal, map: L.Map) {
+    onAdd(this: SurfaceCanvasInternal, map: L.Map) {
       this._weatherMap = map;
-      this._canvas = L.DomUtil.create("canvas", "wind-canvas") as HTMLCanvasElement;
+      this._canvas = L.DomUtil.create("canvas", kind === "temperature" ? "temperature-canvas" : "wind-canvas") as HTMLCanvasElement;
       this._canvas.style.pointerEvents = "none";
-      this._tooltip = L.DomUtil.create("div", "map-hover-tooltip wind") as HTMLDivElement;
+      this._tooltip = L.DomUtil.create("div", `map-hover-tooltip ${kind}`) as HTMLDivElement;
       map.getPanes().overlayPane.appendChild(this._canvas);
       map.getPanes().tooltipPane.appendChild(this._tooltip);
       map.on("moveend zoomend resize", (this as unknown as { _reset: () => void })._reset, this);
       map.on("mousemove", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
       map.on("click", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
       map.on("mouseout movestart zoomstart", (this as unknown as { _hideHover: () => void })._hideHover, this);
-      (this as unknown as { _reset: () => void })._reset();
-      (this as unknown as { _scheduleSettledReset: () => void })._scheduleSettledReset();
+      this._reset();
+      this._scheduleSettledReset();
     },
-    onRemove(this: WindLayerInternal) {
+    onRemove(this: SurfaceCanvasInternal) {
       if (this._resetFrame !== undefined) window.cancelAnimationFrame(this._resetFrame);
       if (this._resetTimer !== undefined) window.clearTimeout(this._resetTimer);
       if (this._dataResetTimer !== undefined) window.clearTimeout(this._dataResetTimer);
+      if (this._settledRefreshTimer !== undefined) window.clearTimeout(this._settledRefreshTimer);
       this._surfaceDraw?.cancel();
+      this._settledRefreshDraw?.cancel();
+      this._surfacePrewarm?.cancel();
       if (this._canvas?.parentNode) this._canvas.parentNode.removeChild(this._canvas);
       if (this._tooltip?.parentNode) this._tooltip.parentNode.removeChild(this._tooltip);
       this._weatherMap?.off("moveend zoomend resize", (this as unknown as { _reset: () => void })._reset, this);
@@ -827,35 +715,134 @@ function makeWindLayer(
       this._canvas = undefined;
       this._tooltip = undefined;
       this._weatherMap = undefined;
+      this._scratch = undefined;
+      this._lastState = undefined;
+      this._lastRenderKey = undefined;
       this._resetFrame = undefined;
       this._resetTimer = undefined;
       this._dataResetTimer = undefined;
+      this._settledRefreshTimer = undefined;
       this._surfaceDraw = undefined;
+      this._settledRefreshDraw = undefined;
+      this._surfacePrewarm = undefined;
+      this._lastPrewarmKey = undefined;
+      this._surfaceRenderComplete = undefined;
     },
-    _hideHover(this: WindLayerInternal) {
+    _hideHover(this: SurfaceCanvasInternal) {
+      if (kind === "temperature") {
+        this._tooltip?.classList.remove("visible");
+        return;
+      }
       hideHoverReadout(this._tooltip);
     },
-    _moveHover(this: WindLayerInternal, event: L.LeafletMouseEvent) {
-      if (!this._weatherMap || !this._tooltip || surfaceGrid.samples.size === 0 && liveStations.length === 0) return;
-      const sample = interpolatedSurfaceSample(surfaceGrid, detailGrid, event.latlng.lat, event.latlng.lng, liveStations);
+    _moveHover(this: SurfaceCanvasInternal, event: L.LeafletMouseEvent) {
+      if (
+        !this._weatherMap ||
+        !this._tooltip ||
+        (surfaceGrid.samples.size === 0 && detailGrid.samples.size === 0 && liveStations.length === 0)
+      ) {
+        return;
+      }
+      const sample = interpolatedSurfacePaintSample(surfaceGrid, detailGrid, event.latlng.lat, event.latlng.lng, liveStations);
       if (!sample) {
         this._hideHover();
         return;
       }
 
       positionHoverReadout(this._weatherMap, event, this._tooltip);
-      this._tooltip.innerHTML = windHoverContent(sample, event.latlng.lat, event.latlng.lng, currentUnits, currentLanguage, currentIncludeLocalTime ? forecastSampleTimestamp(sample) : undefined);
+      this._tooltip.innerHTML =
+        kind === "temperature"
+          ? `<strong>${formatTemperature(sample.temperature, currentUnits.temperatureUnit)}</strong>${currentIncludeLocalTime ? `<span>${localTimeSummary(event.latlng.lat, event.latlng.lng, Date.now())}</span>` : ""}<em>${event.latlng.lat.toFixed(1)}°, ${normalizeLongitude(event.latlng.lng).toFixed(1)}°</em>`
+          : windHoverContent(sample, event.latlng.lat, event.latlng.lng, currentUnits, currentLanguage, currentIncludeLocalTime ? forecastSampleTimestamp(sample) : undefined);
       showHoverReadout(this._tooltip);
     },
-    _scheduleDataReset(this: WindLayerInternal) {
+    _scheduleDataReset(this: SurfaceCanvasInternal) {
       if (this._dataResetTimer !== undefined) window.clearTimeout(this._dataResetTimer);
       this._dataResetTimer = window.setTimeout(() => {
         this._dataResetTimer = undefined;
         this._reset();
         this._scheduleSettledReset();
-      }, 140);
+      }, 80);
     },
-    _scheduleSettledReset(this: WindLayerInternal) {
+    _scheduleSettledSurfaceRefresh(this: SurfaceCanvasInternal, layout: SurfaceCanvasLayout, renderKey: string, expectedState: SurfaceCanvasState) {
+      if (this._settledRefreshTimer !== undefined) window.clearTimeout(this._settledRefreshTimer);
+      this._settledRefreshDraw?.cancel();
+      this._settledRefreshDraw = undefined;
+      this._settledRefreshTimer = window.setTimeout(() => {
+        this._settledRefreshTimer = undefined;
+        if (!this._weatherMap || !this._canvas || this._lastRenderKey !== renderKey || !surfaceCanvasStateMatches(this._lastState, expectedState)) {
+          return;
+        }
+
+        const map = this._weatherMap;
+        const nextCanvas = document.createElement("canvas");
+        nextCanvas.className = kind === "temperature" ? "temperature-canvas" : "wind-canvas";
+        nextCanvas.style.pointerEvents = "none";
+        nextCanvas.width = layout.width;
+        nextCanvas.height = layout.height;
+        nextCanvas.style.width = `${layout.cssWidth}px`;
+        nextCanvas.style.height = `${layout.cssHeight}px`;
+        L.DomUtil.setPosition(nextCanvas, layout.topLeft);
+
+        const nextContext = nextCanvas.getContext("2d");
+        if (!nextContext) return;
+        nextContext.imageSmoothingEnabled = true;
+
+        this._settledRefreshDraw = drawSurfaceRasterTilesIncremental(
+          nextContext,
+          map,
+          kind,
+          surfaceSignature,
+          layout.profile,
+          layout.width,
+          layout.height,
+          surfaceGrid,
+          detailGrid,
+          liveStations,
+          {
+            canvasTopLeft: layout.topLeft,
+            containerBounds: layout.bounds,
+            frameBudgetMs: 18,
+            onComplete: () => {
+              this._settledRefreshDraw = undefined;
+              if (
+                !this._weatherMap ||
+                !this._canvas ||
+                this._lastRenderKey !== renderKey ||
+                !surfaceCanvasStateMatches(this._lastState, expectedState)
+              ) {
+                return;
+              }
+
+              if (kind === "wind") {
+                drawWindDirectionStreaks(
+                  nextContext,
+                  map,
+                  surfaceGrid,
+                  detailGrid,
+                  liveStations,
+                  streamSignature,
+                  layout.profile.scale,
+                  layout.width,
+                  layout.height,
+                  layout.topLeft,
+                  layout.bounds
+                );
+              }
+
+              const previousCanvas = this._canvas;
+              const pane = previousCanvas.parentNode;
+              if (!pane) return;
+              pane.insertBefore(nextCanvas, previousCanvas.nextSibling);
+              pane.removeChild(previousCanvas);
+              this._canvas = nextCanvas;
+              this._surfaceRenderComplete = true;
+            }
+          }
+        );
+      }, 70);
+    },
+    _scheduleSettledReset(this: SurfaceCanvasInternal) {
       if (this._resetFrame !== undefined) window.cancelAnimationFrame(this._resetFrame);
       if (this._resetTimer !== undefined) window.clearTimeout(this._resetTimer);
       this._resetFrame = window.requestAnimationFrame(() => {
@@ -869,26 +856,62 @@ function makeWindLayer(
         this._reset();
       }, 180);
     },
-    _reset(this: WindLayerInternal) {
+    _prewarm(this: SurfaceCanvasInternal, layout: SurfaceCanvasLayout) {
+      if (!this._weatherMap || !hasSurfaceRasterData(surfaceGrid, detailGrid)) return;
+      const map = this._weatherMap;
+      const tileZoom = surfaceTileZoom(map.getZoom());
+      const tileRange = visibleSurfaceTileRange(map, tileZoom, layout.bounds);
+      const nextPrewarmKey = [
+        kind,
+        surfaceSignature,
+        streamSignature,
+        tileZoom,
+        layout.profile.scale.toFixed(4),
+        tileRange.minX,
+        tileRange.maxX,
+        tileRange.minY,
+        tileRange.maxY
+      ].join(":");
+      if (this._lastPrewarmKey === nextPrewarmKey) return;
+
+      this._surfacePrewarm?.cancel();
+      this._lastPrewarmKey = nextPrewarmKey;
+      this._surfacePrewarm = prewarmSurfaceRasterTiles(
+        map,
+        kind,
+        surfaceSignature,
+        layout.profile,
+        surfaceGrid,
+        detailGrid,
+        liveStations,
+        {
+          containerBounds: layout.bounds,
+          frameBudgetMs: 3,
+          startDelayMs: 120,
+          rings: 2,
+          maxTiles: 54
+        }
+      );
+    },
+    _reset(this: SurfaceCanvasInternal) {
       if (!this._weatherMap || !this._canvas) return;
       const map = this._weatherMap;
       const canvas = this._canvas;
-      const size = map.getSize();
-      const topLeft = map.containerPointToLayerPoint([0, 0]);
-      const profile = surfaceRasterProfile(size, map.getZoom());
-      const width = Math.max(1, Math.ceil(size.x * profile.scale));
-      const height = Math.max(1, Math.ceil(size.y * profile.scale));
-      L.DomUtil.setPosition(canvas, topLeft);
-      canvas.style.width = `${size.x}px`;
-      canvas.style.height = `${size.y}px`;
-      const renderKey = surfaceViewportRenderKey("wind", surfaceSignature, map, width, height, profile);
-      const sizeChanged = canvas.width !== width || canvas.height !== height;
-      if (this._lastRenderKey === renderKey && !sizeChanged) return;
+      const layout = surfaceCanvasLayout(map);
+      const nextState = surfaceCanvasState(layout.topLeft, layout.width, layout.height, layout.profile, map);
+      const renderKey = surfaceViewportRenderKey(kind, surfaceSignature, map, layout.width, layout.height, layout.profile, layout.bounds);
+      const sizeChanged = canvas.width !== layout.width || canvas.height !== layout.height;
+      const positionChanged = !this._lastState || this._lastState.topLeft.x !== nextState.topLeft.x || this._lastState.topLeft.y !== nextState.topLeft.y;
+      if (this._lastRenderKey === renderKey && surfaceCanvasStateMatches(this._lastState, nextState) && !sizeChanged) return;
 
       if (sizeChanged) {
-        canvas.width = width;
-        canvas.height = height;
+        canvas.width = layout.width;
+        canvas.height = layout.height;
+        this._scratch = undefined;
       }
+      canvas.style.width = `${layout.cssWidth}px`;
+      canvas.style.height = `${layout.cssHeight}px`;
+      L.DomUtil.setPosition(canvas, layout.topLeft);
 
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
@@ -897,19 +920,79 @@ function makeWindLayer(
       if (surfaceGrid.samples.size === 0 && detailGrid.samples.size === 0 && liveStations.length === 0) {
         this._surfaceDraw?.cancel();
         this._surfaceDraw = undefined;
-        ctx.clearRect(0, 0, width, height);
+        ctx.clearRect(0, 0, layout.width, layout.height);
         this._lastRenderKey = undefined;
+        this._lastState = nextState;
+        this._surfaceRenderComplete = true;
         return;
       }
 
+      const canReuseExistingRender = this._surfaceRenderComplete === true;
+      if (this._settledRefreshTimer !== undefined) {
+        window.clearTimeout(this._settledRefreshTimer);
+        this._settledRefreshTimer = undefined;
+      }
+      this._settledRefreshDraw?.cancel();
+      this._settledRefreshDraw = undefined;
       this._surfaceDraw?.cancel();
-      this._lastRenderKey = renderKey;
-      this._surfaceDraw = drawSurfaceRasterTilesIncremental(ctx, map, "wind", surfaceSignature, profile, width, height, surfaceGrid, detailGrid, liveStations, {
-        onComplete: () => {
-          if (this._lastRenderKey !== renderKey || !this._weatherMap || !this._canvas) return;
-          drawWindDirectionStreaks(ctx, map, surfaceGrid, detailGrid, liveStations, streamSignature, profile.scale, width, height);
+      let preserveExisting = false;
+      let invalidRects: SurfaceCanvasRect[] | undefined;
+      if (canReuseExistingRender && !sizeChanged && positionChanged && this._lastState) {
+        if (!this._scratch || this._scratch.width !== canvas.width || this._scratch.height !== canvas.height) {
+          this._scratch = makeSurfaceShiftScratch(canvas.width, canvas.height);
         }
-      });
+        const shift = shiftSurfaceCanvas(canvas, ctx, this._lastState, nextState, this._scratch);
+        if (shift) {
+          preserveExisting = true;
+          invalidRects = shift.invalidRects;
+        }
+      }
+
+      this._lastState = nextState;
+      this._lastRenderKey = renderKey;
+      this._surfaceRenderComplete = false;
+      this._surfaceDraw = drawSurfaceRasterTilesIncremental(
+        ctx,
+        map,
+        kind,
+        surfaceSignature,
+        layout.profile,
+        layout.width,
+        layout.height,
+        surfaceGrid,
+        detailGrid,
+        liveStations,
+        {
+          canvasTopLeft: layout.topLeft,
+          containerBounds: layout.bounds,
+          preserveExisting,
+          invalidRects,
+          frameBudgetMs: preserveExisting ? 10 : 18,
+          onComplete: () => {
+            if (this._lastRenderKey !== renderKey || !this._weatherMap || !this._canvas) return;
+            if (kind === "wind") {
+              drawWindDirectionStreaks(
+                ctx,
+                map,
+                surfaceGrid,
+                detailGrid,
+                liveStations,
+                streamSignature,
+                layout.profile.scale,
+                layout.width,
+                layout.height,
+                layout.topLeft,
+                layout.bounds,
+                preserveExisting ? invalidRects : undefined
+              );
+            }
+            this._surfaceRenderComplete = true;
+            if (preserveExisting && invalidRects?.length) {
+              this._scheduleSettledSurfaceRefresh(layout, renderKey, nextState);
+            }
+          }
+        }
+      );
     }
   });
 
@@ -984,13 +1067,246 @@ function windRgb(windSpeed: number): [number, number, number] {
   return stops[stops.length - 1][1];
 }
 
+interface SurfaceRasterGridLayerInstance extends L.GridLayer {
+  _surfaceKind: SurfaceRasterKind;
+  _surfaceSignature: string;
+  _surfaceGrid: SurfaceGrid;
+  _surfaceDetailGrid: SurfaceGrid;
+  _surfaceStations: SurfaceStation[];
+  _streamSignature?: string;
+  _surfacePrewarm?: SurfaceRasterDrawHandle;
+  _lastPrewarmKey?: string;
+  prewarmSurfaceTiles: (map?: L.Map) => void;
+  updateSurfaceTiles: (
+    signature: string,
+    grid: SurfaceGrid,
+    detailGrid: SurfaceGrid,
+    stations: SurfaceStation[],
+    streamSignature?: string
+  ) => void;
+}
+
+function makeSurfaceRasterGridLayer(
+  kind: SurfaceRasterKind,
+  signature: string,
+  grid: SurfaceGrid,
+  detailGrid: SurfaceGrid,
+  stations: SurfaceStation[],
+  streamSignature?: string
+): SurfaceRasterGridLayerInstance {
+  const SurfaceGridLayer = L.GridLayer.extend({
+    createTile(this: SurfaceRasterGridLayerInstance, coords: L.Coords, done: L.DoneCallback) {
+      const tile = L.DomUtil.create("canvas", `surface-raster-tile ${this._surfaceKind}-tile`) as HTMLCanvasElement;
+      const tileScale = surfaceTileLayerScale(coords.z);
+      const innerSize = Math.max(1, Math.ceil(256 * tileScale));
+      tile.width = innerSize;
+      tile.height = innerSize;
+      tile.style.width = "256px";
+      tile.style.height = "256px";
+
+      const finish = () => done(undefined, tile);
+      const map = (this as unknown as { _map?: L.Map })._map;
+      if (!map || coords.y < 0 || coords.y >= 2 ** coords.z) {
+        finish();
+        return tile;
+      }
+      if (!hasSurfaceRasterData(this._surfaceGrid, this._surfaceDetailGrid)) {
+        finish();
+        return tile;
+      }
+
+      const kind = this._surfaceKind;
+      const signature = this._surfaceSignature;
+      const grid = this._surfaceGrid;
+      const detailGrid = this._surfaceDetailGrid;
+      const stations = this._surfaceStations;
+      const streamSignature = this._streamSignature;
+      const streamFieldSignature = streamSignature ?? signature;
+      const wrappedX = wrapSurfaceTileX(coords.x, coords.z);
+      const tileSignature = cachedSurfaceRasterTileLocalSignature(
+        kind,
+        signature,
+        coords.z,
+        wrappedX,
+        coords.y,
+        tileScale,
+        grid,
+        detailGrid,
+        stations
+      );
+      const key = surfaceRasterTileCacheKey(kind, tileSignature, coords.z, wrappedX, coords.y, tileScale);
+      const cached = getCachedSurfaceRasterTile(key);
+      if (cached) {
+        drawSurfaceRasterTileCanvas(tile, cached);
+        if (kind === "wind") {
+          drawWindDirectionStreaksTile(
+            tile,
+            map,
+            wrappedX,
+            coords.y,
+            coords.z,
+            tileScale,
+            grid,
+            detailGrid,
+            stations,
+            streamFieldSignature
+          );
+        }
+        finish();
+        return tile;
+      }
+
+      const raster = renderSurfaceRasterTile(
+        kind,
+        coords.z,
+        wrappedX,
+        coords.y,
+        tileScale,
+        grid,
+        detailGrid,
+        stations
+      );
+      setSurfaceRasterTileCache(key, raster);
+      drawSurfaceRasterTileCanvas(tile, raster);
+      if (kind === "wind") {
+        drawWindDirectionStreaksTile(
+          tile,
+          map,
+          wrappedX,
+          coords.y,
+          coords.z,
+          tileScale,
+          grid,
+          detailGrid,
+          stations,
+          streamFieldSignature
+        );
+      }
+      finish();
+
+      return tile;
+    },
+    prewarmSurfaceTiles(this: SurfaceRasterGridLayerInstance, map?: L.Map) {
+      const targetMap = map ?? (this as unknown as { _map?: L.Map })._map;
+      if (!targetMap || !hasSurfaceRasterData(this._surfaceGrid, this._surfaceDetailGrid)) return;
+      const tileZoom = surfaceTileZoom(targetMap.getZoom());
+      const tileScale = surfaceTileLayerScale(tileZoom);
+      const visibleRange = visibleSurfaceTileRange(targetMap, tileZoom);
+      const nextPrewarmKey = [
+        this._surfaceKind,
+        this._surfaceSignature,
+        this._streamSignature ?? "",
+        tileZoom,
+        tileScale.toFixed(4),
+        visibleRange.minX,
+        visibleRange.maxX,
+        visibleRange.minY,
+        visibleRange.maxY
+      ].join(":");
+      if (this._lastPrewarmKey === nextPrewarmKey) return;
+
+      this._surfacePrewarm?.cancel();
+      this._lastPrewarmKey = nextPrewarmKey;
+      this._surfacePrewarm = prewarmSurfaceRasterGridTiles(
+        this._surfaceKind,
+        targetMap,
+        this._surfaceGrid,
+        this._surfaceDetailGrid,
+        this._surfaceStations
+      );
+    },
+    updateSurfaceTiles(
+      this: SurfaceRasterGridLayerInstance,
+      nextSignature: string,
+      nextGrid: SurfaceGrid,
+      nextDetailGrid: SurfaceGrid,
+      nextStations: SurfaceStation[],
+      nextStreamSignature?: string
+    ) {
+      if (
+        this._surfaceSignature === nextSignature &&
+        this._streamSignature === nextStreamSignature
+      ) {
+        return;
+      }
+
+      this._surfacePrewarm?.cancel();
+      this._surfacePrewarm = undefined;
+      this._lastPrewarmKey = undefined;
+      if (this._surfaceKind === "wind") clearWindStreamPathCache();
+      this._surfaceSignature = nextSignature;
+      this._surfaceGrid = nextGrid;
+      this._surfaceDetailGrid = nextDetailGrid;
+      this._surfaceStations = nextStations;
+      this._streamSignature = nextStreamSignature;
+      this.redraw();
+      this.prewarmSurfaceTiles();
+    }
+  });
+
+	  const SurfaceGridLayerCtor = SurfaceGridLayer as unknown as { new (options?: L.GridLayerOptions): SurfaceRasterGridLayerInstance };
+	  const layer = new SurfaceGridLayerCtor({
+	    tileSize: 256,
+	    className: `surface-raster-grid ${kind}-grid`,
+		    keepBuffer: 8,
+		    noWrap: false,
+		    opacity: 1,
+		    updateInterval: 80,
+	    updateWhenIdle: false,
+    updateWhenZooming: false,
+    zIndex: 340
+  }) as SurfaceRasterGridLayerInstance;
+  layer._surfaceKind = kind;
+  layer._surfaceSignature = signature;
+  layer._surfaceGrid = grid;
+  layer._surfaceDetailGrid = detailGrid;
+  layer._surfaceStations = stations;
+  layer._streamSignature = streamSignature;
+  return layer;
+}
+
+function surfaceTileLayerScale(zoom: number) {
+  if (zoom < 3) return 0.42;
+  if (zoom < 5) return 0.48;
+  if (zoom < 7) return 0.54;
+  if (zoom < 9) return 0.6;
+  return 0.66;
+}
+
+function wrapSurfaceTileX(tileX: number, zoom: number) {
+  const worldTileCount = 2 ** zoom;
+  return ((tileX % worldTileCount) + worldTileCount) % worldTileCount;
+}
+
+function drawSurfaceRasterTileCanvas(target: HTMLCanvasElement, raster: SurfaceRasterTile) {
+  const ctx = target.getContext("2d");
+  if (!ctx) return;
+  ctx.clearRect(0, 0, target.width, target.height);
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(
+    raster.canvas,
+    raster.gutter,
+    raster.gutter,
+    raster.innerSize,
+    raster.innerSize,
+    0,
+    0,
+    target.width,
+    target.height
+  );
+}
+
 interface SurfaceRasterDrawHandle {
   cancel: () => void;
 }
 
 interface SurfaceRasterDrawOptions {
+  canvasTopLeft?: L.Point;
+  containerBounds?: SurfaceCanvasBounds;
   frameBudgetMs?: number;
+  invalidRects?: SurfaceCanvasRect[];
   onComplete?: () => void;
+  preserveExisting?: boolean;
 }
 
 interface SurfaceRasterDrawItem {
@@ -1005,6 +1321,154 @@ interface SurfaceRasterDrawItem {
     width: number;
     height: number;
   };
+}
+
+interface SurfaceRasterPrewarmOptions {
+  containerBounds?: SurfaceCanvasBounds;
+  frameBudgetMs?: number;
+  startDelayMs?: number;
+  rings?: number;
+  maxTiles?: number;
+}
+
+interface SurfaceCanvasState {
+  topLeft: L.Point;
+  width: number;
+  height: number;
+  scale: number;
+  zoom: number;
+  zoomBucket: string;
+}
+
+interface SurfaceCanvasRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface SurfaceCanvasBounds {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
+
+interface SurfaceCanvasLayout {
+  topLeft: L.Point;
+  bounds: SurfaceCanvasBounds;
+  cssWidth: number;
+  cssHeight: number;
+  width: number;
+  height: number;
+  profile: SurfaceRasterProfile;
+}
+
+interface SurfaceCanvasShift {
+  invalidRects: SurfaceCanvasRect[];
+}
+
+function surfaceCanvasLayout(map: L.Map): SurfaceCanvasLayout {
+  const size = map.getSize();
+  const padding = surfaceCanvasPadding(size);
+  const bounds = {
+    left: -padding.x,
+    top: -padding.y,
+    right: size.x + padding.x,
+    bottom: size.y + padding.y
+  };
+  const cssWidth = Math.max(1, bounds.right - bounds.left);
+  const cssHeight = Math.max(1, bounds.bottom - bounds.top);
+  const profile = surfaceRasterProfile(L.point(cssWidth, cssHeight), map.getZoom());
+
+  return {
+    topLeft: map.containerPointToLayerPoint([bounds.left, bounds.top]),
+    bounds,
+    cssWidth,
+    cssHeight,
+    width: Math.max(1, Math.ceil(cssWidth * profile.scale)),
+    height: Math.max(1, Math.ceil(cssHeight * profile.scale)),
+    profile
+  };
+}
+
+function surfaceCanvasPadding(size: L.Point) {
+  return {
+    x: Math.round(Math.min(1100, Math.max(420, size.x * 0.8))),
+    y: Math.round(Math.min(760, Math.max(320, size.y * 0.8)))
+  };
+}
+
+function surfaceCanvasState(topLeft: L.Point, width: number, height: number, profile: SurfaceRasterProfile, map: L.Map): SurfaceCanvasState {
+  return {
+    topLeft,
+    width,
+    height,
+    scale: profile.scale,
+    zoom: map.getZoom(),
+    zoomBucket: profile.zoomBucket
+  };
+}
+
+function makeSurfaceShiftScratch(width: number, height: number) {
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  return canvas;
+}
+
+function surfaceCanvasStateMatches(previous: SurfaceCanvasState | undefined, next: SurfaceCanvasState) {
+  return Boolean(
+    previous &&
+      previous.width === next.width &&
+      previous.height === next.height &&
+      previous.zoomBucket === next.zoomBucket &&
+      Math.abs(previous.scale - next.scale) <= 0.001 &&
+      Math.abs(previous.zoom - next.zoom) <= 0.001 &&
+      previous.topLeft.x === next.topLeft.x &&
+      previous.topLeft.y === next.topLeft.y
+  );
+}
+
+function shiftSurfaceCanvas(
+  canvas: HTMLCanvasElement,
+  ctx: CanvasRenderingContext2D,
+  previous: SurfaceCanvasState | undefined,
+  next: SurfaceCanvasState,
+  scratch: HTMLCanvasElement
+): SurfaceCanvasShift | undefined {
+  if (
+    !previous ||
+    previous.width !== next.width ||
+    previous.height !== next.height ||
+    previous.zoomBucket !== next.zoomBucket ||
+    Math.abs(previous.scale - next.scale) > 0.001 ||
+    Math.abs(previous.zoom - next.zoom) > 0.001
+  ) {
+    return undefined;
+  }
+
+  const offsetX = Math.round((previous.topLeft.x - next.topLeft.x) * next.scale);
+  const offsetY = Math.round((previous.topLeft.y - next.topLeft.y) * next.scale);
+  if (offsetX === 0 && offsetY === 0) return { invalidRects: [] };
+  if (Math.abs(offsetX) >= next.width || Math.abs(offsetY) >= next.height) return undefined;
+
+  const scratchContext = scratch.getContext("2d");
+  if (!scratchContext) return undefined;
+  scratchContext.clearRect(0, 0, scratch.width, scratch.height);
+  scratchContext.drawImage(canvas, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(scratch, offsetX, offsetY);
+  return { invalidRects: surfaceShiftInvalidRects(offsetX, offsetY, next.width, next.height) };
+}
+
+function surfaceShiftInvalidRects(offsetX: number, offsetY: number, width: number, height: number): SurfaceCanvasRect[] {
+  const rects: SurfaceCanvasRect[] = [];
+  if (offsetX > 0) rects.push({ x: 0, y: 0, width: offsetX, height });
+  if (offsetX < 0) rects.push({ x: width + offsetX, y: 0, width: -offsetX, height });
+  if (offsetY > 0) rects.push({ x: 0, y: 0, width, height: offsetY });
+  if (offsetY < 0) rects.push({ x: 0, y: height + offsetY, width, height: -offsetY });
+  return rects.filter((rect) => rect.width > 0 && rect.height > 0);
 }
 
 function drawSurfaceRasterTilesIncremental(
@@ -1022,61 +1486,32 @@ function drawSurfaceRasterTilesIncremental(
 ): SurfaceRasterDrawHandle {
   let cancelled = false;
   let frameId: number | undefined;
-  ctx.clearRect(0, 0, width, height);
-  const zoom = map.getZoom();
-  const tileZoom = surfaceTileZoom(zoom);
-  const tileScale = profile.scale;
-  const tileRange = visibleSurfaceTileRange(map, tileZoom);
-  const missingTiles: SurfaceRasterDrawItem[] = [];
+  void dataSignature;
+  void profile;
+  const containerBounds = options.containerBounds ?? defaultSurfaceCanvasBounds(map);
+  const clipRects = options.preserveExisting ? options.invalidRects : undefined;
 
-  for (let tileY = tileRange.minY; tileY <= tileRange.maxY; tileY += 1) {
-    for (let tileX = tileRange.minX; tileX <= tileRange.maxX; tileX += 1) {
-      const key = surfaceRasterTileCacheKey(kind, dataSignature, tileZoom, tileX, tileY, tileScale);
-      const dest = surfaceTileDestination(map, tileZoom, tileX, tileY, tileScale);
-      const cached = getCachedSurfaceRasterTile(key);
-      if (cached) {
-        drawSurfaceRasterTile(ctx, cached, dest);
-        continue;
-      }
-
-      missingTiles.push({ key, tileZoom, tileX, tileY, tileScale, dest });
-    }
-  }
-
-  const finish = () => {
-    if (!cancelled) options.onComplete?.();
-  };
-
-  const renderMissingTiles = () => {
+  const paint = () => {
     frameId = undefined;
     if (cancelled) return;
 
-    const budgetMs = options.frameBudgetMs ?? 7;
-    const startedAt = performance.now();
-
-    while (missingTiles.length > 0 && performance.now() - startedAt < budgetMs) {
-      const item = missingTiles.shift();
-      if (!item) break;
-      const cached = getCachedSurfaceRasterTile(item.key);
-      const tile = cached ?? renderSurfaceRasterTile(kind, item.tileZoom, item.tileX, item.tileY, item.tileScale, grid, detailGrid, stations);
-      if (!cached) setSurfaceRasterTileCache(item.key, tile);
-      if (cancelled) return;
-      drawSurfaceRasterTile(ctx, tile, item.dest);
-    }
-
-    if (missingTiles.length > 0) {
-      frameId = window.requestAnimationFrame(renderMissingTiles);
+    if (options.preserveExisting && (!clipRects || clipRects.length === 0)) {
+      options.onComplete?.();
       return;
     }
 
-    finish();
+    if (!options.preserveExisting) {
+      ctx.clearRect(0, 0, width, height);
+    }
+
+    drawSurfaceRasterPreview(ctx, map, kind, width, height, containerBounds, grid, detailGrid, stations, {
+      clipRects,
+      replaceExisting: options.preserveExisting
+    });
+    if (!cancelled) options.onComplete?.();
   };
 
-  if (missingTiles.length === 0) {
-    finish();
-  } else {
-    frameId = window.requestAnimationFrame(renderMissingTiles);
-  }
+  frameId = window.requestAnimationFrame(paint);
 
   return {
     cancel() {
@@ -1086,29 +1521,466 @@ function drawSurfaceRasterTilesIncremental(
   };
 }
 
-function drawSurfaceRasterTile(
+function drawSurfaceRasterPreview(
   ctx: CanvasRenderingContext2D,
-  tile: SurfaceRasterTile,
-  dest: { x: number; y: number; width: number; height: number }
+  map: L.Map,
+  kind: SurfaceRasterKind,
+  width: number,
+  height: number,
+  containerBounds: SurfaceCanvasBounds,
+  grid: SurfaceGrid,
+  detailGrid: SurfaceGrid,
+  stations: SurfaceStation[],
+  options: { clipRects?: SurfaceCanvasRect[]; replaceExisting?: boolean } = {}
 ) {
-  const bleed = Math.min(tile.gutter, 1.25);
-  ctx.drawImage(
-    tile.canvas,
-    tile.gutter - bleed,
-    tile.gutter - bleed,
-    tile.innerSize + bleed * 2,
-    tile.innerSize + bleed * 2,
-    dest.x,
-    dest.y,
-    dest.width,
-    dest.height
+  if (grid.samples.size === 0 && detailGrid.samples.size === 0 && stations.length === 0) return;
+  if (options.clipRects && options.clipRects.length === 0) return;
+
+  const maxPreviewPixels = 34_000;
+  const previewScale = Math.max(0.04, Math.min(0.22, Math.sqrt(maxPreviewPixels / Math.max(1, width * height))));
+  if (options.clipRects?.length) {
+    const stripPreviewScale = Math.max(previewScale, Math.min(0.5, previewScale * 2.8));
+    options.clipRects.forEach((rect) => {
+      drawSurfaceRasterPreviewRect(
+        ctx,
+        map,
+        kind,
+        width,
+        height,
+        surfaceExpandedRect(rect, 18, width, height),
+        stripPreviewScale,
+        containerBounds,
+        grid,
+        detailGrid,
+        stations,
+        options.replaceExisting
+      );
+    });
+    return;
+  }
+
+  drawSurfaceRasterPreviewRect(
+    ctx,
+    map,
+    kind,
+    width,
+    height,
+    { x: 0, y: 0, width, height },
+    previewScale,
+    containerBounds,
+    grid,
+    detailGrid,
+    stations,
+    options.replaceExisting
   );
 }
 
-function surfaceTileDestination(map: L.Map, tileZoom: number, tileX: number, tileY: number, scale: number) {
+function drawSurfaceRasterPreviewRect(
+  ctx: CanvasRenderingContext2D,
+  map: L.Map,
+  kind: SurfaceRasterKind,
+  width: number,
+  height: number,
+  target: SurfaceCanvasRect,
+  previewScale: number,
+  containerBounds: SurfaceCanvasBounds,
+  grid: SurfaceGrid,
+  detailGrid: SurfaceGrid,
+  stations: SurfaceStation[],
+  replaceExisting = false
+) {
+  if (target.width <= 0 || target.height <= 0) return;
+
+  const previewWidth = Math.max(2, Math.ceil(target.width * previewScale));
+  const previewHeight = Math.max(2, Math.ceil(target.height * previewScale));
+  const preview = document.createElement("canvas");
+  preview.width = previewWidth;
+  preview.height = previewHeight;
+  const previewContext = preview.getContext("2d");
+  if (!previewContext) return;
+
+  const image = previewContext.createImageData(previewWidth, previewHeight);
+  const canvasToContainerX = (containerBounds.right - containerBounds.left) / width;
+  const canvasToContainerY = (containerBounds.bottom - containerBounds.top) / height;
+  const rectContainerLeft = containerBounds.left + target.x * canvasToContainerX;
+  const rectContainerTop = containerBounds.top + target.y * canvasToContainerY;
+  const containerScaleX = (target.width * canvasToContainerX) / previewWidth;
+  const containerScaleY = (target.height * canvasToContainerY) / previewHeight;
+
+  for (let y = 0; y < previewHeight; y += 1) {
+    const containerY = rectContainerTop + (y + 0.5) * containerScaleY;
+    for (let x = 0; x < previewWidth; x += 1) {
+      const containerX = rectContainerLeft + (x + 0.5) * containerScaleX;
+      const latLng = map.containerPointToLatLng([containerX, containerY]);
+      const sample = interpolatedSurfacePaintSample(grid, detailGrid, latLng.lat, latLng.lng, stations);
+      const index = (y * previewWidth + x) * 4;
+      if (!sample) {
+        image.data[index + 3] = 0;
+        continue;
+      }
+
+      const rgb = kind === "temperature" ? temperatureRgb(sample.temperature) : windRgb(sample.windSpeed);
+      image.data[index] = rgb[0];
+      image.data[index + 1] = rgb[1];
+      image.data[index + 2] = rgb[2];
+      image.data[index + 3] = kind === "temperature" ? 108 : 116;
+    }
+  }
+
+  previewContext.putImageData(image, 0, 0);
+  ctx.save();
+  if (replaceExisting) {
+    ctx.globalCompositeOperation = "copy";
+  }
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(preview, target.x, target.y, target.width, target.height);
+  ctx.restore();
+}
+
+function surfaceExpandedRect(rect: SurfaceCanvasRect, padding: number, maxWidth: number, maxHeight: number): SurfaceCanvasRect {
+  const x = Math.max(0, rect.x - padding);
+  const y = Math.max(0, rect.y - padding);
+  const right = Math.min(maxWidth, rect.x + rect.width + padding);
+  const bottom = Math.min(maxHeight, rect.y + rect.height + padding);
+  return {
+    x,
+    y,
+    width: Math.max(0, right - x),
+    height: Math.max(0, bottom - y)
+  };
+}
+
+function shouldDrawSurfaceTileDestination(dest: SurfaceCanvasRect, options: SurfaceRasterDrawOptions) {
+  if (!options.preserveExisting) return true;
+  const invalidRects = options.invalidRects ?? [];
+  if (invalidRects.length === 0) return false;
+  return invalidRects.some((rect) => surfaceRectsIntersect(dest, rect));
+}
+
+function surfaceRectsIntersect(left: SurfaceCanvasRect, right: SurfaceCanvasRect) {
+  return (
+    left.x < right.x + right.width &&
+    left.x + left.width > right.x &&
+    left.y < right.y + right.height &&
+    left.y + left.height > right.y
+  );
+}
+
+function surfaceVisibleTilePriority(tile: SurfaceRasterDrawItem, range: SurfaceTileRange) {
+  const centerX = (range.minX + range.maxX) / 2;
+  const centerY = (range.minY + range.maxY) / 2;
+  return Math.hypot(tile.tileX - centerX, tile.tileY - centerY);
+}
+
+function prewarmSurfaceRasterTiles(
+  map: L.Map,
+  kind: SurfaceRasterKind,
+  dataSignature: string,
+  profile: SurfaceRasterProfile,
+  grid: SurfaceGrid,
+  detailGrid: SurfaceGrid,
+  stations: SurfaceStation[],
+  options: SurfaceRasterPrewarmOptions = {}
+): SurfaceRasterDrawHandle {
+  let cancelled = false;
+  let frameId: number | undefined;
+  let delayId: number | undefined;
+  const tileZoom = surfaceTileZoom(map.getZoom());
+  const tileScale = profile.scale;
+  const visibleRange = visibleSurfaceTileRange(map, tileZoom, options.containerBounds);
+  const tiles = surfacePrewarmTileQueue(kind, dataSignature, tileZoom, tileScale, visibleRange, grid, detailGrid, stations, options);
+
+  const warmNextTiles = () => {
+    frameId = undefined;
+    if (cancelled) return;
+
+    if (document.visibilityState !== "visible") {
+      delayId = window.setTimeout(warmNextTiles, 1000);
+      return;
+    }
+
+    const budgetMs = options.frameBudgetMs ?? 3;
+    const startedAt = performance.now();
+
+    while (tiles.length > 0 && performance.now() - startedAt < budgetMs) {
+      const tile = tiles.shift();
+      if (!tile) break;
+      if (getCachedSurfaceRasterTile(tile.key)) continue;
+      setSurfaceRasterTileCache(
+        tile.key,
+        renderSurfaceRasterTile(kind, tile.tileZoom, tile.tileX, tile.tileY, tile.tileScale, grid, detailGrid, stations)
+      );
+    }
+
+    if (tiles.length > 0) {
+      frameId = window.requestAnimationFrame(warmNextTiles);
+    }
+  };
+
+  if (tiles.length > 0) {
+    delayId = window.setTimeout(warmNextTiles, options.startDelayMs ?? 160);
+  }
+
+  return {
+    cancel() {
+      cancelled = true;
+      if (frameId !== undefined) window.cancelAnimationFrame(frameId);
+      if (delayId !== undefined) window.clearTimeout(delayId);
+    }
+  };
+}
+
+function prewarmSurfaceRasterGridTiles(
+  kind: SurfaceRasterKind,
+  map: L.Map,
+  grid: SurfaceGrid,
+  detailGrid: SurfaceGrid,
+  stations: SurfaceStation[]
+): SurfaceRasterDrawHandle {
+  let cancelled = false;
+  let frameId: number | undefined;
+  let delayId: number | undefined;
+  const tileZoom = surfaceTileZoom(map.getZoom());
+  const tileScale = surfaceTileLayerScale(tileZoom);
+  const visibleRange = visibleSurfaceTileRange(map, tileZoom);
+      const tiles = surfaceGridPrewarmTileQueue(kind, tileZoom, tileScale, visibleRange, grid, detailGrid, stations);
+
+  const renderNextTiles = () => {
+    frameId = undefined;
+    if (cancelled) return;
+
+    if (document.visibilityState !== "visible") {
+      delayId = window.setTimeout(renderNextTiles, 1000);
+      return;
+    }
+
+    const startedAt = performance.now();
+    while (tiles.length > 0 && performance.now() - startedAt < SURFACE_GRID_PREWARM_FRAME_BUDGET_MS) {
+      const tile = tiles.shift();
+      if (!tile) break;
+      if (getCachedSurfaceRasterTile(tile.key)) continue;
+      setSurfaceRasterTileCache(
+        tile.key,
+        renderSurfaceRasterTile(kind, tile.tileZoom, tile.tileX, tile.tileY, tile.tileScale, grid, detailGrid, stations)
+      );
+    }
+
+    if (tiles.length > 0) {
+      frameId = window.requestAnimationFrame(renderNextTiles);
+    }
+  };
+
+  if (tiles.length > 0) {
+    delayId = window.setTimeout(renderNextTiles, 80);
+  }
+
+  return {
+    cancel() {
+      cancelled = true;
+      if (frameId !== undefined) window.cancelAnimationFrame(frameId);
+      if (delayId !== undefined) window.clearTimeout(delayId);
+    }
+  };
+}
+
+function surfaceGridPrewarmTileQueue(
+  kind: SurfaceRasterKind,
+  tileZoom: number,
+  tileScale: number,
+  visibleRange: SurfaceTileRange,
+  grid: SurfaceGrid,
+  detailGrid: SurfaceGrid,
+  stations: SurfaceStation[]
+): SurfaceRasterDrawItem[] {
+  const worldTileCount = 2 ** tileZoom;
+  const maxTiles = surfaceGridPrewarmTileLimit(tileZoom);
+  const worldTileTotal = worldTileCount * worldTileCount;
+  const seen = new Set<string>();
+  const queued: Array<SurfaceRasterDrawItem & { priority: number }> = [];
+  const visibleCenterX = wrapSurfaceTileX(Math.round((visibleRange.minX + visibleRange.maxX) / 2), tileZoom);
+  const visibleCenterY = Math.max(0, Math.min(worldTileCount - 1, Math.round((visibleRange.minY + visibleRange.maxY) / 2)));
+
+  const addTile = (tileX: number, tileY: number, priority: number) => {
+    if (tileY < 0 || tileY >= worldTileCount) return;
+    const wrappedX = wrapSurfaceTileX(tileX, tileZoom);
+    const tileSignature = surfaceRasterTileLocalSignature(kind, tileZoom, wrappedX, tileY, tileScale, grid, detailGrid, stations);
+    const key = surfaceRasterTileCacheKey(kind, tileSignature, tileZoom, wrappedX, tileY, tileScale);
+    if (seen.has(key) || surfaceTileCache.has(key)) return;
+    seen.add(key);
+    queued.push({
+      key,
+      tileZoom,
+      tileX: wrappedX,
+      tileY,
+      tileScale,
+      dest: { x: 0, y: 0, width: 0, height: 0 },
+      priority
+    });
+  };
+
+  if (worldTileTotal <= maxTiles) {
+    for (let tileY = 0; tileY < worldTileCount; tileY += 1) {
+      for (let tileX = 0; tileX < worldTileCount; tileX += 1) {
+        addTile(tileX, tileY, surfaceGridPrewarmPriority(tileX, tileY, visibleCenterX, visibleCenterY, worldTileCount));
+      }
+    }
+  } else {
+    const maxRadius = Math.max(worldTileCount, visibleRange.maxX - visibleRange.minX, visibleRange.maxY - visibleRange.minY);
+    for (let radius = 0; radius <= maxRadius && queued.length < maxTiles; radius += 1) {
+      for (let tileY = visibleRange.minY - radius; tileY <= visibleRange.maxY + radius; tileY += 1) {
+        for (let tileX = visibleRange.minX - radius; tileX <= visibleRange.maxX + radius; tileX += 1) {
+          const edgeTile =
+            radius === 0 ||
+            tileY === visibleRange.minY - radius ||
+            tileY === visibleRange.maxY + radius ||
+            tileX === visibleRange.minX - radius ||
+            tileX === visibleRange.maxX + radius;
+          if (!edgeTile) continue;
+          addTile(tileX, tileY, radius);
+          if (queued.length >= maxTiles) break;
+        }
+        if (queued.length >= maxTiles) break;
+      }
+    }
+  }
+
+  return queued
+    .sort((left, right) => left.priority - right.priority || left.tileY - right.tileY || left.tileX - right.tileX)
+    .slice(0, maxTiles)
+    .map(({ priority: _priority, ...tile }) => tile);
+}
+
+function surfaceGridPrewarmPriority(tileX: number, tileY: number, centerX: number, centerY: number, worldTileCount: number) {
+  const rawXDistance = Math.abs(tileX - centerX);
+  const wrappedXDistance = Math.min(rawXDistance, worldTileCount - rawXDistance);
+  return Math.hypot(wrappedXDistance, tileY - centerY);
+}
+
+function surfaceGridPrewarmTileLimit(tileZoom: number) {
+  if (tileZoom <= 2) return 64;
+  if (tileZoom === 3) return 96;
+  if (tileZoom === 4) return 160;
+  if (tileZoom === 5) return 220;
+  if (tileZoom === 6) return 240;
+  if (tileZoom === 7) return 180;
+  if (tileZoom === 8) return 120;
+  return 80;
+}
+
+function surfacePrewarmTileQueue(
+  kind: SurfaceRasterKind,
+  dataSignature: string,
+  tileZoom: number,
+  tileScale: number,
+  visibleRange: SurfaceTileRange,
+  grid: SurfaceGrid,
+  detailGrid: SurfaceGrid,
+  stations: SurfaceStation[],
+  options: SurfaceRasterPrewarmOptions
+): SurfaceRasterDrawItem[] {
+  const rings = options.rings ?? surfacePrewarmRings(tileZoom);
+  const maxTiles = options.maxTiles ?? surfacePrewarmTileLimit(tileZoom);
+  const expandedRange = expandSurfaceTileRange(visibleRange, rings, tileZoom);
+  const queued: Array<SurfaceRasterDrawItem & { priority: number }> = [];
+
+  for (let tileY = expandedRange.minY; tileY <= expandedRange.maxY; tileY += 1) {
+    for (let tileX = expandedRange.minX; tileX <= expandedRange.maxX; tileX += 1) {
+      if (tileY >= visibleRange.minY && tileY <= visibleRange.maxY && tileX >= visibleRange.minX && tileX <= visibleRange.maxX) continue;
+      const wrappedX = wrapSurfaceTileX(tileX, tileZoom);
+      const tileSignature = cachedSurfaceRasterTileLocalSignature(kind, dataSignature, tileZoom, wrappedX, tileY, tileScale, grid, detailGrid, stations);
+      const key = surfaceRasterTileCacheKey(kind, tileSignature, tileZoom, wrappedX, tileY, tileScale);
+      if (surfaceTileCache.has(key)) continue;
+      queued.push({
+        key,
+        tileZoom,
+        tileX: wrappedX,
+        tileY,
+        tileScale,
+        dest: { x: 0, y: 0, width: 0, height: 0 },
+        priority: surfaceTileRingDistance(tileX, tileY, visibleRange)
+      });
+    }
+  }
+
+  return queued
+    .sort((left, right) => left.priority - right.priority || left.tileY - right.tileY || left.tileX - right.tileX)
+    .slice(0, maxTiles)
+    .map(({ priority: _priority, ...tile }) => tile);
+}
+
+function expandSurfaceTileRange(range: SurfaceTileRange, rings: number, tileZoom: number): SurfaceTileRange {
+  const worldTileCount = 2 ** tileZoom;
+  return {
+    minX: range.minX - rings,
+    maxX: range.maxX + rings,
+    minY: Math.max(0, range.minY - rings),
+    maxY: Math.min(worldTileCount - 1, range.maxY + rings)
+  };
+}
+
+function surfaceTileRingDistance(tileX: number, tileY: number, range: SurfaceTileRange) {
+  const xDistance = tileX < range.minX ? range.minX - tileX : tileX > range.maxX ? tileX - range.maxX : 0;
+  const yDistance = tileY < range.minY ? range.minY - tileY : tileY > range.maxY ? tileY - range.maxY : 0;
+  return Math.max(xDistance, yDistance);
+}
+
+function surfacePrewarmRings(tileZoom: number) {
+  if (tileZoom <= 3) return 1;
+  if (tileZoom <= 7) return 2;
+  return 3;
+}
+
+function surfacePrewarmTileLimit(tileZoom: number) {
+  if (tileZoom <= 3) return 28;
+  if (tileZoom <= 7) return 48;
+  return 72;
+}
+
+function drawSurfaceRasterTile(
+  ctx: CanvasRenderingContext2D,
+  tile: SurfaceRasterTile,
+  dest: { x: number; y: number; width: number; height: number },
+  replaceExisting = false,
+  clipRects?: SurfaceCanvasRect[]
+) {
+  const bleed = Math.min(tile.gutter, 1.25);
+  const draw = () => {
+    ctx.drawImage(
+      tile.canvas,
+      tile.gutter - bleed,
+      tile.gutter - bleed,
+      tile.innerSize + bleed * 2,
+      tile.innerSize + bleed * 2,
+      dest.x,
+      dest.y,
+      dest.width,
+      dest.height
+    );
+  };
+
+  if (!replaceExisting) {
+    draw();
+    return;
+  }
+
+  ctx.save();
+  ctx.globalCompositeOperation = "copy";
+  const relevantClipRects = clipRects?.filter((rect) => surfaceRectsIntersect(dest, rect));
+  if (relevantClipRects?.length) {
+    ctx.beginPath();
+    relevantClipRects.forEach((rect) => {
+      ctx.rect(rect.x, rect.y, rect.width, rect.height);
+    });
+    ctx.clip();
+  }
+  draw();
+  ctx.restore();
+}
+
+function surfaceTileDestination(map: L.Map, tileZoom: number, tileX: number, tileY: number, scale: number, canvasTopLeft?: L.Point) {
   const zoomScale = map.getZoomScale(map.getZoom(), tileZoom);
-  const start = projectWorldPointToCanvasPoint(map, tileX * 256 * zoomScale, tileY * 256 * zoomScale, scale);
-  const end = projectWorldPointToCanvasPoint(map, (tileX + 1) * 256 * zoomScale, (tileY + 1) * 256 * zoomScale, scale);
+  const start = projectWorldPointToCanvasPoint(map, tileX * 256 * zoomScale, tileY * 256 * zoomScale, scale, canvasTopLeft);
+  const end = projectWorldPointToCanvasPoint(map, (tileX + 1) * 256 * zoomScale, (tileY + 1) * 256 * zoomScale, scale, canvasTopLeft);
   return {
     x: start.x,
     y: start.y,
@@ -1124,11 +1996,20 @@ interface SurfaceTileRange {
   maxY: number;
 }
 
-function visibleSurfaceTileRange(map: L.Map, tileZoom: number): SurfaceTileRange {
+function defaultSurfaceCanvasBounds(map: L.Map): SurfaceCanvasBounds {
   const size = map.getSize();
   const padding = 80;
-  const northWest = map.containerPointToLatLng([-padding, -padding]);
-  const southEast = map.containerPointToLatLng([size.x + padding, size.y + padding]);
+  return {
+    left: -padding,
+    top: -padding,
+    right: size.x + padding,
+    bottom: size.y + padding
+  };
+}
+
+function visibleSurfaceTileRange(map: L.Map, tileZoom: number, containerBounds: SurfaceCanvasBounds = defaultSurfaceCanvasBounds(map)): SurfaceTileRange {
+  const northWest = map.containerPointToLatLng([containerBounds.left, containerBounds.top]);
+  const southEast = map.containerPointToLatLng([containerBounds.right, containerBounds.bottom]);
   const northWestPoint = map.project(northWest, tileZoom);
   const southEastPoint = map.project(southEast, tileZoom);
   const worldTileCount = 2 ** tileZoom;
@@ -1155,11 +2036,167 @@ interface SurfaceRasterTile {
 }
 
 const surfaceTileCache = new Map<string, SurfaceTileCacheEntry>();
-const SURFACE_TILE_CACHE_LIMIT = 900;
-const SURFACE_TILE_GUTTER = 2;
+const SURFACE_TILE_CACHE_LIMIT = 1800;
+const SURFACE_TILE_GUTTER = 3;
+const SURFACE_GRID_PREWARM_FRAME_BUDGET_MS = 2;
+const SURFACE_TILE_RENDER_FRAME_BUDGET_MS = 7;
+const SURFACE_TILE_LOCAL_SIGNATURE_VERSION = "tile-local-v1";
+const surfaceTileRenderQueue: Array<() => void> = [];
+let surfaceTileRenderFrame: number | undefined;
+const surfaceTileSignatureCache = new Map<string, string>();
+const SURFACE_TILE_SIGNATURE_CACHE_LIMIT = 6000;
+
+interface SurfaceTileDataBounds {
+  south: number;
+  north: number;
+  west: number;
+  east: number;
+  wrapsLongitude: boolean;
+  allLongitudes: boolean;
+}
+
+function enqueueSurfaceTileRender(render: () => void) {
+  surfaceTileRenderQueue.push(render);
+  if (surfaceTileRenderFrame !== undefined) return;
+  surfaceTileRenderFrame = window.requestAnimationFrame(flushSurfaceTileRenderQueue);
+}
+
+function flushSurfaceTileRenderQueue() {
+  surfaceTileRenderFrame = undefined;
+  const startedAt = performance.now();
+  let rendered = 0;
+
+  while (surfaceTileRenderQueue.length > 0 && (rendered === 0 || performance.now() - startedAt < SURFACE_TILE_RENDER_FRAME_BUDGET_MS)) {
+    const render = surfaceTileRenderQueue.shift();
+    render?.();
+    rendered += 1;
+  }
+
+  if (surfaceTileRenderQueue.length > 0) {
+    surfaceTileRenderFrame = window.requestAnimationFrame(flushSurfaceTileRenderQueue);
+  }
+}
 
 function surfaceRasterTileCacheKey(kind: SurfaceRasterKind, dataSignature: string, tileZoom: number, tileX: number, tileY: number, tileScale: number) {
   return [kind, dataSignature, tileZoom, tileX, tileY, tileScale.toFixed(4)].join(":");
+}
+
+function cachedSurfaceRasterTileLocalSignature(
+  kind: SurfaceRasterKind,
+  dataSignature: string,
+  tileZoom: number,
+  tileX: number,
+  tileY: number,
+  tileScale: number,
+  grid: SurfaceGrid,
+  detailGrid: SurfaceGrid,
+  stations: SurfaceStation[]
+) {
+  const signatureKey = surfaceRasterTileCacheKey(kind, dataSignature, tileZoom, tileX, tileY, tileScale);
+  const cached = surfaceTileSignatureCache.get(signatureKey);
+  if (cached) {
+    surfaceTileSignatureCache.delete(signatureKey);
+    surfaceTileSignatureCache.set(signatureKey, cached);
+    return cached;
+  }
+
+  const signature = surfaceRasterTileLocalSignature(kind, tileZoom, tileX, tileY, tileScale, grid, detailGrid, stations);
+  surfaceTileSignatureCache.set(signatureKey, signature);
+  while (surfaceTileSignatureCache.size > SURFACE_TILE_SIGNATURE_CACHE_LIMIT) {
+    const oldestKey = surfaceTileSignatureCache.keys().next().value;
+    if (!oldestKey) break;
+    surfaceTileSignatureCache.delete(oldestKey);
+  }
+  return signature;
+}
+
+function surfaceRasterTileLocalSignature(
+  kind: SurfaceRasterKind,
+  tileZoom: number,
+  tileX: number,
+  tileY: number,
+  tileScale: number,
+  grid: SurfaceGrid,
+  detailGrid: SurfaceGrid,
+  stations: SurfaceStation[]
+) {
+  const bounds = surfaceRasterTileDataBounds(tileZoom, tileX, tileY, tileScale, grid, detailGrid);
+  let hash = 2166136261;
+  hash = hashSurfaceValue(hash, SURFACE_TILE_LOCAL_SIGNATURE_VERSION);
+  hash = hashSurfaceValue(hash, kind);
+  hash = hashSurfaceValue(hash, tileZoom);
+  hash = hashSurfaceValue(hash, tileScale);
+  hash = hashSurfaceValue(hash, bounds.south);
+  hash = hashSurfaceValue(hash, bounds.north);
+  hash = hashSurfaceValue(hash, bounds.west);
+  hash = hashSurfaceValue(hash, bounds.east);
+  hash = hashSurfaceValue(hash, bounds.wrapsLongitude ? 1 : 0);
+  hash = hashSurfaceValue(hash, bounds.allLongitudes ? 1 : 0);
+  hash = hashSurfaceGridSubset(hash, kind, "base", grid, bounds);
+  hash = hashSurfaceGridSubset(hash, kind, "detail", detailGrid, bounds);
+  hash = hashSurfaceStationSubset(hash, kind, stations, bounds);
+  return (hash >>> 0).toString(36);
+}
+
+function surfaceRasterTileDataBounds(
+  tileZoom: number,
+  tileX: number,
+  tileY: number,
+  tileScale: number,
+  grid: SurfaceGrid,
+  detailGrid: SurfaceGrid
+): SurfaceTileDataBounds {
+  const innerSize = Math.max(1, Math.ceil(256 * tileScale));
+  const pixelPadding = SURFACE_TILE_GUTTER + 4;
+  const northWest = mapTilePointToLatLng(tileX, tileY, -pixelPadding, -pixelPadding, tileScale, tileZoom);
+  const southEast = mapTilePointToLatLng(tileX, tileY, innerSize + pixelPadding, innerSize + pixelPadding, tileScale, tileZoom);
+  const latMargin = surfaceRasterTileCoordinateMargin(grid.latStep, detailGrid.latStep, 2);
+  const lonMargin = surfaceRasterTileCoordinateMargin(grid.lonStep, detailGrid.lonStep, 2);
+  const south = Math.max(SURFACE_GRID_MIN_LAT, Math.min(northWest.lat, southEast.lat) - latMargin);
+  const north = Math.min(SURFACE_GRID_MAX_LAT, Math.max(northWest.lat, southEast.lat) + latMargin);
+  const west = normalizeLongitude(northWest.lng);
+  const east = normalizeLongitude(southEast.lng);
+  const rawSpan = Math.abs(southEast.lng - northWest.lng);
+  const span = rawSpan >= 360 ? 360 : positiveLongitudeSpan(west, east);
+  const allLongitudes = span + lonMargin * 2 >= 360;
+  const expandedWest = normalizeLongitude(west - lonMargin);
+  const expandedEast = normalizeLongitude(east + lonMargin);
+
+  return {
+    south,
+    north,
+    west: allLongitudes ? -180 : expandedWest,
+    east: allLongitudes ? 180 : expandedEast,
+    wrapsLongitude: !allLongitudes && expandedWest > expandedEast,
+    allLongitudes
+  };
+}
+
+function surfaceRasterTileCoordinateMargin(primaryStep: number, secondaryStep: number, minimum: number) {
+  const steps = [primaryStep, secondaryStep].filter((step) => Number.isFinite(step) && step > 0);
+  return Math.min(90, Math.max(minimum, ...steps.map((step) => step * 2.25)));
+}
+
+function positiveLongitudeSpan(west: number, east: number) {
+  return (normalizeLongitude(east) - normalizeLongitude(west) + 360) % 360;
+}
+
+function surfacePointInDataBounds(lat: number, lon: number, bounds: SurfaceTileDataBounds) {
+  if (lat < bounds.south || lat > bounds.north) return false;
+  if (bounds.allLongitudes) return true;
+  const normalizedLon = normalizeLongitude(lon);
+  return bounds.wrapsLongitude
+    ? normalizedLon >= bounds.west || normalizedLon <= bounds.east
+    : normalizedLon >= bounds.west && normalizedLon <= bounds.east;
+}
+
+function surfaceGridKeyParts(key: string) {
+  const separatorIndex = key.indexOf(":");
+  if (separatorIndex === -1) return undefined;
+  const lat = Number(key.slice(0, separatorIndex));
+  const lon = Number(key.slice(separatorIndex + 1));
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return undefined;
+  return { lat, lon };
 }
 
 function getCachedSurfaceRasterTile(key: string) {
@@ -1177,6 +2214,10 @@ function setSurfaceRasterTileCache(key: string, tile: SurfaceRasterTile) {
     if (!oldestKey) break;
     surfaceTileCache.delete(oldestKey);
   }
+}
+
+function hasSurfaceRasterData(grid: SurfaceGrid, detailGrid: SurfaceGrid) {
+  return grid.samples.size > 0 || detailGrid.samples.size > 0;
 }
 
 function getSurfaceRasterTile(
@@ -1244,7 +2285,7 @@ function renderSurfaceRasterTile(
       image.data[index] = rgb[0];
       image.data[index + 1] = rgb[1];
       image.data[index + 2] = rgb[2];
-      image.data[index + 3] = kind === "temperature" ? 116 : 124;
+      image.data[index + 3] = kind === "temperature" ? 150 : 146;
     }
   }
 
@@ -1262,6 +2303,58 @@ function mapTilePointToLatLng(tileX: number, tileY: number, x: number, y: number
   return { lat, lng: lon };
 }
 
+function drawWindDirectionStreaksTile(
+  tile: HTMLCanvasElement,
+  map: L.Map,
+  tileX: number,
+  tileY: number,
+  zoom: number,
+  scale: number,
+  grid: SurfaceGrid,
+  detailGrid: SurfaceGrid,
+  stations: SurfaceStation[],
+  streamSignature: string
+) {
+  const ctx = tile.getContext("2d");
+  if (!ctx) return;
+
+  const resolution = windStreamResolution(zoom);
+  const speedFloor = 0.8;
+  const northWest = mapTilePointToLatLng(tileX, tileY, 0, 0, 1, zoom);
+  const southEast = mapTilePointToLatLng(tileX, tileY, 256, 256, 1, zoom);
+  const north = Math.min(SURFACE_GRID_MAX_LAT, Math.max(northWest.lat, southEast.lat));
+  const south = Math.max(SURFACE_GRID_MIN_LAT, Math.min(northWest.lat, southEast.lat));
+  const west = Math.min(northWest.lng, southEast.lng);
+  const east = Math.max(northWest.lng, southEast.lng);
+  const startLatIndex = Math.floor(south / resolution.latStep) - 2;
+  const endLatIndex = Math.ceil(north / resolution.latStep) + 2;
+  const startLonIndex = Math.floor(west / resolution.lonStep) - 2;
+  const endLonIndex = Math.ceil(east / resolution.lonStep) + 2;
+
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+
+  for (let latIndex = startLatIndex; latIndex <= endLatIndex; latIndex += 1) {
+    for (let lonIndex = startLonIndex; lonIndex <= endLonIndex; lonIndex += 1) {
+      const { lat, lon } = windStreamSeedPoint(latIndex, lonIndex, resolution);
+      if (lat < SURFACE_GRID_MIN_LAT || lat > SURFACE_GRID_MAX_LAT) continue;
+      const turnScore = windStreamTurnScore(grid, detailGrid, stations, lat, lon, resolution);
+      if (!windStreamShouldRender(latIndex, lonIndex, resolution, turnScore)) continue;
+      const lengthVariation = windStreamLengthVariation(latIndex, lonIndex);
+      const path = cachedWindStreamPath(
+        `${streamSignature}:stream-tile-v1:${resolution.key}:${latIndex}:${lonIndex}`,
+        () => traceWindStreamPath(map, grid, detailGrid, stations, zoom, lat, lon, speedFloor, lengthVariation)
+      );
+      if (!path) continue;
+
+      drawWindStreamPathOnTile(ctx, map, path, scale, tileX, tileY, zoom);
+    }
+  }
+
+  ctx.restore();
+}
+
 function drawWindDirectionStreaks(
   ctx: CanvasRenderingContext2D,
   map: L.Map,
@@ -1271,14 +2364,30 @@ function drawWindDirectionStreaks(
   streamSignature: string,
   scale: number,
   width: number,
-  height: number
+  height: number,
+  canvasTopLeft: L.Point = map.containerPointToLayerPoint([0, 0]),
+  containerBounds: SurfaceCanvasBounds = defaultSurfaceCanvasBounds(map),
+  clipRects?: SurfaceCanvasRect[]
 ) {
+  if (clipRects) {
+    if (clipRects.length === 0) return;
+    clipRects.forEach((rect) => {
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(rect.x, rect.y, rect.width, rect.height);
+      ctx.clip();
+      drawWindDirectionStreaks(ctx, map, grid, detailGrid, stations, streamSignature, scale, width, height, canvasTopLeft, containerBounds);
+      ctx.restore();
+    });
+    return;
+  }
+
   const zoom = map.getZoom();
   const resolution = windStreamResolution(zoom);
   const speedFloor = 0.8;
   const viewPadding = resolution.pixelSpacing * 1.8;
-  const northWest = map.containerPointToLatLng([-viewPadding, -viewPadding]);
-  const southEast = map.containerPointToLatLng([width / scale + viewPadding, height / scale + viewPadding]);
+  const northWest = map.containerPointToLatLng([containerBounds.left - viewPadding, containerBounds.top - viewPadding]);
+  const southEast = map.containerPointToLatLng([containerBounds.right + viewPadding, containerBounds.bottom + viewPadding]);
   const north = Math.min(SURFACE_GRID_MAX_LAT, Math.max(northWest.lat, southEast.lat));
   const south = Math.max(SURFACE_GRID_MIN_LAT, Math.min(northWest.lat, southEast.lat));
   const west = Math.min(northWest.lng, southEast.lng);
@@ -1306,7 +2415,7 @@ function drawWindDirectionStreaks(
       );
       if (!path) continue;
 
-      drawWindStreamPath(ctx, map, path, scale);
+      drawWindStreamPath(ctx, map, path, scale, canvasTopLeft);
     }
   }
 
@@ -1412,6 +2521,10 @@ interface WindStreamPath {
 
 const windStreamPathCache = new Map<string, WindStreamPath | null>();
 const WIND_STREAM_PATH_CACHE_LIMIT = 12000;
+
+function clearWindStreamPathCache() {
+  windStreamPathCache.clear();
+}
 
 function cachedWindStreamPath(key: string, compute: () => WindStreamPath | undefined) {
   if (windStreamPathCache.has(key)) {
@@ -1534,9 +2647,9 @@ function normalizeVector(vector: { x: number; y: number }) {
   };
 }
 
-function drawWindStreamPath(ctx: CanvasRenderingContext2D, map: L.Map, path: WindStreamPath, scale: number) {
+function drawWindStreamPath(ctx: CanvasRenderingContext2D, map: L.Map, path: WindStreamPath, scale: number, canvasTopLeft?: L.Point) {
   const points = path.points.map((point) => {
-    return projectLatLngToCanvasPoint(map, point.lat, point.lon, scale);
+    return projectLatLngToCanvasPoint(map, point.lat, point.lon, scale, canvasTopLeft);
   });
   if (points.length < 2) return;
 
@@ -1552,17 +2665,49 @@ function drawWindStreamPath(ctx: CanvasRenderingContext2D, map: L.Map, path: Win
   strokeSmoothPath(ctx, points, lineWidth, windGradient);
 }
 
-function projectLatLngToCanvasPoint(map: L.Map, lat: number, lon: number, scale: number) {
-  const point = map.project([lat, lon], map.getZoom());
-  return projectWorldPointToCanvasPoint(map, point.x, point.y, scale);
+function drawWindStreamPathOnTile(
+  ctx: CanvasRenderingContext2D,
+  map: L.Map,
+  path: WindStreamPath,
+  scale: number,
+  tileX: number,
+  tileY: number,
+  zoom: number
+) {
+  const points = path.points.map((point) => projectLatLngToSurfaceTilePoint(map, point.lat, point.lon, scale, tileX, tileY, zoom));
+  if (points.length < 2) return;
+
+  const lineWidth = Math.max(1.2, (2.4 + path.speedRatio * 1.8) * scale);
+  const start = points[0];
+  const end = points[points.length - 1];
+  const windGradient = ctx.createLinearGradient(start.x, start.y, end.x, end.y);
+  windGradient.addColorStop(0, "rgba(255, 255, 255, 1)");
+  windGradient.addColorStop(0.36, "rgba(255, 255, 255, 0.68)");
+  windGradient.addColorStop(0.72, "rgba(255, 255, 255, 0.24)");
+  windGradient.addColorStop(1, "rgba(255, 255, 255, 0)");
+
+  strokeSmoothPath(ctx, points, lineWidth, windGradient);
 }
 
-function projectWorldPointToCanvasPoint(map: L.Map, worldX: number, worldY: number, scale: number) {
-  const pixelOrigin = map.getPixelOrigin();
-  const canvasTopLeft = map.containerPointToLayerPoint([0, 0]);
+function projectLatLngToSurfaceTilePoint(map: L.Map, lat: number, lon: number, scale: number, tileX: number, tileY: number, zoom: number) {
+  const point = map.project([lat, lon], zoom);
   return {
-    x: (worldX - pixelOrigin.x - canvasTopLeft.x) * scale,
-    y: (worldY - pixelOrigin.y - canvasTopLeft.y) * scale
+    x: (point.x - tileX * 256) * scale,
+    y: (point.y - tileY * 256) * scale
+  };
+}
+
+function projectLatLngToCanvasPoint(map: L.Map, lat: number, lon: number, scale: number, canvasTopLeft?: L.Point) {
+  const point = map.project([lat, lon], map.getZoom());
+  return projectWorldPointToCanvasPoint(map, point.x, point.y, scale, canvasTopLeft);
+}
+
+function projectWorldPointToCanvasPoint(map: L.Map, worldX: number, worldY: number, scale: number, canvasTopLeft?: L.Point) {
+  const pixelOrigin = map.getPixelOrigin();
+  const origin = canvasTopLeft ?? map.containerPointToLayerPoint([0, 0]);
+  return {
+    x: (worldX - pixelOrigin.x - origin.x) * scale,
+    y: (worldY - pixelOrigin.y - origin.y) * scale
   };
 }
 
@@ -1610,23 +2755,23 @@ interface SurfaceGrid {
   samples: Map<string, SurfaceSample>;
   latStep: number;
   lonStep: number;
+  latValues: number[];
+  lonValues: number[];
+  wrapsLongitude: boolean;
 }
 
 type SurfaceRasterKind = "temperature" | "wind";
 
-interface SurfaceRasterCacheEntry {
-  width: number;
-  height: number;
-  image: ImageData;
-}
-
-const surfaceRasterCache = new Map<string, SurfaceRasterCacheEntry>();
-
 function makeSurfaceGrid(points: WeatherGridPoint[]) {
+  const latValues = sortedSurfaceCoordinates(points.map((point) => point.lat));
+  const lonValues = sortedSurfaceCoordinates(points.map((point) => normalizeLongitude(point.lon)));
   const grid: SurfaceGrid = {
     samples: new Map<string, SurfaceSample>(),
-    latStep: inferredCoordinateStep(points.map((point) => point.lat), 10),
-    lonStep: inferredCoordinateStep(points.map((point) => normalizeLongitude(point.lon)), 10)
+    latStep: inferredCoordinateStep(latValues, 10),
+    lonStep: inferredCoordinateStep(lonValues, 10),
+    latValues,
+    lonValues,
+    wrapsLongitude: surfaceGridWrapsLongitude(lonValues)
   };
 
   points.forEach((point) => {
@@ -1644,6 +2789,19 @@ function makeSurfaceGrid(points: WeatherGridPoint[]) {
     });
   });
   return grid;
+}
+
+function sortedSurfaceCoordinates(values: number[]) {
+  return Array.from(new Set(values.map(roundSurfaceCoordinate))).sort((left, right) => left - right);
+}
+
+function roundSurfaceCoordinate(value: number) {
+  return Math.round(value * 1000) / 1000;
+}
+
+function surfaceGridWrapsLongitude(values: number[]) {
+  if (values.length < 3) return false;
+  return values[0] <= -175 && values[values.length - 1] >= 170;
 }
 
 function surfaceDetailPoints(points: WeatherGridPoint[]) {
@@ -1686,7 +2844,7 @@ function makeSurfaceStations(points: WeatherGridPoint[] = []): SurfaceStation[] 
 }
 
 function surfaceGridKey(lat: number, lon: number) {
-  return `${(Math.round(lat * 1000) / 1000).toFixed(3)}:${(Math.round(normalizeLongitude(lon) * 1000) / 1000).toFixed(3)}`;
+  return `${roundSurfaceCoordinate(lat).toFixed(3)}:${roundSurfaceCoordinate(normalizeLongitude(lon)).toFixed(3)}`;
 }
 
 interface SurfaceRasterProfile {
@@ -1800,6 +2958,26 @@ function hashSurfaceStations(hash: number, kind: SurfaceRasterKind, stations: Su
   return nextHash;
 }
 
+function hashSurfaceStationSubset(
+  hash: number,
+  kind: SurfaceRasterKind,
+  stations: SurfaceStation[],
+  bounds: SurfaceTileDataBounds
+) {
+  const visibleStations = stations
+    .filter((station) => surfacePointInDataBounds(station.lat, station.lon, bounds))
+    .sort((left, right) => left.lat - right.lat || normalizeLongitude(left.lon) - normalizeLongitude(right.lon));
+  let nextHash = hashSurfaceValue(hash, "stations");
+  nextHash = hashSurfaceValue(nextHash, visibleStations.length);
+  visibleStations.forEach((station) => {
+    nextHash = hashSurfaceValue(nextHash, station.lat);
+    nextHash = hashSurfaceValue(nextHash, normalizeLongitude(station.lon));
+    nextHash = hashSurfaceValue(nextHash, surfaceSampleSignatureValue(kind, station));
+    if (kind === "wind") nextHash = hashSurfaceValue(nextHash, station.windDirection);
+  });
+  return nextHash;
+}
+
 function hashSurfaceGrid(hash: number, kind: SurfaceRasterKind, label: string, grid: SurfaceGrid) {
   let nextHash = hashSurfaceValue(hash, label);
   nextHash = hashSurfaceValue(nextHash, grid.latStep);
@@ -1822,6 +3000,40 @@ function hashSurfaceGrid(hash: number, kind: SurfaceRasterKind, label: string, g
   return nextHash;
 }
 
+function hashSurfaceGridSubset(
+  hash: number,
+  kind: SurfaceRasterKind,
+  label: string,
+  grid: SurfaceGrid,
+  bounds: SurfaceTileDataBounds
+) {
+  const entries = Array.from(grid.samples.entries())
+    .filter(([key]) => {
+      const parts = surfaceGridKeyParts(key);
+      return parts ? surfacePointInDataBounds(parts.lat, parts.lon, bounds) : false;
+    })
+    .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey));
+  let nextHash = hashSurfaceValue(hash, label);
+  nextHash = hashSurfaceValue(nextHash, grid.latStep);
+  nextHash = hashSurfaceValue(nextHash, grid.lonStep);
+  nextHash = hashSurfaceValue(nextHash, grid.latValues[0]);
+  nextHash = hashSurfaceValue(nextHash, grid.latValues[grid.latValues.length - 1]);
+  nextHash = hashSurfaceValue(nextHash, grid.lonValues[0]);
+  nextHash = hashSurfaceValue(nextHash, grid.lonValues[grid.lonValues.length - 1]);
+  nextHash = hashSurfaceValue(nextHash, grid.wrapsLongitude ? 1 : 0);
+  nextHash = hashSurfaceValue(nextHash, entries.length);
+  entries.forEach(([key, sample]) => {
+    nextHash = hashSurfaceValue(nextHash, key);
+    nextHash = hashSurfaceValue(nextHash, surfaceSampleSignatureValue(kind, sample));
+    if (kind === "wind") nextHash = hashSurfaceValue(nextHash, sample.windDirection);
+  });
+  return nextHash;
+}
+
+function surfaceSampleSignatureValue(kind: SurfaceRasterKind, sample: SurfaceSample) {
+  return kind === "temperature" ? sample.temperature : sample.windSpeed;
+}
+
 function hashSurfaceValue(hash: number, value: string | number | undefined) {
   const text =
     typeof value === "number"
@@ -1838,17 +3050,17 @@ function hashSurfaceValue(hash: number, value: string | number | undefined) {
   return Math.imul(nextHash, 16777619);
 }
 
-function surfaceRasterCacheKey(kind: SurfaceRasterKind, dataSignature: string, map: L.Map, width: number, height: number, profile: SurfaceRasterProfile) {
-  const size = map.getSize();
-  const northWest = map.containerPointToLatLng([0, 0]);
-  const southEast = map.containerPointToLatLng([size.x, size.y]);
-  const north = northWest.lat;
-  const south = southEast.lat;
-  const west = normalizeLongitude(northWest.lng);
-  const east = normalizeLongitude(southEast.lng);
-  const lonSpan = longitudeSpan(west, east);
-  const latSnap = Math.max(0.000001, Math.abs(north - south) / Math.max(1, height) * profile.coordinateSnapPixels);
-  const lonSnap = Math.max(0.000001, lonSpan / Math.max(1, width) * profile.coordinateSnapPixels);
+function surfaceViewportRenderKey(
+  kind: SurfaceRasterKind,
+  dataSignature: string,
+  map: L.Map,
+  width: number,
+  height: number,
+  profile: SurfaceRasterProfile,
+  containerBounds?: SurfaceCanvasBounds
+) {
+  const tileZoom = surfaceTileZoom(map.getZoom());
+  const tileRange = visibleSurfaceTileRange(map, tileZoom, containerBounds);
   return [
     kind,
     dataSignature,
@@ -1856,75 +3068,72 @@ function surfaceRasterCacheKey(kind: SurfaceRasterKind, dataSignature: string, m
     width,
     height,
     profile.scale.toFixed(4),
-    map.getZoom().toFixed(2),
-    surfaceRasterCacheCoordinate(north, latSnap),
-    surfaceRasterCacheCoordinate(west, lonSnap),
-    surfaceRasterCacheCoordinate(south, latSnap),
-    surfaceRasterCacheCoordinate(east, lonSnap)
+    tileZoom,
+    tileRange.minX,
+    tileRange.maxX,
+    tileRange.minY,
+    tileRange.maxY
   ].join(":");
-}
-
-function surfaceViewportRenderKey(kind: SurfaceRasterKind, dataSignature: string, map: L.Map, width: number, height: number, profile: SurfaceRasterProfile) {
-  const center = map.getCenter();
-  return [
-    kind,
-    dataSignature,
-    profile.zoomBucket,
-    width,
-    height,
-    profile.scale.toFixed(4),
-    map.getZoom().toFixed(4),
-    center.lat.toFixed(7),
-    center.lng.toFixed(7)
-  ].join(":");
-}
-
-function longitudeSpan(west: number, east: number) {
-  const delta = Math.abs(east - west);
-  return delta > 180 ? 360 - delta : delta;
-}
-
-function surfaceRasterCacheCoordinate(value: number, snapStep: number) {
-  const snapped = Math.round(value / snapStep) * snapStep;
-  const precision = Math.max(3, Math.min(6, Math.ceil(-Math.log10(snapStep)) + 2));
-  return snapped.toFixed(precision);
-}
-
-function getSurfaceRasterCache(key: string, width: number, height: number) {
-  const cached = surfaceRasterCache.get(key);
-  if (!cached || cached.width !== width || cached.height !== height) return undefined;
-  surfaceRasterCache.delete(key);
-  surfaceRasterCache.set(key, cached);
-  return cached.image;
-}
-
-function setSurfaceRasterCache(key: string, width: number, height: number, image: ImageData) {
-  surfaceRasterCache.set(key, { width, height, image });
-  while (surfaceRasterCache.size > SURFACE_RASTER_CACHE_LIMIT) {
-    const oldestKey = surfaceRasterCache.keys().next().value;
-    if (!oldestKey) break;
-    surfaceRasterCache.delete(oldestKey);
-  }
 }
 
 function gridCell(grid: SurfaceGrid, lat: number, lon: number) {
-  const latStep = grid.latStep;
-  const lonStep = grid.lonStep;
   const clampedLat = Math.max(SURFACE_GRID_MIN_LAT, Math.min(SURFACE_GRID_MAX_LAT, lat));
+  const latBracket = bracketSurfaceCoordinate(grid.latValues, clampedLat);
+  const lonBracket = bracketSurfaceLongitude(grid, lon);
+
+  return {
+    south: latBracket.lower,
+    north: latBracket.upper,
+    west: lonBracket.lower,
+    east: lonBracket.upper,
+    latRatio: latBracket.ratio,
+    lonRatio: lonBracket.ratio
+  };
+}
+
+function bracketSurfaceCoordinate(values: number[], value: number) {
+  if (values.length === 0) return { lower: value, upper: value, ratio: 0 };
+  if (values.length === 1 || value <= values[0]) return { lower: values[0], upper: values[0], ratio: 0 };
+  const last = values[values.length - 1];
+  if (value >= last) return { lower: last, upper: last, ratio: 0 };
+
+  const upperIndex = upperSurfaceCoordinateIndex(values, value);
+  const lower = values[Math.max(0, upperIndex - 1)];
+  const upper = values[upperIndex];
+  return { lower, upper, ratio: upper === lower ? 0 : (value - lower) / (upper - lower) };
+}
+
+function bracketSurfaceLongitude(grid: SurfaceGrid, lon: number) {
+  const values = grid.lonValues;
   const normalizedLon = normalizeLongitude(lon);
-  const south =
-    clampedLat >= SURFACE_GRID_MAX_LAT
-      ? SURFACE_GRID_MAX_LAT - latStep
-      : Math.floor(clampedLat / latStep) * latStep;
-  const north = Math.min(SURFACE_GRID_MAX_LAT, south + latStep);
-  const latRatio = north === south ? 0 : (clampedLat - south) / (north - south);
+  if (values.length === 0) return { lower: normalizedLon, upper: normalizedLon, ratio: 0 };
+  if (values.length === 1) return { lower: values[0], upper: values[0], ratio: 0 };
 
-  const shiftedLon = normalizedLon + 180;
-  const west = -180 + Math.floor(shiftedLon / lonStep) * lonStep;
-  const east = west + lonStep >= 180 ? -180 : west + lonStep;
-  const lonRatio = (shiftedLon - Math.floor(shiftedLon / lonStep) * lonStep) / lonStep;
+  if (!grid.wrapsLongitude) return bracketSurfaceCoordinate(values, normalizedLon);
 
-  return { south, north, west, east, latRatio, lonRatio };
+  const first = values[0];
+  const last = values[values.length - 1];
+  if (normalizedLon < first || normalizedLon > last) {
+    const adjusted = normalizedLon < first ? normalizedLon + 360 : normalizedLon;
+    const span = first + 360 - last;
+    return { lower: last, upper: first, ratio: span <= 0 ? 0 : (adjusted - last) / span };
+  }
+
+  return bracketSurfaceCoordinate(values, normalizedLon);
+}
+
+function upperSurfaceCoordinateIndex(values: number[], value: number) {
+  let low = 0;
+  let high = values.length - 1;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (values[middle] <= value) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+  return low;
 }
 
 function interpolatedSurfaceSample(
@@ -1934,8 +3143,7 @@ function interpolatedSurfaceSample(
   lon: number,
   stations: SurfaceStation[] = []
 ): SurfaceSample | undefined {
-  const base = interpolatedGridSample(detailGrid, lat, lon) ?? interpolatedGridSample(grid, lat, lon);
-  return blendSurfaceStations(base, stations, lat, lon);
+  return interpolatedSurfacePaintSample(grid, detailGrid, lat, lon, stations);
 }
 
 function interpolatedSurfacePaintSample(
@@ -1945,8 +3153,84 @@ function interpolatedSurfacePaintSample(
   lon: number,
   stations: SurfaceStation[] = []
 ): SurfaceSample | undefined {
-  const base = interpolatedGridCellSample(detailGrid, lat, lon) ?? interpolatedGridCellSample(grid, lat, lon);
-  return blendSurfaceStations(base, stations, lat, lon);
+  const base = interpolatedGridSample(grid, lat, lon);
+  const detail = surfaceDetailSampleWithWeight(detailGrid, lat, lon);
+  const blended = blendSurfaceSamples(base, detail?.sample, detail?.weight ?? 0);
+  return blendSurfaceStations(blended, stations, lat, lon);
+}
+
+function surfaceDetailSampleWithWeight(grid: SurfaceGrid, lat: number, lon: number) {
+  if (grid.samples.size === 0) return undefined;
+
+  const cellSample = interpolatedGridCellSample(grid, lat, lon, true);
+  if (cellSample) {
+    const edgeWeight = surfaceGridInteriorWeight(grid, lat, lon);
+    return { sample: cellSample, weight: 0.72 * edgeWeight };
+  }
+
+  const nearest = nearestSurfacePoint(grid, lat, lon);
+  const maxDistance = surfaceGridNearestDistanceKm(grid);
+  if (!nearest || nearest.distance > maxDistance) return undefined;
+
+  const distanceWeight = smoothstep(maxDistance, 0, nearest.distance);
+  return { sample: nearest.sample, weight: 0.28 * distanceWeight };
+}
+
+function surfaceGridInteriorWeight(grid: SurfaceGrid, lat: number, lon: number) {
+  if (grid.samples.size === 0 || grid.latValues.length === 0 || grid.lonValues.length === 0) return 0;
+  const latEdgeDistance = Math.min(
+    Math.abs(lat - grid.latValues[0]),
+    Math.abs(grid.latValues[grid.latValues.length - 1] - lat)
+  );
+  const lonEdgeDistance = surfaceLongitudeEdgeDistance(grid, lon);
+  const latFadeDistance = Math.max(grid.latStep * 2.4, 1.5);
+  const lonFadeDistance = Math.max(grid.lonStep * 2.4, 1.5);
+  return Math.min(
+    smoothstep(0, latFadeDistance, latEdgeDistance),
+    smoothstep(0, lonFadeDistance, lonEdgeDistance)
+  );
+}
+
+function surfaceLongitudeEdgeDistance(grid: SurfaceGrid, lon: number) {
+  const normalizedLon = normalizeLongitude(lon);
+  const first = grid.lonValues[0];
+  const last = grid.lonValues[grid.lonValues.length - 1];
+  if (grid.wrapsLongitude) {
+    const distanceToFirst = Math.abs((((normalizedLon - first) % 360) + 540) % 360 - 180);
+    const distanceToLast = Math.abs((((normalizedLon - last) % 360) + 540) % 360 - 180);
+    return Math.min(distanceToFirst, distanceToLast);
+  }
+  return Math.min(Math.abs(normalizedLon - first), Math.abs(last - normalizedLon));
+}
+
+function blendSurfaceSamples(base: SurfaceSample | undefined, detail: SurfaceSample | undefined, detailWeight: number) {
+  if (!base) return detail;
+  if (!detail || detailWeight <= 0.001) return base;
+
+  const weight = Math.max(0, Math.min(0.85, detailWeight));
+  const baseWeight = 1 - weight;
+  const mix = (key: keyof Omit<SurfaceSample, "time" | "weatherCode" | "windDirection">) =>
+    (base[key] ?? 0) * baseWeight + (detail[key] ?? 0) * weight;
+  const baseVector = windDirectionVector(base.windDirection);
+  const detailVector = windDirectionVector(detail.windDirection);
+  const windVector = {
+    x: baseVector.x * baseWeight + detailVector.x * weight,
+    y: baseVector.y * baseWeight + detailVector.y * weight
+  };
+  const metadataSample = weight >= 0.45 ? detail : base;
+
+  return {
+    temperature: mix("temperature"),
+    time: metadataSample.time ?? base.time ?? detail.time,
+    weatherCode: metadataSample.weatherCode ?? base.weatherCode ?? detail.weatherCode,
+    windSpeed: mix("windSpeed"),
+    windGust: mix("windGust"),
+    windDirection: normalizeBearing((Math.atan2(windVector.x, windVector.y) * 180) / Math.PI),
+    precipitation: mix("precipitation"),
+    precipitationProbability: mix("precipitationProbability"),
+    pressure: mix("pressure"),
+    cloudCover: mix("cloudCover")
+  };
 }
 
 function interpolatedGridSample(grid: SurfaceGrid, lat: number, lon: number): SurfaceSample | undefined {
@@ -1960,7 +3244,18 @@ function interpolatedGridSample(grid: SurfaceGrid, lat: number, lon: number): Su
   };
 }
 
-function interpolatedGridCellSample(grid: SurfaceGrid, lat: number, lon: number): SurfaceSample | undefined {
+function interpolatedDetailGridSample(grid: SurfaceGrid, lat: number, lon: number): SurfaceSample | undefined {
+  const interpolated = interpolatedGridCellSample(grid, lat, lon, true);
+  if (!interpolated) return undefined;
+  const nearest = nearestSurfaceSample(grid, lat, lon);
+  return {
+    ...interpolated,
+    time: nearest?.time ?? interpolated.time,
+    weatherCode: nearest?.weatherCode ?? interpolated.weatherCode
+  };
+}
+
+function interpolatedGridCellSample(grid: SurfaceGrid, lat: number, lon: number, requireFullCorners = false): SurfaceSample | undefined {
   const { south, north, west, east, latRatio, lonRatio } = gridCell(grid, lat, lon);
   const southwest = readSurfaceGrid(grid, south, west);
   const southeast = readSurfaceGrid(grid, south, east);
@@ -1968,6 +3263,7 @@ function interpolatedGridCellSample(grid: SurfaceGrid, lat: number, lon: number)
   const northeast = readSurfaceGrid(grid, north, east);
 
   if (!southwest || !southeast || !northwest || !northeast) {
+    if (requireFullCorners) return undefined;
     return weightedSurfaceCornerSample(
       [
         southwest ? { sample: southwest, x: 0, y: 0 } : undefined,
@@ -2132,18 +3428,65 @@ function nearestSurfaceSample(grid: SurfaceGrid, lat: number, lon: number) {
   return nearestSurfacePoint(grid, lat, lon)?.sample;
 }
 
+function nearestSurfaceSampleWithin(grid: SurfaceGrid, lat: number, lon: number, maxDistanceKm: number) {
+  const nearest = nearestSurfacePoint(grid, lat, lon);
+  if (!nearest || nearest.distance > maxDistanceKm) return undefined;
+  return nearest.sample;
+}
+
+function surfaceGridNearestDistanceKm(grid: SurfaceGrid) {
+  if (grid.samples.size === 0) return 0;
+  return Math.max(180, Math.max(grid.latStep, grid.lonStep) * 170);
+}
+
 function nearestSurfacePoint(grid: SurfaceGrid, lat: number, lon: number) {
   let nearest: { lat: number; lon: number; sample: SurfaceSample; distance: number } | undefined;
-  grid.samples.forEach((sample, key) => {
-    const [sampleLatText, sampleLonText] = key.split(":");
-    const sampleLat = Number(sampleLatText);
-    const sampleLon = Number(sampleLonText);
-    if (!Number.isFinite(sampleLat) || !Number.isFinite(sampleLon)) return;
-    const distance = surfaceDistanceKm(lat, lon, sampleLat, sampleLon);
-    if (!nearest || distance < nearest.distance) nearest = { lat: sampleLat, lon: sampleLon, sample, distance };
-  });
+
+  for (const radius of [1, 2, 4, 7]) {
+    const latCandidates = nearbySurfaceCoordinates(grid.latValues, lat, radius, false);
+    const lonCandidates = nearbySurfaceCoordinates(grid.lonValues, normalizeLongitude(lon), radius, grid.wrapsLongitude);
+    latCandidates.forEach((sampleLat) => {
+      lonCandidates.forEach((sampleLon) => {
+        const sample = readSurfaceGrid(grid, sampleLat, sampleLon);
+        if (!sample) return;
+        const adjustedLon = sampleLon + Math.round((lon - sampleLon) / 360) * 360;
+        const distance = surfaceDistanceKm(lat, lon, sampleLat, adjustedLon);
+        if (!nearest || distance < nearest.distance) {
+          nearest = { lat: sampleLat, lon: adjustedLon, sample, distance };
+        }
+      });
+    });
+    if (nearest) break;
+  }
+
   if (!nearest) return undefined;
-  return { lat: nearest.lat, lon: nearest.lon + Math.round((lon - nearest.lon) / 360) * 360, sample: nearest.sample };
+  return nearest;
+}
+
+function nearbySurfaceCoordinates(values: number[], value: number, radius: number, wrap: boolean) {
+  if (values.length === 0) return [];
+  if (values.length === 1) return [values[0]];
+
+  const normalizedValue = wrap ? normalizeLongitude(value) : value;
+  const upperIndex = Math.min(values.length - 1, Math.max(0, upperSurfaceCoordinateIndex(values, normalizedValue)));
+  const indexes = new Set<number>();
+  for (let offset = -radius; offset <= radius; offset += 1) {
+    const rawIndex = upperIndex + offset;
+    if (wrap) {
+      indexes.add(((rawIndex % values.length) + values.length) % values.length);
+    } else if (rawIndex >= 0 && rawIndex < values.length) {
+      indexes.add(rawIndex);
+    }
+  }
+
+  return Array.from(indexes)
+    .map((index) => values[index])
+    .sort((left, right) => surfaceCoordinateDistance(normalizedValue, left, wrap) - surfaceCoordinateDistance(normalizedValue, right, wrap));
+}
+
+function surfaceCoordinateDistance(value: number, coordinate: number, wrap: boolean) {
+  const distance = Math.abs(value - coordinate);
+  return wrap ? Math.min(distance, 360 - distance) : distance;
 }
 
 function lerp(start: number, end: number, ratio: number) {
@@ -2165,16 +3508,97 @@ function hideHoverReadout(tooltip?: HTMLDivElement) {
 }
 
 function localTimeSummary(lat: number, lon: number, timestamp: number) {
-  const local = localTimeInfo(lon, timestamp);
+  const local = localTimeInfo(lat, lon, timestamp);
   return `${local.time} ${local.offsetLabel} · ${localLightLabel(lat, lon, timestamp)}`;
 }
 
 function localTimeHoverContent(lat: number, lon: number, timestamp: number) {
-  const local = localTimeInfo(lon, timestamp);
+  const local = localTimeInfo(lat, lon, timestamp);
   return `<strong>${local.time}</strong><span>${local.offsetLabel} · ${localLightLabel(lat, lon, timestamp)}</span><em>${lat.toFixed(1)}°, ${normalizeLongitude(lon).toFixed(1)}°</em>`;
 }
 
-function localTimeInfo(lon: number, timestamp: number) {
+interface TimeZoneRegion {
+  timeZone: string;
+  minLat: number;
+  maxLat: number;
+  minLon: number;
+  maxLon: number;
+}
+
+const APPROXIMATE_TIME_ZONE_REGIONS: TimeZoneRegion[] = [
+  { timeZone: "Pacific/Honolulu", minLat: 18, maxLat: 23, minLon: -161, maxLon: -154 },
+  { timeZone: "America/Anchorage", minLat: 51, maxLat: 72, minLon: -170, maxLon: -130 },
+  { timeZone: "America/Los_Angeles", minLat: 31, maxLat: 60, minLon: -125, maxLon: -114 },
+  { timeZone: "America/Denver", minLat: 31, maxLat: 55, minLon: -114, maxLon: -102 },
+  { timeZone: "America/Chicago", minLat: 25, maxLat: 55, minLon: -102, maxLon: -85 },
+  { timeZone: "America/New_York", minLat: 24, maxLat: 55, minLon: -85, maxLon: -66 },
+  { timeZone: "America/Mexico_City", minLat: 14, maxLat: 29, minLon: -117, maxLon: -86 },
+  { timeZone: "America/Bogota", minLat: -5, maxLat: 14, minLon: -82, maxLon: -66 },
+  { timeZone: "America/Lima", minLat: -19, maxLat: 1, minLon: -82, maxLon: -68 },
+  { timeZone: "America/Santiago", minLat: -56, maxLat: -17, minLon: -76, maxLon: -66 },
+  { timeZone: "America/Argentina/Buenos_Aires", minLat: -56, maxLat: -21, minLon: -73, maxLon: -53 },
+  { timeZone: "America/Sao_Paulo", minLat: -34, maxLat: 6, minLon: -54, maxLon: -35 },
+  { timeZone: "Atlantic/Reykjavik", minLat: 63, maxLat: 68, minLon: -25, maxLon: -12 },
+  { timeZone: "Europe/London", minLat: 49, maxLat: 61, minLon: -11, maxLon: 2 },
+  { timeZone: "Europe/Lisbon", minLat: 36, maxLat: 43, minLon: -10, maxLon: -6 },
+  { timeZone: "Europe/Madrid", minLat: 35, maxLat: 44, minLon: -10, maxLon: 5 },
+  { timeZone: "Europe/Paris", minLat: 42, maxLat: 51, minLon: -5, maxLon: 8 },
+  { timeZone: "Europe/Berlin", minLat: 47, maxLat: 56, minLon: 5, maxLon: 16 },
+  { timeZone: "Europe/Rome", minLat: 36, maxLat: 47, minLon: 6, maxLon: 19 },
+  { timeZone: "Europe/Stockholm", minLat: 55, maxLat: 70, minLon: 10, maxLon: 25 },
+  { timeZone: "Europe/Helsinki", minLat: 59, maxLat: 70, minLon: 19, maxLon: 32 },
+  { timeZone: "Europe/Athens", minLat: 34, maxLat: 42, minLon: 19, maxLon: 30 },
+  { timeZone: "Europe/Istanbul", minLat: 35, maxLat: 43, minLon: 26, maxLon: 45 },
+  { timeZone: "Europe/Moscow", minLat: 50, maxLat: 72, minLon: 30, maxLon: 60 },
+  { timeZone: "Africa/Casablanca", minLat: 27, maxLat: 36, minLon: -14, maxLon: -1 },
+  { timeZone: "Africa/Cairo", minLat: 22, maxLat: 32, minLon: 24, maxLon: 36 },
+  { timeZone: "Africa/Johannesburg", minLat: -35, maxLat: -22, minLon: 16, maxLon: 33 },
+  { timeZone: "Asia/Jerusalem", minLat: 29, maxLat: 34, minLon: 34, maxLon: 36 },
+  { timeZone: "Asia/Dubai", minLat: 22, maxLat: 27, minLon: 51, maxLon: 57 },
+  { timeZone: "Asia/Kolkata", minLat: 6, maxLat: 36, minLon: 68, maxLon: 90 },
+  { timeZone: "Asia/Bangkok", minLat: 5, maxLat: 22, minLon: 97, maxLon: 106 },
+  { timeZone: "Asia/Singapore", minLat: 1, maxLat: 2, minLon: 103, maxLon: 105 },
+  { timeZone: "Asia/Hong_Kong", minLat: 21, maxLat: 23, minLon: 113, maxLon: 115 },
+  { timeZone: "Asia/Taipei", minLat: 21, maxLat: 26, minLon: 119, maxLon: 123 },
+  { timeZone: "Asia/Seoul", minLat: 33, maxLat: 39, minLon: 124, maxLon: 132 },
+  { timeZone: "Asia/Tokyo", minLat: 24, maxLat: 46, minLon: 123, maxLon: 146 },
+  { timeZone: "Asia/Shanghai", minLat: 18, maxLat: 54, minLon: 73, maxLon: 135 },
+  { timeZone: "Australia/Perth", minLat: -36, maxLat: -13, minLon: 112, maxLon: 130 },
+  { timeZone: "Australia/Darwin", minLat: -26, maxLat: -10, minLon: 129, maxLon: 138 },
+  { timeZone: "Australia/Adelaide", minLat: -38, maxLat: -26, minLon: 129, maxLon: 141 },
+  { timeZone: "Australia/Brisbane", minLat: -29, maxLat: -10, minLon: 138, maxLon: 154 },
+  { timeZone: "Australia/Sydney", minLat: -44, maxLat: -29, minLon: 141, maxLon: 154 },
+  { timeZone: "Pacific/Auckland", minLat: -48, maxLat: -34, minLon: 166, maxLon: 179 }
+];
+
+const timeFormatterCache = new Map<string, Intl.DateTimeFormat>();
+const zoneNameFormatterCache = new Map<string, Intl.DateTimeFormat>();
+const zonePartsFormatterCache = new Map<string, Intl.DateTimeFormat>();
+const unsupportedTimeZones = new Set<string>();
+
+function localTimeInfo(lat: number, lon: number, timestamp: number) {
+  const timeZone = approximateIanaTimeZone(lat, lon);
+  const zoned = timeZone ? zonedLocalTimeInfo(timeZone, timestamp) : undefined;
+  if (zoned) return zoned;
+  return fixedOffsetLocalTimeInfo(lon, timestamp);
+}
+
+function zonedLocalTimeInfo(timeZone: string, timestamp: number) {
+  if (unsupportedTimeZones.has(timeZone)) return undefined;
+
+  try {
+    const date = new Date(timestamp);
+    return {
+      time: timeFormatter(timeZone).format(date),
+      offsetLabel: timeZoneLabel(timeZone, date)
+    };
+  } catch {
+    unsupportedTimeZones.add(timeZone);
+    return undefined;
+  }
+}
+
+function fixedOffsetLocalTimeInfo(lon: number, timestamp: number) {
   const offsetMinutes = Math.round(normalizeLongitude(lon) / 15) * 60;
   const local = new Date(timestamp + offsetMinutes * 60_000);
   const hours = `${local.getUTCHours()}`.padStart(2, "0");
@@ -2183,6 +3607,102 @@ function localTimeInfo(lon: number, timestamp: number) {
     time: `${hours}:${minutes}`,
     offsetLabel: formatUtcOffset(offsetMinutes)
   };
+}
+
+function approximateIanaTimeZone(lat: number, lon: number) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return undefined;
+  const normalizedLon = normalizeLongitude(lon);
+  const region = APPROXIMATE_TIME_ZONE_REGIONS.find(
+    (candidate) =>
+      lat >= candidate.minLat &&
+      lat <= candidate.maxLat &&
+      normalizedLon >= candidate.minLon &&
+      normalizedLon <= candidate.maxLon
+  );
+  if (region) return region.timeZone;
+
+  if (lat >= 35 && lat <= 72 && normalizedLon >= -25 && normalizedLon <= 45) {
+    if (normalizedLon < -7) return "Europe/Lisbon";
+    if (normalizedLon < 2) return "Europe/London";
+    if (normalizedLon < 23) return "Europe/Berlin";
+    if (normalizedLon < 31) return "Europe/Athens";
+    return "Europe/Istanbul";
+  }
+
+  if (lat >= 24 && lat <= 72 && normalizedLon >= -170 && normalizedLon <= -52) {
+    if (normalizedLon < -130) return "America/Anchorage";
+    if (normalizedLon < -114) return "America/Los_Angeles";
+    if (normalizedLon < -102) return "America/Denver";
+    if (normalizedLon < -85) return "America/Chicago";
+    return "America/New_York";
+  }
+
+  return undefined;
+}
+
+function timeFormatter(timeZone: string) {
+  const cached = timeFormatterCache.get(timeZone);
+  if (cached) return cached;
+  const formatter = new Intl.DateTimeFormat("en-GB", {
+    timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  });
+  timeFormatterCache.set(timeZone, formatter);
+  return formatter;
+}
+
+function zoneNameFormatter(timeZone: string) {
+  const cached = zoneNameFormatterCache.get(timeZone);
+  if (cached) return cached;
+  const formatter = new Intl.DateTimeFormat("en-US", { timeZone, timeZoneName: "short" });
+  zoneNameFormatterCache.set(timeZone, formatter);
+  return formatter;
+}
+
+function zonePartsFormatter(timeZone: string) {
+  const cached = zonePartsFormatterCache.get(timeZone);
+  if (cached) return cached;
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23"
+  });
+  zonePartsFormatterCache.set(timeZone, formatter);
+  return formatter;
+}
+
+function timeZoneLabel(timeZone: string, date: Date) {
+  const name = zoneNameFormatter(timeZone)
+    .formatToParts(date)
+    .find((part) => part.type === "timeZoneName")?.value;
+  const offset = formatUtcOffset(timeZoneOffsetMinutes(timeZone, date));
+  if (!name || name === "GMT" || name === "UTC") return offset;
+  if (name.startsWith("GMT") || name.startsWith("UTC")) return offset;
+  return `${offset} ${name}`;
+}
+
+function timeZoneOffsetMinutes(timeZone: string, date: Date) {
+  const parts = zonePartsFormatter(timeZone).formatToParts(date);
+  const values = parts.reduce<Record<string, number>>((accumulator, part) => {
+    if (part.type !== "literal") accumulator[part.type] = Number(part.value);
+    return accumulator;
+  }, {});
+  const asUtc = Date.UTC(
+    values.year,
+    (values.month ?? 1) - 1,
+    values.day ?? 1,
+    values.hour ?? 0,
+    values.minute ?? 0,
+    values.second ?? 0
+  );
+  return Math.round((asUtc - date.getTime()) / 60_000);
 }
 
 function formatUtcOffset(offsetMinutes: number) {
@@ -2268,19 +3788,31 @@ function makeRainRadarLayer(
   units: UnitSettings = DEFAULT_UNIT_SETTINGS,
   language = "en"
 ) {
-  const makeTileLayer = (state: RainViewerState, radarFrame: RainFrame, opacity = 0.78) => L.tileLayer(`${state.host}${radarFrame.path}/512/{z}/{x}/{y}/2/1_1.png`, {
-    opacity,
-    maxNativeZoom: 7,
-    maxZoom: MAP_MAX_ZOOM,
-    noWrap: false,
-    keepBuffer: 4,
-    crossOrigin: true,
-    attribution: 'Weather data by <a href="https://www.rainviewer.com/" target="_blank" rel="noreferrer">RainViewer</a>'
-  });
+  const makeTileLayer = (
+    state: RainViewerState,
+    radarFrame: RainFrame,
+    opacity = RAIN_RADAR_OPACITY,
+    nativeZoom = RAIN_RADAR_NATIVE_ZOOM,
+    zIndex = 330
+  ) =>
+    L.tileLayer(`${state.host}${radarFrame.path}/512/{z}/{x}/{y}/2/1_1.png`, {
+      opacity,
+      maxNativeZoom: nativeZoom,
+      maxZoom: MAP_MAX_ZOOM,
+      noWrap: false,
+      keepBuffer: 4,
+      zIndex,
+      crossOrigin: true,
+      attribution: 'Weather data by <a href="https://www.rainviewer.com/" target="_blank" rel="noreferrer">RainViewer</a>'
+    });
+
+  const coverageOpacity = (map?: L.Map) =>
+    map && map.getZoom() >= RAIN_RADAR_COVERAGE_ZOOM + 1 ? RAIN_RADAR_COVERAGE_OPACITY : 0;
 
   const initialUrlKey = (state: RainViewerState, radarFrame: RainFrame) => `${state.host}${radarFrame.path}`;
 
-  const tileLayer = makeTileLayer(rainViewer, frame);
+  const tileLayer = makeTileLayer(rainViewer, frame, RAIN_RADAR_OPACITY, RAIN_RADAR_NATIVE_ZOOM, 332);
+  const coverageTileLayer = makeTileLayer(rainViewer, frame, 0, RAIN_RADAR_COVERAGE_ZOOM, 331);
   let currentRainViewer = rainViewer;
   let currentFrame = frame;
   let currentSurfaceGrid = makeSurfaceGrid(weatherGrid);
@@ -2293,7 +3825,9 @@ function makeRainRadarLayer(
 
   interface RainRadarLayerInternal extends L.Layer {
     _tileLayer?: L.TileLayer;
+    _coverageTileLayer?: L.TileLayer;
     _pendingTileLayer?: L.TileLayer;
+    _pendingCoverageTileLayer?: L.TileLayer;
     _tooltip?: HTMLDivElement;
     _weatherMap?: L.Map;
     _tileCache?: Map<string, Promise<ImageData | undefined>>;
@@ -2301,6 +3835,7 @@ function makeRainRadarLayer(
     _removed?: boolean;
     _hideHover: () => void;
     _moveHover: (event: L.LeafletMouseEvent) => void;
+    _syncCoverageOpacity: () => void;
     updateRainRadar: RainRadarLayerInstance["updateRainRadar"];
   }
 
@@ -2308,6 +3843,7 @@ function makeRainRadarLayer(
     onAdd(this: RainRadarLayerInternal, map: L.Map) {
       this._removed = false;
       this._weatherMap = map;
+      this._coverageTileLayer = coverageTileLayer.addTo(map);
       this._tileLayer = tileLayer.addTo(map);
       this._tileCache = new Map();
       this._hoverSerial = 0;
@@ -2316,18 +3852,25 @@ function makeRainRadarLayer(
       map.on("mousemove", this._moveHover, this);
       map.on("click", this._moveHover, this);
       map.on("mouseout movestart zoomstart", this._hideHover, this);
+      map.on("zoomend", this._syncCoverageOpacity, this);
+      this._syncCoverageOpacity();
     },
     onRemove(this: RainRadarLayerInternal) {
       this._removed = true;
       if (this._tileLayer && this._weatherMap) this._weatherMap.removeLayer(this._tileLayer);
+      if (this._coverageTileLayer && this._weatherMap) this._weatherMap.removeLayer(this._coverageTileLayer);
       if (this._pendingTileLayer && this._weatherMap) this._weatherMap.removeLayer(this._pendingTileLayer);
+      if (this._pendingCoverageTileLayer && this._weatherMap) this._weatherMap.removeLayer(this._pendingCoverageTileLayer);
       if (this._tooltip?.parentNode) this._tooltip.parentNode.removeChild(this._tooltip);
       this._weatherMap?.off("mousemove", this._moveHover, this);
       this._weatherMap?.off("click", this._moveHover, this);
       this._weatherMap?.off("mouseout movestart zoomstart", this._hideHover, this);
+      this._weatherMap?.off("zoomend", this._syncCoverageOpacity, this);
       this._tileCache?.clear();
       this._tileLayer = undefined;
+      this._coverageTileLayer = undefined;
       this._pendingTileLayer = undefined;
+      this._pendingCoverageTileLayer = undefined;
       this._tooltip = undefined;
       this._weatherMap = undefined;
     },
@@ -2359,25 +3902,53 @@ function makeRainRadarLayer(
         this._weatherMap.removeLayer(this._pendingTileLayer);
         this._pendingTileLayer = undefined;
       }
+      if (this._pendingCoverageTileLayer) {
+        this._weatherMap.removeLayer(this._pendingCoverageTileLayer);
+        this._pendingCoverageTileLayer = undefined;
+      }
 
       const previousTileLayer = this._tileLayer;
-      const nextTileLayer = makeTileLayer(nextRainViewer, nextFrame, 0);
-      this._pendingTileLayer = nextTileLayer.addTo(this._weatherMap);
-      nextTileLayer.once("load", () => {
-        if (this._removed || !this._weatherMap || this._pendingTileLayer !== nextTileLayer) return;
-        nextTileLayer.setOpacity(0.78);
+      const previousCoverageTileLayer = this._coverageTileLayer;
+      const nextCoverageTileLayer = makeTileLayer(nextRainViewer, nextFrame, 0, RAIN_RADAR_COVERAGE_ZOOM, 331);
+      const nextTileLayer = makeTileLayer(nextRainViewer, nextFrame, 0, RAIN_RADAR_NATIVE_ZOOM, 332);
+      let loadedLayers = 0;
+      const finishLayerSwap = () => {
+        loadedLayers += 1;
+        if (loadedLayers < 2) return;
+        if (
+          this._removed ||
+          !this._weatherMap ||
+          this._pendingTileLayer !== nextTileLayer ||
+          this._pendingCoverageTileLayer !== nextCoverageTileLayer
+        ) {
+          return;
+        }
+        nextCoverageTileLayer.setOpacity(coverageOpacity(this._weatherMap));
+        nextTileLayer.setOpacity(RAIN_RADAR_OPACITY);
         if (previousTileLayer) this._weatherMap.removeLayer(previousTileLayer);
+        if (previousCoverageTileLayer) this._weatherMap.removeLayer(previousCoverageTileLayer);
+        this._coverageTileLayer = nextCoverageTileLayer;
         this._tileLayer = nextTileLayer;
+        this._pendingCoverageTileLayer = undefined;
         this._pendingTileLayer = undefined;
-      });
+      };
+      nextCoverageTileLayer.once("load", finishLayerSwap);
+      nextTileLayer.once("load", finishLayerSwap);
+      this._pendingCoverageTileLayer = nextCoverageTileLayer.addTo(this._weatherMap);
+      this._pendingTileLayer = nextTileLayer.addTo(this._weatherMap);
     },
     _hideHover(this: RainRadarLayerInternal) {
       this._hoverSerial = (this._hoverSerial ?? 0) + 1;
       hideHoverReadout(this._tooltip);
     },
+    _syncCoverageOpacity(this: RainRadarLayerInternal) {
+      const opacity = coverageOpacity(this._weatherMap);
+      this._coverageTileLayer?.setOpacity(opacity);
+      this._pendingCoverageTileLayer?.setOpacity(opacity);
+    },
     _moveHover(this: RainRadarLayerInternal, event: L.LeafletMouseEvent) {
       if (!this._weatherMap || !this._tooltip) return;
-      const lookup = radarTileLookup(this._weatherMap, currentRainViewer, currentFrame, event.latlng);
+      const lookups = radarTileLookups(this._weatherMap, currentRainViewer, currentFrame, event.latlng);
       const surface = interpolatedSurfaceSample(currentSurfaceGrid, currentSurfaceDetailGrid, event.latlng.lat, event.latlng.lng, currentSurfaceStations);
       const serial = (this._hoverSerial ?? 0) + 1;
       this._hoverSerial = serial;
@@ -2385,7 +3956,7 @@ function makeRainRadarLayer(
       this._tooltip.innerHTML = radarHoverContent(undefined, currentFrame, event.latlng.lat, event.latlng.lng, surface, currentUnits, currentLanguage, currentIncludeLocalTime ? Date.now() : undefined);
       showHoverReadout(this._tooltip);
 
-      void sampleRadarTile(lookup, this._tileCache ?? new Map(), surface?.temperature).then((sample) => {
+      void sampleRadarTile(lookups, this._tileCache ?? new Map(), surface?.temperature).then((sample) => {
         if (this._hoverSerial !== serial || !this._tooltip || !this._weatherMap) return;
         positionHoverReadout(this._weatherMap, event, this._tooltip);
         this._tooltip.innerHTML = radarHoverContent(sample, currentFrame, event.latlng.lat, event.latlng.lng, surface, currentUnits, currentLanguage, currentIncludeLocalTime ? Date.now() : undefined);
@@ -2414,8 +3985,22 @@ function selectedRainViewerFrame(rainViewer: RainViewerState | undefined, select
   return frames.find((frame) => frame.time === selectedTime) ?? defaultRainViewerFrame(rainViewer);
 }
 
-function radarTileLookup(map: L.Map, rainViewer: RainViewerState, frame: RainFrame, latLng: L.LatLng) {
-  const z = Math.max(0, Math.min(7, Math.floor(map.getZoom())));
+interface RadarTileLookup {
+  url: string;
+  pixelX: number;
+  pixelY: number;
+}
+
+function radarTileLookups(map: L.Map, rainViewer: RainViewerState, frame: RainFrame, latLng: L.LatLng) {
+  const preferredZoom = Math.max(0, Math.min(RAIN_RADAR_NATIVE_ZOOM, Math.floor(map.getZoom())));
+  const lookups = [radarTileLookupAtZoom(rainViewer, frame, latLng, preferredZoom)];
+  if (preferredZoom > RAIN_RADAR_COVERAGE_ZOOM) {
+    lookups.push(radarTileLookupAtZoom(rainViewer, frame, latLng, RAIN_RADAR_COVERAGE_ZOOM));
+  }
+  return lookups;
+}
+
+function radarTileLookupAtZoom(rainViewer: RainViewerState, frame: RainFrame, latLng: L.LatLng, z: number): RadarTileLookup {
   const tileCount = 2 ** z;
   const lat = Math.max(-MAX_MERCATOR_LAT, Math.min(MAX_MERCATOR_LAT, latLng.lat));
   const lon = normalizeLongitude(latLng.lng);
@@ -2432,23 +4017,33 @@ function radarTileLookup(map: L.Map, rainViewer: RainViewerState, frame: RainFra
 }
 
 async function sampleRadarTile(
-  lookup: ReturnType<typeof radarTileLookup>,
+  lookup: RadarTileLookup | RadarTileLookup[],
   cache: Map<string, Promise<ImageData | undefined>>,
   temperature?: number
 ): Promise<RadarPixelSample | null> {
-  if (!cache.has(lookup.url)) {
-    if (cache.size > 72) {
-      const oldestKey = cache.keys().next().value;
-      if (oldestKey) cache.delete(oldestKey);
+  const lookups = Array.isArray(lookup) ? lookup : [lookup];
+  let transparentSample: RadarPixelSample | null = null;
+
+  for (const tileLookup of lookups) {
+    if (!cache.has(tileLookup.url)) {
+      if (cache.size > 96) {
+        const oldestKey = cache.keys().next().value;
+        if (oldestKey) cache.delete(oldestKey);
+      }
+      cache.set(tileLookup.url, loadRadarImageData(tileLookup.url));
     }
-    cache.set(lookup.url, loadRadarImageData(lookup.url));
+
+    const image = await cache.get(tileLookup.url);
+    if (!image) continue;
+
+    const index = (tileLookup.pixelY * image.width + tileLookup.pixelX) * 4;
+    const alpha = image.data[index + 3];
+    const sample = classifyRadarPixel(image.data[index], image.data[index + 1], image.data[index + 2], alpha, temperature);
+    if (alpha >= 18 || sample.dbz !== undefined) return sample;
+    transparentSample = transparentSample ?? sample;
   }
 
-  const image = await cache.get(lookup.url);
-  if (!image) return null;
-
-  const index = (lookup.pixelY * image.width + lookup.pixelX) * 4;
-  return classifyRadarPixel(image.data[index], image.data[index + 1], image.data[index + 2], image.data[index + 3], temperature);
+  return transparentSample;
 }
 
 function loadRadarImageData(url: string): Promise<ImageData | undefined> {
@@ -2945,17 +4540,40 @@ function earthquakePopup(quake: EarthquakeEvent) {
     ["Actual magnitude", quake.magnitude !== undefined ? quake.magnitude.toFixed(1) : "Unavailable"],
     ["Place", quake.place],
     ["Depth", quake.depth !== undefined ? `${quake.depth.toFixed(1)} km` : "Unavailable"],
-    ["Perceived shaking", quake.feltIntensity !== undefined ? `${quake.feltIntensity.toFixed(1)} CDI` : undefined],
+    ["Reported max shaking", quake.feltIntensity !== undefined ? formatShakingIntensity(quake.feltIntensity, "CDI") : undefined],
     [
-      "Estimated shaking",
-      quake.instrumentalIntensity !== undefined ? `${quake.instrumentalIntensity.toFixed(1)} MMI` : undefined
+      "Modeled max shaking",
+      quake.instrumentalIntensity !== undefined ? formatShakingIntensity(quake.instrumentalIntensity, "MMI") : undefined
     ],
     ["Felt reports", quake.feltReports !== undefined ? Math.round(quake.feltReports).toLocaleString() : undefined],
+    ["Shaking note", quake.feltIntensity !== undefined || quake.instrumentalIntensity !== undefined ? "Intensity scale, not magnitude; local shaking varies by location" : undefined],
     ["Time", new Date(quake.time).toLocaleString()],
     ["Tsunami", quake.tsunami ? "Yes" : "No"],
     ["Source", escapeHtml(quake.sourceLabel ?? "Earthquake feed")],
     ["Details", `<a href="${quake.url}" target="_blank" rel="noreferrer">Open report</a>`]
   ]);
+}
+
+function formatShakingIntensity(value: number, scale: "CDI" | "MMI") {
+  return `${shakingIntensityRoman(value)} (${value.toFixed(1)} ${scale}) · ${shakingIntensityLabel(value)}`;
+}
+
+function shakingIntensityRoman(value: number) {
+  const rounded = Math.max(1, Math.min(10, Math.round(value)));
+  const numerals = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"];
+  return numerals[rounded - 1];
+}
+
+function shakingIntensityLabel(value: number) {
+  if (value < 2) return "Not felt";
+  if (value < 4) return "Weak";
+  if (value < 5) return "Light";
+  if (value < 6) return "Moderate";
+  if (value < 7) return "Strong";
+  if (value < 8) return "Very strong";
+  if (value < 9) return "Severe";
+  if (value < 10) return "Violent";
+  return "Extreme";
 }
 
 interface SeismicHoverTarget {
@@ -3080,13 +4698,13 @@ function seismicHoverContent(quake: EarthquakeEvent, timestamp?: number) {
 
   return `<strong>${magnitude} movement</strong><div class="hover-metrics">
     <span>Depth</span><b>${quake.depth !== undefined ? `${quake.depth.toFixed(1)} km` : "--"}</b>
-    <span>Felt</span><b>${quake.feltIntensity !== undefined ? `${quake.feltIntensity.toFixed(1)} CDI` : "--"}</b>
-    <span>Estimated</span><b>${quake.instrumentalIntensity !== undefined ? `${quake.instrumentalIntensity.toFixed(1)} MMI` : "--"}</b>
+    <span>Reported max</span><b>${quake.feltIntensity !== undefined ? formatShakingIntensity(quake.feltIntensity, "CDI") : "--"}</b>
+    <span>Modeled max</span><b>${quake.instrumentalIntensity !== undefined ? formatShakingIntensity(quake.instrumentalIntensity, "MMI") : "--"}</b>
     <span>Reports</span><b>${quake.feltReports !== undefined ? Math.round(quake.feltReports).toLocaleString() : "--"}</b>
     <span>Source</span><b>${escapeHtml(quake.sourceLabel ?? "--")}</b>
     <span>Time</span><b>${time}</b>
     ${localTimeRow}
-  </div><em>${escapeHtml(alert)} · ${escapeHtml(quake.place)}</em>`;
+  </div><em>${escapeHtml(alert)} · intensity, not magnitude · ${escapeHtml(quake.place)}</em>`;
 }
 
 interface RiskHoverTarget {
