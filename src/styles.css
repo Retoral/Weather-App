@@ -259,6 +259,28 @@ button {
   color: #171615;
 }
 
+.settings-select.text-setting {
+  cursor: text;
+}
+
+.settings-select.text-setting input {
+  position: relative;
+  z-index: 1;
+  width: min(190px, 56%);
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: #fffaf1;
+  font: inherit;
+  font-weight: 850;
+  text-align: right;
+}
+
+.settings-select.text-setting input::placeholder {
+  color: rgba(255, 250, 241, 0.44);
+}
+
 .aircraft-search-filter {
   display: grid;
   gap: 6px;

@@ -10,6 +10,7 @@ import type {
   GdacsAlert,
   LocalSignal,
   LocalWeather,
+  RainObservationPoint,
   RainViewerState,
   RiskSignalEvent,
   Severity,
@@ -30,6 +31,7 @@ const BMKG_FELT_EARTHQUAKES = "https://data.bmkg.go.id/DataMKG/TEWS/gempadirasak
 const INGV_EARTHQUAKES = "https://webservices.ingv.it/fdsnws/event/1/query";
 const TAIWAN_CWA_EARTHQUAKES = "https://sta.ci.taiwan.gov.tw/STA_Earthquake_v2/v1.0/Things";
 const RAINVIEWER = "https://api.rainviewer.com/public/weather-maps.json";
+const TAIWAN_CWA_RAINFALL = "https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0002-001";
 const GDACS_RSS = "https://www.gdacs.org/xml/rss.xml";
 const SMHI_WARNINGS = "https://opendata-download-warnings.smhi.se/ibww/api/version/1/warning.json";
 const NWS_ALERTS = "https://api.weather.gov/alerts/active?status=actual&message_type=alert,update";
@@ -2923,6 +2925,112 @@ export async function fetchRainViewer(signal?: AbortSignal): Promise<RainViewerS
     past: data.radar?.past ?? [],
     nowcast: data.radar?.nowcast ?? []
   };
+}
+
+export async function fetchTaiwanCwaRainfall(token: string, signal?: AbortSignal): Promise<RainObservationPoint[]> {
+  const authorization = token.trim();
+  if (!authorization) return [];
+
+  const url = new URL(TAIWAN_CWA_RAINFALL);
+  url.searchParams.set("Authorization", authorization);
+  url.searchParams.set("format", "JSON");
+  url.searchParams.set("limit", "1000");
+  url.searchParams.set("RainfallElement", "Now,Past10Min,Past1hr");
+  url.searchParams.set("GeoInfo", "Coordinates,CountyName,TownName");
+
+  const data = await fetchJsonViaText<unknown>(url.toString(), signal);
+  const records = recordValue(data)?.records;
+  const stations =
+    arrayValue(recordValue(records)?.Station) ??
+    arrayValue(recordValue(records)?.station) ??
+    arrayValue(recordValue(data)?.Station) ??
+    [];
+
+  return stations
+    .map((station, index) => parseTaiwanCwaRainStation(station, index))
+    .filter(isDefined)
+    .sort((a, b) => b.rainfallMm - a.rainfallMm);
+}
+
+function parseTaiwanCwaRainStation(value: unknown, index: number): RainObservationPoint | undefined {
+  const station = recordValue(value);
+  if (!station) return undefined;
+
+  const geo = recordValue(station.GeoInfo) ?? recordValue(station.geoInfo) ?? station;
+  const coordinate = taiwanCwaWgs84Coordinate(geo);
+  if (!coordinate) return undefined;
+
+  const rainfall = recordValue(station.RainfallElement) ?? recordValue(station.rainfallElement) ?? station;
+  const past10MinMm = validRainAmount(taiwanCwaRainfallValue(rainfall, "Past10Min"));
+  const past1hrMm = validRainAmount(taiwanCwaRainfallValue(rainfall, "Past1hr"));
+  const nowMm = validRainAmount(taiwanCwaRainfallValue(rainfall, "Now"));
+  const rainfallMm = past10MinMm !== undefined ? past10MinMm * 6 : past1hrMm ?? nowMm;
+  if (rainfallMm === undefined) return undefined;
+
+  const obsTime = recordValue(station.ObsTime) ?? recordValue(station.obsTime);
+  const countyName = stringValue(recordValue(geo)?.CountyName) ?? stringValue(recordValue(geo)?.countyName);
+  const townName = stringValue(recordValue(geo)?.TownName) ?? stringValue(recordValue(geo)?.townName);
+  const name = stringValue(station.StationName) ?? stringValue(station.stationName) ?? `CWA station ${index + 1}`;
+  const id = stringValue(station.StationId) ?? stringValue(station.stationId) ?? `cwa-rain-${name}-${index}`;
+
+  return {
+    id: `cwa-rain-${id}`,
+    name,
+    lat: coordinate.lat,
+    lon: coordinate.lon,
+    rainfallMm,
+    source: "cwa",
+    observedAt: stringValue(recordValue(obsTime)?.DateTime) ?? stringValue(recordValue(obsTime)?.dateTime),
+    past10MinMm,
+    past1hrMm,
+    areaName: [countyName, townName].filter(Boolean).join(", ") || undefined
+  };
+}
+
+function taiwanCwaWgs84Coordinate(geo: Record<string, unknown>) {
+  const coordinates = arrayValue(geo.Coordinates) ?? arrayValue(geo.coordinates) ?? arrayValue(geo.Coordinate) ?? arrayValue(geo.coordinate);
+  const candidates = coordinates?.map(recordValue).filter(isDefined) ?? [geo];
+  const preferred = candidates.find((candidate) => /wgs84/i.test(stringValue(candidate.CoordinateName) ?? stringValue(candidate.coordinateName) ?? "")) ?? candidates[0];
+  if (!preferred) return undefined;
+
+  const lat =
+    numberValue(preferred.StationLatitude) ??
+    numberValue(preferred.stationLatitude) ??
+    numberValue(preferred.Latitude) ??
+    numberValue(preferred.latitude) ??
+    numberValue(geo.StationLatitude) ??
+    numberValue(geo.latitude);
+  const lon =
+    numberValue(preferred.StationLongitude) ??
+    numberValue(preferred.stationLongitude) ??
+    numberValue(preferred.Longitude) ??
+    numberValue(preferred.longitude) ??
+    numberValue(geo.StationLongitude) ??
+    numberValue(geo.longitude);
+
+  if (lat === undefined || lon === undefined || Math.abs(lat) > 90 || Math.abs(lon) > 180) return undefined;
+  return { lat, lon };
+}
+
+function taiwanCwaRainfallValue(rainfall: Record<string, unknown>, key: "Now" | "Past10Min" | "Past1hr") {
+  const direct = rainfall[key] ?? rainfall[key[0].toLowerCase() + key.slice(1)];
+  const nested = recordValue(direct);
+  if (nested) {
+    return numberValue(nested.Precipitation) ?? numberValue(nested.precipitation) ?? numberValue(nested.Value) ?? numberValue(nested.value);
+  }
+  return numberValue(direct);
+}
+
+function validRainAmount(value: number | undefined) {
+  return value !== undefined && value >= 0 && value < 1000 ? value : undefined;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
+function arrayValue(value: unknown): unknown[] | undefined {
+  return Array.isArray(value) ? value : undefined;
 }
 
 function firstTextByLocalName(element: Element, localName: string) {

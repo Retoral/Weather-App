@@ -227,3 +227,16 @@ export interface RainViewerState {
   past: RainFrame[];
   nowcast: RainFrame[];
 }
+
+export interface RainObservationPoint {
+  id: string;
+  name: string;
+  lat: number;
+  lon: number;
+  rainfallMm: number;
+  source: "cwa";
+  observedAt?: string;
+  past10MinMm?: number;
+  past1hrMm?: number;
+  areaName?: string;
+}

@@ -1067,6 +1067,18 @@ function windRgb(windSpeed: number): [number, number, number] {
   return stops[stops.length - 1][1];
 }
 
+function surfacePaintRgb(kind: SurfaceRasterKind, sample: SurfaceSample): [number, number, number] {
+  if (kind === "temperature") {
+    const rgb = temperatureRgb(roundSurfacePaintValue(sample.temperature, 0.5));
+    return [rgb[0], rgb[1], rgb[2]];
+  }
+  return windRgb(roundSurfacePaintValue(sample.windSpeed, 1.8));
+}
+
+function roundSurfacePaintValue(value: number, step: number) {
+  return Number.isFinite(value) ? Math.round(value / step) * step : value;
+}
+
 interface SurfaceRasterGridLayerInstance extends L.GridLayer {
   _surfaceKind: SurfaceRasterKind;
   _surfaceSignature: string;
@@ -1619,7 +1631,7 @@ function drawSurfaceRasterPreviewRect(
         continue;
       }
 
-      const rgb = kind === "temperature" ? temperatureRgb(sample.temperature) : windRgb(sample.windSpeed);
+      const rgb = surfacePaintRgb(kind, sample);
       image.data[index] = rgb[0];
       image.data[index + 1] = rgb[1];
       image.data[index + 2] = rgb[2];
@@ -1627,6 +1639,7 @@ function drawSurfaceRasterPreviewRect(
     }
   }
 
+  smoothSurfacePreviewImage(image, previewWidth, previewHeight, surfacePreviewBlurRadius(previewScale));
   previewContext.putImageData(image, 0, 0);
   ctx.save();
   if (replaceExisting) {
@@ -1648,6 +1661,59 @@ function surfaceExpandedRect(rect: SurfaceCanvasRect, padding: number, maxWidth:
     width: Math.max(0, right - x),
     height: Math.max(0, bottom - y)
   };
+}
+
+function surfacePreviewBlurRadius(previewScale: number) {
+  return Math.max(1, Math.min(4, Math.round(0.58 / Math.max(0.08, previewScale))));
+}
+
+function smoothSurfacePreviewImage(image: ImageData, width: number, height: number, radius: number) {
+  if (radius <= 0 || width <= 2 || height <= 2) return;
+  const source = new Uint8ClampedArray(image.data);
+  const scratch = new Uint8ClampedArray(image.data.length);
+  boxBlurSurfacePreview(source, scratch, width, height, radius, true);
+  boxBlurSurfacePreview(scratch, image.data, width, height, radius, false);
+}
+
+function boxBlurSurfacePreview(
+  source: Uint8ClampedArray,
+  target: Uint8ClampedArray,
+  width: number,
+  height: number,
+  radius: number,
+  horizontal: boolean
+) {
+  const span = radius * 2 + 1;
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      let red = 0;
+      let green = 0;
+      let blue = 0;
+      let alpha = 0;
+
+      for (let offset = -radius; offset <= radius; offset += 1) {
+        const sampleX = horizontal ? Math.max(0, Math.min(width - 1, x + offset)) : x;
+        const sampleY = horizontal ? y : Math.max(0, Math.min(height - 1, y + offset));
+        const sampleIndex = (sampleY * width + sampleX) * 4;
+        const sampleAlpha = source[sampleIndex + 3];
+        red += source[sampleIndex] * sampleAlpha;
+        green += source[sampleIndex + 1] * sampleAlpha;
+        blue += source[sampleIndex + 2] * sampleAlpha;
+        alpha += sampleAlpha;
+      }
+
+      const targetIndex = (y * width + x) * 4;
+      if (alpha <= 0) {
+        target[targetIndex + 3] = 0;
+        continue;
+      }
+      target[targetIndex] = Math.round(red / alpha);
+      target[targetIndex + 1] = Math.round(green / alpha);
+      target[targetIndex + 2] = Math.round(blue / alpha);
+      target[targetIndex + 3] = Math.round(alpha / span);
+    }
+  }
 }
 
 function shouldDrawSurfaceTileDestination(dest: SurfaceCanvasRect, options: SurfaceRasterDrawOptions) {
@@ -2040,7 +2106,7 @@ const SURFACE_TILE_CACHE_LIMIT = 1800;
 const SURFACE_TILE_GUTTER = 3;
 const SURFACE_GRID_PREWARM_FRAME_BUDGET_MS = 2;
 const SURFACE_TILE_RENDER_FRAME_BUDGET_MS = 7;
-const SURFACE_TILE_LOCAL_SIGNATURE_VERSION = "tile-local-v1";
+const SURFACE_TILE_LOCAL_SIGNATURE_VERSION = "tile-local-v3";
 const surfaceTileRenderQueue: Array<() => void> = [];
 let surfaceTileRenderFrame: number | undefined;
 const surfaceTileSignatureCache = new Map<string, string>();
@@ -2281,7 +2347,7 @@ function renderSurfaceRasterTile(
         continue;
       }
 
-      const rgb = kind === "temperature" ? temperatureRgb(sample.temperature) : windRgb(sample.windSpeed);
+      const rgb = surfacePaintRgb(kind, sample);
       image.data[index] = rgb[0];
       image.data[index + 1] = rgb[1];
       image.data[index + 2] = rgb[2];

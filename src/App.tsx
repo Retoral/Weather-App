@@ -38,6 +38,7 @@ import {
   fetchLocalWeather,
   fetchRainViewer,
   fetchRiskEvents,
+  fetchTaiwanCwaRainfall,
   fetchWeatherGridWithMeta,
   getCachedAircraftStates,
   getCachedWeatherGrid,
@@ -55,6 +56,7 @@ import type {
   LocalWeather,
   PrimaryLayer,
   RainFrame,
+  RainObservationPoint,
   RainViewerState,
   RiskSignalEvent,
   WeatherGridPoint
@@ -75,6 +77,7 @@ const MAP_LANGUAGE_KEY = "weather-watch:map-language";
 const APP_LANGUAGE_KEY = "weather-watch:app-language";
 const VIEW_SETTINGS_KEY = "weather-watch:view-settings:v1";
 const TRACKED_AIRCRAFT_KEY = "weather-watch:tracked-aircraft:v1";
+const CWA_TOKEN_KEY = "weather-watch:taiwan-cwa-token:v1";
 const LATEST_RELEASE_URL = "https://api.github.com/repos/Retoral/Weather-App/releases/latest";
 const RELEASES_PAGE_URL = "https://github.com/Retoral/Weather-App/releases";
 const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
@@ -1120,6 +1123,17 @@ const unitCopy = {
   }
 } satisfies Record<AppLanguage, Record<string, string>>;
 
+const cwaTokenCopy = {
+  en: { token: "Taiwan CWA token", placeholder: "Optional OpenData token" },
+  sv: { token: "Taiwan CWA-token", placeholder: "Valfri OpenData-token" },
+  de: { token: "Taiwan-CWA-Token", placeholder: "Optionaler OpenData-Token" },
+  fr: { token: "Jeton CWA Taiwan", placeholder: "Jeton OpenData optionnel" },
+  es: { token: "Token CWA Taiwán", placeholder: "Token OpenData opcional" },
+  it: { token: "Token CWA Taiwan", placeholder: "Token OpenData opzionale" },
+  ja: { token: "台湾 CWA トークン", placeholder: "任意の OpenData トークン" },
+  zh: { token: "台湾 CWA 令牌", placeholder: "可选 OpenData 令牌" }
+} satisfies Record<AppLanguage, { token: string; placeholder: string }>;
+
 const updateCopy = {
   en: {
     check: "Check for updates",
@@ -1456,6 +1470,21 @@ function rainViewerChanged(previous: RainViewerState | undefined, next: RainView
     defaultRadarFrameTime(previous) !== defaultRadarFrameTime(next) ||
     previous.host !== next.host
   );
+}
+
+function rainObservationPointsChanged(previous: RainObservationPoint[], next: RainObservationPoint[]) {
+  if (previous.length !== next.length) return true;
+  const previousById = new Map(previous.map((point) => [point.id, point]));
+  return next.some((point) => {
+    const existing = previousById.get(point.id);
+    return (
+      !existing ||
+      existing.observedAt !== point.observedAt ||
+      existing.rainfallMm !== point.rainfallMm ||
+      existing.past10MinMm !== point.past10MinMm ||
+      existing.past1hrMm !== point.past1hrMm
+    );
+  });
 }
 
 function selectedRadarTimelineFrame(rainViewer: RainViewerState | undefined, selectedTime: number | undefined) {
@@ -1954,6 +1983,7 @@ export function App() {
   const [temperatureUnit, setTemperatureUnit] = useState<TemperatureUnit>(savedViewSettings.temperatureUnit ?? "celsius");
   const [windUnit, setWindUnit] = useState<WindUnit>(savedViewSettings.windUnit ?? "ms");
   const [rainUnit, setRainUnit] = useState<RainUnit>(savedViewSettings.rainUnit ?? "mm");
+  const [cwaToken, setCwaToken] = useState(() => localStorage.getItem(CWA_TOKEN_KEY) ?? "");
   const [cityQuery, setCityQuery] = useState("");
   const [cityResults, setCityResults] = useState<CityLocation[]>([]);
   const [placeQuery, setPlaceQuery] = useState("");
@@ -1971,6 +2001,7 @@ export function App() {
   const [aviationIncidents, setAviationIncidents] = useState<AviationIncident[]>([]);
   const [aviationBounds, setAviationBounds] = useState<AviationBounds | undefined>();
   const [rainViewer, setRainViewer] = useState<RainViewerState | undefined>();
+  const [taiwanRainfall, setTaiwanRainfall] = useState<RainObservationPoint[]>([]);
   const [radarFrameTime, setRadarFrameTime] = useState<number | undefined>();
   const [notificationPermission, setNotificationPermission] = useState(() =>
     typeof Notification === "undefined" ? "denied" : Notification.permission
@@ -1999,8 +2030,11 @@ export function App() {
   const mapViewMenuRef = useRef<HTMLDivElement | null>(null);
   const refreshInFlight = useRef({ weatherGrid: false, earthquakes: false, radar: false, warnings: false, risk: false, aircraft: false, aviationIncidents: false });
   const rainViewerRef = useRef<RainViewerState | undefined>();
+  const taiwanRainfallRef = useRef<RainObservationPoint[]>([]);
+  const cwaTokenRef = useRef(cwaToken);
   const copy = appCopy[appLanguage];
   const updateText = updateCopy[appLanguage];
+  const cwaText = cwaTokenCopy[appLanguage];
   const unitSettings = useMemo<UnitSettings>(() => ({ temperatureUnit, windUnit, rainUnit }), [temperatureUnit, windUnit, rainUnit]);
 
   const weatherSignals = useMemo(() => deriveLocalSignals(localWeather, { ...unitSettings, language: appLanguage }), [localWeather, unitSettings, appLanguage]);
@@ -2263,13 +2297,45 @@ export function App() {
     }
   }
 
+  async function loadTaiwanCwaRainfall() {
+    const token = cwaTokenRef.current.trim();
+    if (!token) return undefined;
+    return fetchTaiwanCwaRainfall(token);
+  }
+
+  function applyTaiwanCwaRainfall(points: RainObservationPoint[] | undefined) {
+    if (!points) return false;
+    const changed = rainObservationPointsChanged(taiwanRainfallRef.current, points);
+    if (changed) {
+      taiwanRainfallRef.current = points;
+      setTaiwanRainfall(points);
+    }
+    return changed;
+  }
+
   async function refreshRadarFeed() {
     if (!beginRefreshLock("radar")) return;
     try {
-      const nextRainViewer = await fetchRainViewer();
-      const changed = rainViewerChanged(rainViewerRef.current, nextRainViewer);
-      rainViewerRef.current = nextRainViewer;
-      setRainViewer(nextRainViewer);
+      const [rainResult, cwaResult] = await Promise.allSettled([
+        fetchRainViewer(),
+        loadTaiwanCwaRainfall()
+      ]);
+      let checked = false;
+      let changed = false;
+
+      if (rainResult.status === "fulfilled") {
+        checked = true;
+        changed = rainViewerChanged(rainViewerRef.current, rainResult.value);
+        rainViewerRef.current = rainResult.value;
+        setRainViewer(rainResult.value);
+      }
+
+      if (cwaResult.status === "fulfilled" && cwaResult.value !== undefined) {
+        checked = true;
+        changed = applyTaiwanCwaRainfall(cwaResult.value) || changed;
+      }
+
+      if (!checked) throw rainResult.status === "rejected" ? rainResult.reason : new Error("Unable to refresh radar");
       markLiveRefresh("radar", changed);
     } catch {
       // Keep the last successful radar frame visible.
@@ -2383,11 +2449,12 @@ export function App() {
       const cachedGlobalGrid = getCachedWeatherGrid();
       if (cachedGlobalGrid?.length) setWeatherGrid((current) => current.length > 0 ? current : cachedGlobalGrid);
 
-      const [quakeResult, rainResult, gdacsResult, riskResult] = await Promise.allSettled([
+      const [quakeResult, rainResult, gdacsResult, riskResult, cwaRainResult] = await Promise.allSettled([
         fetchEarthquakes(),
         fetchRainViewer(),
         fetchGdacsAlerts().catch(() => [] as GdacsAlert[]),
-        fetchRiskEvents(undefined, { freshMs: force ? 0 : LIVE_REFRESH_MS.risk }).catch(() => [] as RiskSignalEvent[])
+        fetchRiskEvents(undefined, { freshMs: force ? 0 : LIVE_REFRESH_MS.risk }).catch(() => [] as RiskSignalEvent[]),
+        loadTaiwanCwaRainfall()
       ]);
 
       if (quakeResult.status === "fulfilled") {
@@ -2407,6 +2474,10 @@ export function App() {
       if (riskResult.status === "fulfilled") {
         setRiskEvents(riskResult.value);
         markLiveRefresh("risk");
+      }
+      if (cwaRainResult.status === "fulfilled" && cwaRainResult.value !== undefined) {
+        const changed = applyTaiwanCwaRainfall(cwaRainResult.value);
+        if (rainResult.status !== "fulfilled") markLiveRefresh("radar", changed);
       }
 
       const failedFeeds = [quakeResult, rainResult, gdacsResult, riskResult].filter((result) => result.status === "rejected").length;
@@ -2643,6 +2714,21 @@ export function App() {
   useEffect(() => {
     document.documentElement.lang = appLanguage;
   }, [appLanguage]);
+
+  useEffect(() => {
+    const trimmedToken = cwaToken.trim();
+    cwaTokenRef.current = trimmedToken;
+    if (trimmedToken) {
+      localStorage.setItem(CWA_TOKEN_KEY, trimmedToken);
+      void refreshRadarFeed();
+      return;
+    }
+    localStorage.removeItem(CWA_TOKEN_KEY);
+    if (taiwanRainfallRef.current.length > 0) {
+      taiwanRainfallRef.current = [];
+      setTaiwanRainfall([]);
+    }
+  }, [cwaToken]);
 
   useEffect(() => {
     document.title = homeCurrent ? `${formatTemperature(homeCurrent.temperature_2m, temperatureUnit)} · Weather Watch` : "Weather Watch";
@@ -3465,6 +3551,19 @@ export function App() {
                   ))}
                 </select>
                 <ChevronDown size={15} />
+              </label>
+
+              <label className="settings-select text-setting">
+                <span className="settings-select-label">{cwaText.token}</span>
+                <input
+                  value={cwaToken}
+                  onChange={(event) => setCwaToken(event.target.value)}
+                  placeholder={cwaText.placeholder}
+                  spellCheck={false}
+                  autoCapitalize="off"
+                  autoComplete="off"
+                  aria-label={cwaText.token}
+                />
               </label>
 
               <div className="result-list">
