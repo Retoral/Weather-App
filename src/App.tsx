@@ -3192,6 +3192,7 @@ export function App() {
           trackedAircraftIds={trackedAircraftIds}
           aircraftTracks={aircraftTracks}
           rainViewer={rainViewer}
+          rainObservations={taiwanRainfall}
           rainFrameTime={selectedRadarFrame?.time}
           unitSettings={unitSettings}
           mapLanguage={mapLanguage}

@@ -13,6 +13,7 @@ import type {
   LocalWeather,
   PrimaryLayer,
   RainFrame,
+  RainObservationPoint,
   RainViewerState,
   RiskSignalEvent,
   WeatherGridPoint
@@ -63,6 +64,7 @@ interface WeatherMapProps {
   trackedAircraftIds: string[];
   aircraftTracks: Record<string, AircraftTrack | undefined>;
   rainViewer?: RainViewerState;
+  rainObservations?: RainObservationPoint[];
   rainFrameTime?: number;
   unitSettings: UnitSettings;
   mapLanguage: string;
@@ -3839,6 +3841,7 @@ type RainRadarLayerInstance = L.Layer & {
     frame: RainFrame,
     weatherGrid: WeatherGridPoint[],
     liveWeatherPoints: WeatherGridPoint[],
+    rainObservations: RainObservationPoint[],
     includeLocalTime: boolean,
     units: UnitSettings,
     language: string
@@ -3850,6 +3853,7 @@ function makeRainRadarLayer(
   frame: RainFrame,
   weatherGrid: WeatherGridPoint[],
   liveWeatherPoints: WeatherGridPoint[] = [],
+  rainObservations: RainObservationPoint[] = [],
   includeLocalTime = false,
   units: UnitSettings = DEFAULT_UNIT_SETTINGS,
   language = "en"
@@ -3884,6 +3888,7 @@ function makeRainRadarLayer(
   let currentSurfaceGrid = makeSurfaceGrid(weatherGrid);
   let currentSurfaceDetailGrid = makeSurfaceGrid(surfaceDetailPoints(liveWeatherPoints));
   let currentSurfaceStations = makeSurfaceStations(surfaceStationPoints(liveWeatherPoints));
+  let currentRainObservations = rainObservations;
   let currentIncludeLocalTime = includeLocalTime;
   let currentUnits = units;
   let currentLanguage = language;
@@ -3894,6 +3899,7 @@ function makeRainRadarLayer(
     _coverageTileLayer?: L.TileLayer;
     _pendingTileLayer?: L.TileLayer;
     _pendingCoverageTileLayer?: L.TileLayer;
+    _rainObservationLayer?: L.LayerGroup;
     _tooltip?: HTMLDivElement;
     _weatherMap?: L.Map;
     _tileCache?: Map<string, Promise<ImageData | undefined>>;
@@ -3901,6 +3907,7 @@ function makeRainRadarLayer(
     _removed?: boolean;
     _hideHover: () => void;
     _moveHover: (event: L.LeafletMouseEvent) => void;
+    _syncRainObservationLayer: () => void;
     _syncCoverageOpacity: () => void;
     updateRainRadar: RainRadarLayerInstance["updateRainRadar"];
   }
@@ -3911,6 +3918,7 @@ function makeRainRadarLayer(
       this._weatherMap = map;
       this._coverageTileLayer = coverageTileLayer.addTo(map);
       this._tileLayer = tileLayer.addTo(map);
+      this._rainObservationLayer = makeRainObservationLayer(currentRainObservations, currentFrame).addTo(map);
       this._tileCache = new Map();
       this._hoverSerial = 0;
       this._tooltip = L.DomUtil.create("div", "map-hover-tooltip radar") as HTMLDivElement;
@@ -3927,6 +3935,7 @@ function makeRainRadarLayer(
       if (this._coverageTileLayer && this._weatherMap) this._weatherMap.removeLayer(this._coverageTileLayer);
       if (this._pendingTileLayer && this._weatherMap) this._weatherMap.removeLayer(this._pendingTileLayer);
       if (this._pendingCoverageTileLayer && this._weatherMap) this._weatherMap.removeLayer(this._pendingCoverageTileLayer);
+      if (this._rainObservationLayer && this._weatherMap) this._weatherMap.removeLayer(this._rainObservationLayer);
       if (this._tooltip?.parentNode) this._tooltip.parentNode.removeChild(this._tooltip);
       this._weatherMap?.off("mousemove", this._moveHover, this);
       this._weatherMap?.off("click", this._moveHover, this);
@@ -3937,6 +3946,7 @@ function makeRainRadarLayer(
       this._coverageTileLayer = undefined;
       this._pendingTileLayer = undefined;
       this._pendingCoverageTileLayer = undefined;
+      this._rainObservationLayer = undefined;
       this._tooltip = undefined;
       this._weatherMap = undefined;
     },
@@ -3946,6 +3956,7 @@ function makeRainRadarLayer(
       nextFrame: RainFrame,
       nextWeatherGrid: WeatherGridPoint[],
       nextLiveWeatherPoints: WeatherGridPoint[],
+      nextRainObservations: RainObservationPoint[],
       nextIncludeLocalTime: boolean,
       nextUnits: UnitSettings,
       nextLanguage: string
@@ -3955,9 +3966,11 @@ function makeRainRadarLayer(
       currentSurfaceGrid = makeSurfaceGrid(nextWeatherGrid);
       currentSurfaceDetailGrid = makeSurfaceGrid(surfaceDetailPoints(nextLiveWeatherPoints));
       currentSurfaceStations = makeSurfaceStations(surfaceStationPoints(nextLiveWeatherPoints));
+      currentRainObservations = nextRainObservations;
       currentIncludeLocalTime = nextIncludeLocalTime;
       currentUnits = nextUnits;
       currentLanguage = nextLanguage;
+      this._syncRainObservationLayer();
 
       const nextUrlKey = initialUrlKey(nextRainViewer, nextFrame);
       if (this._removed || !this._weatherMap || nextUrlKey === currentUrlKey) return;
@@ -4012,26 +4025,112 @@ function makeRainRadarLayer(
       this._coverageTileLayer?.setOpacity(opacity);
       this._pendingCoverageTileLayer?.setOpacity(opacity);
     },
+    _syncRainObservationLayer(this: RainRadarLayerInternal) {
+      if (!this._weatherMap) return;
+      if (this._rainObservationLayer) {
+        this._weatherMap.removeLayer(this._rainObservationLayer);
+      }
+      this._rainObservationLayer = makeRainObservationLayer(currentRainObservations, currentFrame).addTo(this._weatherMap);
+    },
     _moveHover(this: RainRadarLayerInternal, event: L.LeafletMouseEvent) {
       if (!this._weatherMap || !this._tooltip) return;
       const lookups = radarTileLookups(this._weatherMap, currentRainViewer, currentFrame, event.latlng);
       const surface = interpolatedSurfaceSample(currentSurfaceGrid, currentSurfaceDetailGrid, event.latlng.lat, event.latlng.lng, currentSurfaceStations);
+      const rainObservation = nearestRainObservation(currentRainObservations, currentFrame, this._weatherMap, event.latlng);
       const serial = (this._hoverSerial ?? 0) + 1;
       this._hoverSerial = serial;
       positionHoverReadout(this._weatherMap, event, this._tooltip);
-      this._tooltip.innerHTML = radarHoverContent(undefined, currentFrame, event.latlng.lat, event.latlng.lng, surface, currentUnits, currentLanguage, currentIncludeLocalTime ? Date.now() : undefined);
+      this._tooltip.innerHTML = radarHoverContent(undefined, currentFrame, event.latlng.lat, event.latlng.lng, surface, currentUnits, currentLanguage, currentIncludeLocalTime ? Date.now() : undefined, rainObservation);
       showHoverReadout(this._tooltip);
 
       void sampleRadarTile(lookups, this._tileCache ?? new Map(), surface?.temperature).then((sample) => {
         if (this._hoverSerial !== serial || !this._tooltip || !this._weatherMap) return;
         positionHoverReadout(this._weatherMap, event, this._tooltip);
-        this._tooltip.innerHTML = radarHoverContent(sample, currentFrame, event.latlng.lat, event.latlng.lng, surface, currentUnits, currentLanguage, currentIncludeLocalTime ? Date.now() : undefined);
+        this._tooltip.innerHTML = radarHoverContent(sample, currentFrame, event.latlng.lat, event.latlng.lng, surface, currentUnits, currentLanguage, currentIncludeLocalTime ? Date.now() : undefined, rainObservation);
         showHoverReadout(this._tooltip);
       });
     }
   });
 
   return new RainRadarLayer() as RainRadarLayerInstance;
+}
+
+function makeRainObservationLayer(points: RainObservationPoint[], frame: RainFrame) {
+  const group = L.layerGroup();
+  rainObservationFramePoints(points, frame).forEach((point) => {
+    const color = rainObservationColor(point.rainfallMm);
+    L.circle([point.lat, point.lon], {
+      radius: rainObservationRadiusMeters(point.rainfallMm),
+      color,
+      fillColor: color,
+      fillOpacity: 0.2,
+      opacity: 0,
+      interactive: false
+    }).addTo(group);
+
+    L.circleMarker([point.lat, point.lon], {
+      radius: rainObservationMarkerRadius(point.rainfallMm),
+      color: "rgba(255, 250, 241, 0.9)",
+      fillColor: color,
+      fillOpacity: 0.9,
+      weight: 1.2,
+      opacity: 0.9,
+      interactive: false
+    }).addTo(group);
+  });
+  return group;
+}
+
+function rainObservationFramePoints(points: RainObservationPoint[], frame: RainFrame) {
+  return points
+    .filter((point) => point.rainfallMm >= 0.1 && rainObservationFrameMatches(point, frame))
+    .slice(0, 500);
+}
+
+function rainObservationFrameMatches(point: RainObservationPoint, frame: RainFrame) {
+  const observedAt = rainObservationTimeMs(point);
+  if (observedAt === undefined) return true;
+  return Math.abs(frame.time * 1000 - observedAt) <= 6 * 60 * 60 * 1000;
+}
+
+function rainObservationTimeMs(point: RainObservationPoint) {
+  if (!point.observedAt) return undefined;
+  const value = Date.parse(point.observedAt);
+  return Number.isFinite(value) ? value : undefined;
+}
+
+function rainObservationColor(rainfallMm: number) {
+  if (rainfallMm < 1) return "#38bdf8";
+  if (rainfallMm < 3) return "#22d3ee";
+  if (rainfallMm < 8) return "#facc15";
+  if (rainfallMm < 18) return "#fb923c";
+  if (rainfallMm < 30) return "#ef4444";
+  return "#f472b6";
+}
+
+function rainObservationMarkerRadius(rainfallMm: number) {
+  return Math.max(4.5, Math.min(12, 4 + Math.sqrt(rainfallMm) * 1.6));
+}
+
+function rainObservationRadiusMeters(rainfallMm: number) {
+  return Math.max(8_000, Math.min(44_000, 7_000 + rainfallMm * 1_600));
+}
+
+function nearestRainObservation(points: RainObservationPoint[], frame: RainFrame, map: L.Map, latLng: L.LatLng) {
+  const candidates = rainObservationFramePoints(points, frame);
+  if (candidates.length === 0) return undefined;
+
+  const target = map.latLngToContainerPoint(latLng);
+  let nearest: { point: RainObservationPoint; distance: number } | undefined;
+  candidates.forEach((point) => {
+    const position = map.latLngToContainerPoint([point.lat, point.lon]);
+    const distance = target.distanceTo(position);
+    const threshold = rainObservationMarkerRadius(point.rainfallMm) + 18;
+    if (distance > threshold) return;
+    if (!nearest || distance < nearest.distance) nearest = { point, distance };
+  });
+
+  return nearest?.point;
 }
 
 function isRainRadarLayer(layer: L.Layer | null): layer is RainRadarLayerInstance {
@@ -4315,7 +4414,8 @@ function radarHoverContent(
   surface: SurfaceSample | undefined,
   units: UnitSettings,
   language = "en",
-  timestamp?: number
+  timestamp?: number,
+  rainObservation?: RainObservationPoint
 ) {
   const text = mapCopy(language);
   const frameTime = new Date(frame.time * 1000).toLocaleTimeString(language, { hour: "2-digit", minute: "2-digit" });
@@ -4324,11 +4424,13 @@ function radarHoverContent(
   const windRows = surface
     ? `<span>${text.surfaceWind}</span><b>${windReadoutHtml(surface.windSpeed, surface.windDirection, units, language)}</b>`
     : "";
+  const rainObservationRows = rainObservation ? rainObservationHoverRows(rainObservation, units, language) : "";
   if (!sample) {
     const title = sample === null ? text.radarUnavailable : text.readingRadar;
     const note = sample === null ? text.providerUnavailable : `${lat.toFixed(1)}°, ${normalizeLongitude(lon).toFixed(1)}°`;
     return `<strong>${title}</strong><div class="hover-metrics">
       <span>${text.rainfall}</span><b>--</b>
+      ${rainObservationRows}
       <span>${text.frame}</span><b>${frameTime}</b>
       ${windRows}
       ${temperatureRow}
@@ -4337,21 +4439,39 @@ function radarHoverContent(
   }
 
   const lowerRainRate = sample.rainfallMmRange?.[0] ?? 0;
-  const localizedWeatherType = lowerRainRate < 0.1
+  const titleRainRate = Math.max(lowerRainRate, rainObservation?.rainfallMm ?? 0);
+  const localizedWeatherType = titleRainRate < 0.1
     ? text.noRainDetected
     : surface?.temperature !== undefined
-      ? `${rainIntensityLabel(lowerRainRate, language)} ${surface.temperature <= 1.5 ? weatherCodeLabel(71, language).toLowerCase() : weatherCodeLabel(61, language).toLowerCase()}`
+      ? `${rainIntensityLabel(titleRainRate, language)} ${surface.temperature <= 1.5 ? weatherCodeLabel(71, language).toLowerCase() : weatherCodeLabel(61, language).toLowerCase()}`
       : sample.weatherType;
   const confidence = surface?.temperature === undefined ? text.estimatedFromRadar : text.estimatedFromRadarTemp;
   return `<strong>${localizedWeatherType}</strong><div class="hover-metrics">
     <span>${text.rainfall}</span><b>${formatRainRateRange(sample.rainfallMmRange, units.rainUnit)}</b>
-    <span>${text.intensity}</span><b>${rainIntensityLabel(lowerRainRate, language)}</b>
+    ${rainObservationRows}
+    <span>${text.intensity}</span><b>${rainIntensityLabel(titleRainRate, language)}</b>
     <span>dBZ</span><b>${sample.dbz !== undefined ? sample.dbz.toFixed(0) : "--"}</b>
     <span>${text.frame}</span><b>${frameTime}</b>
     ${windRows}
     ${temperatureRow}
     ${localTimeRow}
   </div><em>${confidence} ${text.at} ${lat.toFixed(1)}°, ${normalizeLongitude(lon).toFixed(1)}°</em>`;
+}
+
+function rainObservationHoverRows(point: RainObservationPoint, units: UnitSettings, language: string) {
+  const text = mapCopy(language);
+  const observedAt = rainObservationTimeMs(point);
+  const observedLabel = observedAt !== undefined
+    ? new Date(observedAt).toLocaleTimeString(language, { hour: "2-digit", minute: "2-digit" })
+    : undefined;
+  const location = [point.name, point.areaName].filter(Boolean).join(" · ");
+  const past10Min = point.past10MinMm !== undefined ? ` · 10m ${formatRain(point.past10MinMm, units.rainUnit)}` : "";
+  const past1hr = point.past1hrMm !== undefined ? ` · 1h ${formatRain(point.past1hrMm, units.rainUnit)}` : "";
+  return `
+    <span>${text.location}</span><b>${escapeHtml(location || "CWA station")}</b>
+    <span>CWA gauge</span><b>${formatRainRate(point.rainfallMm, units.rainUnit)} · ${rainIntensityLabel(point.rainfallMm, language)}</b>
+    ${observedLabel ? `<span>${text.updated}</span><b>${observedLabel}${past10Min}${past1hr}</b>` : ""}
+  `;
 }
 
 function makeTimezoneLayer() {
@@ -5674,6 +5794,7 @@ export function WeatherMap({
   trackedAircraftIds,
   aircraftTracks,
   rainViewer,
+  rainObservations = [],
   rainFrameTime,
   unitSettings,
   mapLanguage,
@@ -5790,7 +5911,7 @@ export function WeatherMap({
     if (!map) return;
 
     if (activeLayer === "radar" && activeLayerKindRef.current === "radar" && rainViewer && selectedRainFrame && isRainRadarLayer(activeLayerRef.current)) {
-      activeLayerRef.current.updateRainRadar(rainViewer, selectedRainFrame, weatherGrid, liveWeatherPoints, showDayNight, unitSettings, appLanguage);
+      activeLayerRef.current.updateRainRadar(rainViewer, selectedRainFrame, weatherGrid, liveWeatherPoints, rainObservations, showDayNight, unitSettings, appLanguage);
       return;
     }
 
@@ -5831,7 +5952,7 @@ export function WeatherMap({
     }
 
     if (activeLayer === "radar" && rainViewer && selectedRainFrame) {
-      nextLayer = makeRainRadarLayer(rainViewer, selectedRainFrame, weatherGrid, liveWeatherPoints, showDayNight, unitSettings, appLanguage);
+      nextLayer = makeRainRadarLayer(rainViewer, selectedRainFrame, weatherGrid, liveWeatherPoints, rainObservations, showDayNight, unitSettings, appLanguage);
     }
 
     if (activeLayer === "seismic") {
@@ -5852,6 +5973,11 @@ export function WeatherMap({
           : null;
     }
   }, [activeLayer, weatherGrid, liveWeatherPoints, rainViewer, selectedRainFrame, earthquakes, riskEvents, showDayNight, unitSettings, appLanguage]);
+
+  useEffect(() => {
+    if (activeLayer !== "radar" || !rainViewer || !selectedRainFrame || !isRainRadarLayer(activeLayerRef.current)) return;
+    activeLayerRef.current.updateRainRadar(rainViewer, selectedRainFrame, weatherGrid, liveWeatherPoints, rainObservations, showDayNight, unitSettings, appLanguage);
+  }, [rainObservations]);
 
   useEffect(() => {
     const map = mapRef.current;
