@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { memo, useEffect, useMemo, useRef } from "react";
 import L from "leaflet";
 import "@maplibre/maplibre-gl-leaflet";
 import type { Geometry } from "geojson";
@@ -683,14 +683,14 @@ function makeSurfaceCanvasLayer(
         this._settledRefreshDraw = undefined;
         this._lastRenderKey = undefined;
         this._surfaceRenderComplete = false;
-        this._scheduleDataReset();
+        if (this._weatherMap) this._scheduleDataReset();
       }
     },
     onAdd(this: SurfaceCanvasInternal, map: L.Map) {
       this._weatherMap = map;
-      this._canvas = L.DomUtil.create("canvas", kind === "temperature" ? "temperature-canvas" : "wind-canvas") as HTMLCanvasElement;
+      this._canvas ??= L.DomUtil.create("canvas", kind === "temperature" ? "temperature-canvas" : "wind-canvas") as HTMLCanvasElement;
       this._canvas.style.pointerEvents = "none";
-      this._tooltip = L.DomUtil.create("div", `map-hover-tooltip ${kind}`) as HTMLDivElement;
+      this._tooltip ??= L.DomUtil.create("div", `map-hover-tooltip ${kind}`) as HTMLDivElement;
       map.getPanes().overlayPane.appendChild(this._canvas);
       map.getPanes().tooltipPane.appendChild(this._tooltip);
       map.on("moveend zoomend resize", (this as unknown as { _reset: () => void })._reset, this);
@@ -708,18 +708,14 @@ function makeSurfaceCanvasLayer(
       this._surfaceDraw?.cancel();
       this._settledRefreshDraw?.cancel();
       this._surfacePrewarm?.cancel();
+      this._hideHover();
       if (this._canvas?.parentNode) this._canvas.parentNode.removeChild(this._canvas);
       if (this._tooltip?.parentNode) this._tooltip.parentNode.removeChild(this._tooltip);
       this._weatherMap?.off("moveend zoomend resize", (this as unknown as { _reset: () => void })._reset, this);
       this._weatherMap?.off("mousemove", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
       this._weatherMap?.off("click", (this as unknown as { _moveHover: (event: L.LeafletMouseEvent) => void })._moveHover, this);
       this._weatherMap?.off("mouseout movestart zoomstart", (this as unknown as { _hideHover: () => void })._hideHover, this);
-      this._canvas = undefined;
-      this._tooltip = undefined;
       this._weatherMap = undefined;
-      this._scratch = undefined;
-      this._lastState = undefined;
-      this._lastRenderKey = undefined;
       this._resetFrame = undefined;
       this._resetTimer = undefined;
       this._dataResetTimer = undefined;
@@ -727,8 +723,6 @@ function makeSurfaceCanvasLayer(
       this._surfaceDraw = undefined;
       this._settledRefreshDraw = undefined;
       this._surfacePrewarm = undefined;
-      this._lastPrewarmKey = undefined;
-      this._surfaceRenderComplete = undefined;
     },
     _hideHover(this: SurfaceCanvasInternal) {
       if (kind === "temperature") {
@@ -904,7 +898,14 @@ function makeSurfaceCanvasLayer(
       const renderKey = surfaceViewportRenderKey(kind, surfaceSignature, map, layout.width, layout.height, layout.profile, layout.bounds);
       const sizeChanged = canvas.width !== layout.width || canvas.height !== layout.height;
       const positionChanged = !this._lastState || this._lastState.topLeft.x !== nextState.topLeft.x || this._lastState.topLeft.y !== nextState.topLeft.y;
-      if (this._lastRenderKey === renderKey && surfaceCanvasStateMatches(this._lastState, nextState) && !sizeChanged) return;
+      if (
+        this._surfaceRenderComplete === true &&
+        this._lastRenderKey === renderKey &&
+        surfaceCanvasStateMatches(this._lastState, nextState) &&
+        !sizeChanged
+      ) {
+        return;
+      }
 
       if (sizeChanged) {
         canvas.width = layout.width;
@@ -5773,7 +5774,7 @@ function leafletBoundsToAviationBounds(bounds: L.LatLngBounds): AviationBounds {
   };
 }
 
-export function WeatherMap({
+export const WeatherMap = memo(function WeatherMap({
   activeLayer,
   showEarthquakes,
   showAircraftLocations,
@@ -5812,6 +5813,7 @@ export function WeatherMap({
   const baseLayerRef = useRef<L.MaplibreGL | null>(null);
   const activeLayerRef = useRef<L.Layer | null>(null);
   const activeLayerKindRef = useRef<PrimaryLayer>("normal");
+  const surfaceLayersRef = useRef<Partial<Record<SurfaceRasterKind, SurfaceCanvasLayerInstance>>>({});
   const surfaceLayerInputsRef = useRef<{
     weatherGrid: WeatherGridPoint[];
     liveWeatherPoints: WeatherGridPoint[];
@@ -5944,11 +5946,27 @@ export function WeatherMap({
     let nextLayer: L.Layer | undefined;
 
     if (activeLayer === "temperature") {
-      nextLayer = makeTemperatureLayer(weatherGrid, liveWeatherPoints, showDayNight, unitSettings);
+      const cachedLayer = surfaceLayersRef.current.temperature;
+      if (cachedLayer) {
+        cachedLayer.updateSurfaceLayer(weatherGrid, liveWeatherPoints, showDayNight, unitSettings, appLanguage);
+        nextLayer = cachedLayer;
+      } else {
+        const temperatureLayer = makeTemperatureLayer(weatherGrid, liveWeatherPoints, showDayNight, unitSettings);
+        surfaceLayersRef.current.temperature = temperatureLayer;
+        nextLayer = temperatureLayer;
+      }
     }
 
     if (activeLayer === "wind") {
-      nextLayer = makeWindLayer(weatherGrid, liveWeatherPoints, showDayNight, unitSettings, appLanguage);
+      const cachedLayer = surfaceLayersRef.current.wind;
+      if (cachedLayer) {
+        cachedLayer.updateSurfaceLayer(weatherGrid, liveWeatherPoints, showDayNight, unitSettings, appLanguage);
+        nextLayer = cachedLayer;
+      } else {
+        const windLayer = makeWindLayer(weatherGrid, liveWeatherPoints, showDayNight, unitSettings, appLanguage);
+        surfaceLayersRef.current.wind = windLayer;
+        nextLayer = windLayer;
+      }
     }
 
     if (activeLayer === "radar" && rainViewer && selectedRainFrame) {
@@ -6239,7 +6257,7 @@ export function WeatherMap({
   ]);
 
   return <div className="map-root" ref={containerRef} />;
-}
+});
 
 function flyToMapLocation(map: L.Map, location: MapLocationDetails) {
   const center = map.getCenter();

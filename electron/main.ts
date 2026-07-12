@@ -52,6 +52,9 @@ app.whenReady().then(() => {
   Menu.setApplicationMenu(null);
 
   ipcMain.handle("fetch-text", async (_event, url: string) => {
+    if (!isSafeExternalUrl(url)) {
+      return fetchFailure(url, "Only http and https requests are allowed", 400);
+    }
     try {
       const response = await fetchWithTimeout(url, "application/json,text/plain,*/*");
 
@@ -66,6 +69,9 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle("fetch-zip-text", async (_event, url: string) => {
+    if (!isSafeExternalUrl(url)) {
+      return fetchFailure(url, "Only http and https requests are allowed", 400);
+    }
     try {
       const response = await fetchWithTimeout(url, "application/zip,application/octet-stream,text/plain,*/*");
 
@@ -127,7 +133,7 @@ function requestHeaders(accept: string) {
     "Accept": accept,
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
-    "User-Agent": "Weather Watch Desktop 1.0"
+    "User-Agent": `Weather Watch Desktop ${app.getVersion()}`
   };
 }
 

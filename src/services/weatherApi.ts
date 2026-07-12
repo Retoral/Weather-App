@@ -47,11 +47,13 @@ const OPENSKY_STATES = "https://opensky-network.org/api/states/all";
 const OPENSKY_TRACKS = "https://opensky-network.org/api/tracks/all";
 const ADSB_LOL_AIRCRAFT = "https://api.adsb.lol/v2/lat";
 const WEATHER_GRID_CACHE_KEY = "weather-watch:weather-grid-cache:v11";
+const WEATHER_GRID_CACHE_INDEX_KEY = "weather-watch:weather-grid-cache-index:v1";
 const WEATHER_GRID_LEGACY_CACHE_KEYS = [
   "weather-watch:weather-grid-cache:v3"
 ];
 const RISK_EVENTS_CACHE_KEY = "weather-watch:risk-events-cache:v4";
 const AIRCRAFT_CACHE_PREFIX = "weather-watch:aircraft-cache:v2";
+const AIRCRAFT_CACHE_INDEX_KEY = "weather-watch:aircraft-cache-index:v1";
 const AIRCRAFT_TRACK_CACHE_PREFIX = "weather-watch:aircraft-track-cache:v1";
 const AVIATION_INCIDENTS_CACHE_KEY = "weather-watch:aviation-incidents-cache:v1";
 const EARTHQUAKE_EVENTS_CACHE_KEY = "weather-watch:earthquake-events-cache:v1";
@@ -82,6 +84,69 @@ const AIRCRAFT_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
 const ADSB_LOL_FALLBACK_RADIUS_KM = 350;
 const ADSB_LOL_MAX_FALLBACK_QUERIES = 12;
 const ADSB_LOL_QUERY_TIMEOUT_MS = 4_500;
+const WEATHER_VIEWPORT_CACHE_LIMIT = 24;
+const AIRCRAFT_VIEWPORT_CACHE_LIMIT = 18;
+
+interface PendingStorageWrite {
+  cancel: () => void;
+  flush: () => void;
+}
+
+const pendingStorageWrites = new Map<string, PendingStorageWrite>();
+
+function scheduleStorageWrite(cacheKey: string, value: unknown, afterWrite?: () => void) {
+  pendingStorageWrites.get(cacheKey)?.cancel();
+  let complete = false;
+  let cancelScheduled: () => void = () => undefined;
+  const flush = () => {
+    if (complete) return;
+    complete = true;
+    cancelScheduled();
+    pendingStorageWrites.delete(cacheKey);
+    try {
+      localStorage.setItem(cacheKey, JSON.stringify(value));
+      afterWrite?.();
+    } catch {
+      // Persistent caching is an optimization; live data must remain usable without it.
+    }
+  };
+
+  if (typeof window.requestIdleCallback === "function") {
+    const idleId = window.requestIdleCallback(flush, { timeout: 1_500 });
+    cancelScheduled = () => window.cancelIdleCallback(idleId);
+  } else {
+    const timerId = window.setTimeout(flush, 0);
+    cancelScheduled = () => window.clearTimeout(timerId);
+  }
+
+  pendingStorageWrites.set(cacheKey, {
+    cancel: () => {
+      if (complete) return;
+      complete = true;
+      cancelScheduled();
+      pendingStorageWrites.delete(cacheKey);
+    },
+    flush
+  });
+}
+
+function flushPendingStorageWrites() {
+  Array.from(pendingStorageWrites.values()).forEach((pending) => pending.flush());
+}
+
+function rememberBoundedCacheKey(indexKey: string, cacheKey: string, limit: number) {
+  try {
+    const raw = localStorage.getItem(indexKey);
+    const current = raw ? JSON.parse(raw) as string[] : [];
+    const next = [cacheKey, ...current.filter((key) => key !== cacheKey)];
+    next.slice(limit).forEach((key) => localStorage.removeItem(key));
+    localStorage.setItem(indexKey, JSON.stringify(next.slice(0, limit)));
+  } catch {
+    // Cache pruning is best-effort and must never interrupt live updates.
+  }
+}
+
+window.addEventListener("pagehide", flushPendingStorageWrites);
 
 class WeatherRequestError extends Error {
   constructor(
@@ -903,11 +968,10 @@ function weatherGridCacheLooksUsable(points: WeatherGridPoint[], options: { boun
 }
 
 function writeWeatherGridCache(points: WeatherGridPoint[], forecastHourOffset = 0, options: { bounds?: AviationBounds; step?: number; maxPoints?: number } = {}) {
-  try {
-    localStorage.setItem(weatherGridCacheKey(forecastHourOffset, options), JSON.stringify({ fetchedAt: Date.now(), points }));
-  } catch {
-    // Cache is only a resilience layer for provider rate limits.
-  }
+  const cacheKey = weatherGridCacheKey(forecastHourOffset, options);
+  scheduleStorageWrite(cacheKey, { fetchedAt: Date.now(), points }, options.bounds
+    ? () => rememberBoundedCacheKey(WEATHER_GRID_CACHE_INDEX_KEY, cacheKey, WEATHER_VIEWPORT_CACHE_LIMIT)
+    : undefined);
 }
 
 function readRetainedEvents<T>(cacheKey: string) {
@@ -923,11 +987,7 @@ function readRetainedEvents<T>(cacheKey: string) {
 }
 
 function writeRetainedEvents<T>(cacheKey: string, events: T[]) {
-  try {
-    localStorage.setItem(cacheKey, JSON.stringify({ fetchedAt: Date.now(), events }));
-  } catch {
-    // Retained event history is useful, but should never block live updates.
-  }
+  scheduleStorageWrite(cacheKey, { fetchedAt: Date.now(), events });
 }
 
 function retainRecentEvents<T>(
@@ -1041,11 +1101,9 @@ function readAircraftCache(cacheKey: string, maxAgeMs: number) {
 }
 
 function writeAircraftCache(cacheKey: string, aircraft: AircraftState[]) {
-  try {
-    localStorage.setItem(cacheKey, JSON.stringify({ fetchedAt: Date.now(), aircraft }));
-  } catch {
-    // Flight data updates frequently; cache is best-effort only.
-  }
+  scheduleStorageWrite(cacheKey, { fetchedAt: Date.now(), aircraft }, cacheKey.endsWith(":global")
+    ? undefined
+    : () => rememberBoundedCacheKey(AIRCRAFT_CACHE_INDEX_KEY, cacheKey, AIRCRAFT_VIEWPORT_CACHE_LIMIT));
 }
 
 function aircraftCacheKey(bounds?: AviationBounds) {
@@ -1858,14 +1916,10 @@ function readAviationIncidentsCache(maxAgeMs: number) {
 }
 
 function writeAviationIncidentsCache(incidents: AviationIncident[]) {
-  try {
-    localStorage.setItem(
-      AVIATION_INCIDENTS_CACHE_KEY,
-      JSON.stringify({ fetchedAt: Date.now(), incidents: retainRecentEvents(incidents, (incident) => incident.time) })
-    );
-  } catch {
-    // Incident reports are useful if cached, but never required.
-  }
+  scheduleStorageWrite(AVIATION_INCIDENTS_CACHE_KEY, {
+    fetchedAt: Date.now(),
+    incidents: retainRecentEvents(incidents, (incident) => incident.time)
+  });
 }
 
 function gdeltGkgUrl(manifest: string) {
@@ -2029,11 +2083,7 @@ function readRiskEventsCache(maxAgeMs: number) {
 }
 
 function writeRiskEventsCache(exportUrl: string, events: RiskSignalEvent[]) {
-  try {
-    localStorage.setItem(RISK_EVENTS_CACHE_KEY, JSON.stringify({ fetchedAt: Date.now(), exportUrl, events }));
-  } catch {
-    // Risk feeds are high-churn data; cache only improves resilience.
-  }
+  scheduleStorageWrite(RISK_EVENTS_CACHE_KEY, { fetchedAt: Date.now(), exportUrl, events });
 }
 
 function gdeltExportUrl(manifest: string) {

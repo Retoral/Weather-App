@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import {
   Activity,
@@ -181,7 +181,6 @@ const appLanguages = [
 ] as const;
 
 type AppLanguage = (typeof appLanguages)[number]["id"];
-type FeedKey = "weather" | "radar" | "earthquakes" | "warnings" | "risk" | "aircraft" | "aviation";
 type RefreshLockKey = "weatherGrid" | "earthquakes" | "radar" | "warnings" | "risk" | "aircraft" | "aviationIncidents";
 type UpdateCheckState =
   | { status: "idle" | "checking" | "current" | "error"; checkedAt?: number; error?: string }
@@ -1925,6 +1924,40 @@ function replaceWeatherGridPoints(current: WeatherGridPoint[], incoming: Weather
   return weatherGridPointsEqual(current, incoming) ? current : incoming;
 }
 
+function dataCollectionsEqual<T>(current: T[], incoming: T[]) {
+  if (current === incoming) return true;
+  if (current.length !== incoming.length) return false;
+  return current.every((item, index) => {
+    const nextItem = incoming[index];
+    return item === nextItem || JSON.stringify(item) === JSON.stringify(nextItem);
+  });
+}
+
+function replaceDataCollection<T>(current: T[], incoming: T[]) {
+  return dataCollectionsEqual(current, incoming) ? current : incoming;
+}
+
+function dataObjectsEqual<T>(current: T | undefined, incoming: T | undefined) {
+  return current === incoming || JSON.stringify(current) === JSON.stringify(incoming);
+}
+
+function aviationBoundsEqual(current: AviationBounds | undefined, incoming: AviationBounds) {
+  return Boolean(
+    current &&
+      current.south === incoming.south &&
+      current.west === incoming.west &&
+      current.north === incoming.north &&
+      current.east === incoming.east
+  );
+}
+
+function setVisibleInterval(callback: () => void, delay: number) {
+  return window.setInterval(() => {
+    if (document.visibilityState !== "visible" || navigator.onLine === false) return;
+    callback();
+  }, delay);
+}
+
 function plusRateLabel(amount: number, unit: RainUnit) {
   const [value, suffix] = formatRainRate(amount, unit).split(" ");
   return suffix ? `${value}+ ${suffix}` : `${value}+`;
@@ -2008,12 +2041,9 @@ export function App() {
   );
   const [loading, setLoading] = useState({ global: false, local: false, search: false, placeSearch: false, inspected: false });
   const [error, setError] = useState<string | undefined>();
-  const [weatherGridError, setWeatherGridError] = useState<string | undefined>();
   const [localError, setLocalError] = useState<string | undefined>();
   const [inspectedError, setInspectedError] = useState<string | undefined>();
   const [updateCheck, setUpdateCheck] = useState<UpdateCheckState>({ status: "idle" });
-  const [lastFeedCheck, setLastFeedCheck] = useState<Partial<Record<FeedKey, string>>>({});
-  const [lastFeedDataRefresh, setLastFeedDataRefresh] = useState<Partial<Record<FeedKey, string>>>({});
   const [solarTimestamp, setSolarTimestamp] = useState(Date.now());
   const mobileControlPanels = useMediaQuery("(max-width: 620px)");
   const notifiedSignals = useRef<Set<string>>(new Set());
@@ -2028,10 +2058,17 @@ export function App() {
   const lifecycleRefreshAt = useRef(0);
   const refreshStartedAt = useRef<Partial<Record<RefreshLockKey, number>>>({});
   const mapViewMenuRef = useRef<HTMLDivElement | null>(null);
+  const toggleTrackedAircraftRef = useRef<(id: string) => void>(() => undefined);
   const refreshInFlight = useRef({ weatherGrid: false, earthquakes: false, radar: false, warnings: false, risk: false, aircraft: false, aviationIncidents: false });
   const rainViewerRef = useRef<RainViewerState | undefined>();
   const taiwanRainfallRef = useRef<RainObservationPoint[]>([]);
   const cwaTokenRef = useRef(cwaToken);
+  const handleViewportChange = useCallback((bounds: AviationBounds) => {
+    setAviationBounds((current) => aviationBoundsEqual(current, bounds) ? current : bounds);
+  }, []);
+  const handleToggleAircraftTrack = useCallback((id: string) => {
+    toggleTrackedAircraftRef.current(id);
+  }, []);
   const copy = appCopy[appLanguage];
   const updateText = updateCopy[appLanguage];
   const cwaText = cwaTokenCopy[appLanguage];
@@ -2063,15 +2100,6 @@ export function App() {
     () => dedupeSignals([...inspectedWarningSignals, ...inspectedRiskSignals, ...inspectedWeatherSignals]),
     [inspectedWarningSignals, inspectedRiskSignals, inspectedWeatherSignals]
   );
-  const activeWarnings = warnings.filter((warning) => warning.geometry || typeof warning.lat === "number" && typeof warning.lon === "number");
-  const highRiskEvents = riskEvents.filter((event) => event.severity === "danger" || event.severity === "warning");
-  const criticalRiskEvents = riskEvents.filter((event) => event.severity === "danger");
-  const strongQuakes = earthquakes.filter((quake) => (quake.magnitude ?? 0) >= 4.5);
-  const strongestQuake = earthquakes.reduce<EarthquakeEvent | undefined>(
-    (strongest, quake) => (quake.magnitude ?? 0) > (strongest?.magnitude ?? 0) ? quake : strongest,
-    undefined
-  );
-  const strongestQuakeLabel = strongestQuake?.magnitude !== undefined ? `M${strongestQuake.magnitude.toFixed(1)}` : "--";
   const aircraftById = useMemo(() => new Map(aircraft.map((plane) => [plane.id, plane])), [aircraft]);
   const visibleAircraft = useMemo(() => {
     const tracked = new Set(trackedAircraftIds);
@@ -2138,7 +2166,36 @@ export function App() {
   const ActiveMapViewIcon = activeMapView.icon;
   const localWeatherStatus = localError ? copy.weatherUnavailable : loading.local ? copy.refreshingWeather : copy.refreshingWeather;
   const inspectedWeatherStatus = inspectedError ? copy.weatherUnavailable : loading.inspected ? copy.refreshingWeather : copy.refreshingWeather;
-  const homeUpdatedLabel = localWeather?.fetchedAt ? timeAgo(localWeather.fetchedAt, appLanguage) : localError ? copy.unavailable : loading.local ? copy.refreshingLower : "--";
+  const selectedMapLocation = useMemo(
+    () => homeLocation
+      ? {
+          ...homeLocation,
+          name: homeLocation.name,
+          label: locationLabel(homeLocation, unitText.noCitySet),
+          weather: localWeather?.current,
+          airQuality: localWeather?.airQuality,
+          fetchedAt: localWeather?.fetchedAt,
+          weatherStatus: localWeatherStatus,
+          popupLabel: copy.home
+        }
+      : undefined,
+    [homeLocation, localWeather?.current, localWeather?.airQuality, localWeather?.fetchedAt, localWeatherStatus, copy.home, unitText.noCitySet]
+  );
+  const inspectedMapLocation = useMemo(
+    () => inspectedLocation
+      ? {
+          ...inspectedLocation,
+          name: inspectedLocation.name,
+          label: locationLabel(inspectedLocation, unitText.noCitySet),
+          weather: inspectedWeather?.current,
+          airQuality: inspectedWeather?.airQuality,
+          fetchedAt: inspectedWeather?.fetchedAt,
+          weatherStatus: inspectedWeatherStatus,
+          popupLabel: copy.location
+        }
+      : undefined,
+    [inspectedLocation, inspectedWeather?.current, inspectedWeather?.airQuality, inspectedWeather?.fetchedAt, inspectedWeatherStatus, copy.location, unitText.noCitySet]
+  );
   const inspectedUpdatedLabel = inspectedWeather?.fetchedAt
     ? timeAgo(inspectedWeather.fetchedAt, appLanguage)
     : inspectedError
@@ -2146,34 +2203,6 @@ export function App() {
       : loading.inspected
         ? copy.refreshingLower
         : "--";
-  const activeFeedKey: FeedKey =
-    activeLayer === "radar"
-      ? "radar"
-      : activeLayer === "temperature" || activeLayer === "wind"
-        ? "weather"
-        : activeLayer === "seismic"
-          ? "earthquakes"
-          : activeLayer === "risk"
-            ? "risk"
-            : "warnings";
-  const activeDataRefresh = lastFeedDataRefresh[activeFeedKey];
-  const activeFeedChecked = lastFeedCheck[activeFeedKey];
-  const activeUpdateLabel = activeDataRefresh
-    ? `${copy.updated} ${timeAgo(activeDataRefresh, appLanguage)}${
-        activeFeedChecked && activeFeedChecked !== activeDataRefresh ? ` · ${unitText.checked} ${timeAgo(activeFeedChecked, appLanguage)}` : ""
-      }`
-    : activeFeedChecked
-      ? `${unitText.checked} ${timeAgo(activeFeedChecked, appLanguage)}`
-      : `${copy.updated} --`;
-
-  function markLiveRefresh(feed: FeedKey, dataChanged = true) {
-    const timestamp = new Date().toISOString();
-    setLastFeedCheck((state) => ({ ...state, [feed]: timestamp }));
-    if (dataChanged) {
-      setLastFeedDataRefresh((state) => ({ ...state, [feed]: timestamp }));
-    }
-  }
-
   function beginRefreshLock(key: RefreshLockKey) {
     const now = Date.now();
     if (refreshInFlight.current[key]) {
@@ -2252,29 +2281,21 @@ export function App() {
       ]);
 
       let checkedWeather = false;
-      let fetchedFreshWeather = false;
-
       if (globalResult.status === "fulfilled" && globalResult.value.points.length) {
         setWeatherGrid((current) => replaceWeatherGridPoints(current, globalResult.value.points));
         checkedWeather = true;
-        fetchedFreshWeather ||= !globalResult.value.fromCache;
       }
 
       const viewportValue = viewportResult.status === "fulfilled" ? viewportResult.value : undefined;
       if (viewportValue?.points.length && requestBoundsKey === viewportWeatherBoundsKey(aviationBoundsRef.current)) {
         setViewportWeatherGrid((current) => mergeWeatherGridPoints(current, viewportValue.points));
         checkedWeather = true;
-        fetchedFreshWeather ||= !viewportValue.fromCache;
       }
 
-      if (checkedWeather) {
-        setWeatherGridError(undefined);
-        markLiveRefresh("weather", fetchedFreshWeather);
-      } else if (globalResult.status === "rejected") {
+      if (!checkedWeather && globalResult.status === "rejected") {
         throw globalResult.reason;
       }
-    } catch (err) {
-      setWeatherGridError(err instanceof Error ? err.message : "Unable to refresh weather forecast");
+    } catch {
       // Keep the last successful global weather layer visible.
     } finally {
       endRefreshLock("weatherGrid");
@@ -2288,8 +2309,8 @@ export function App() {
   async function refreshEarthquakeFeed() {
     if (!beginRefreshLock("earthquakes")) return;
     try {
-      setEarthquakes(await fetchEarthquakes());
-      markLiveRefresh("earthquakes");
+      const nextEarthquakes = await fetchEarthquakes();
+      setEarthquakes((current) => replaceDataCollection(current, nextEarthquakes));
     } catch {
       // Keep the last successful earthquake layer visible.
     } finally {
@@ -2321,22 +2342,22 @@ export function App() {
         loadTaiwanCwaRainfall()
       ]);
       let checked = false;
-      let changed = false;
 
       if (rainResult.status === "fulfilled") {
         checked = true;
-        changed = rainViewerChanged(rainViewerRef.current, rainResult.value);
-        rainViewerRef.current = rainResult.value;
-        setRainViewer(rainResult.value);
+        const changed = rainViewerChanged(rainViewerRef.current, rainResult.value);
+        if (changed) {
+          rainViewerRef.current = rainResult.value;
+          setRainViewer(rainResult.value);
+        }
       }
 
       if (cwaResult.status === "fulfilled" && cwaResult.value !== undefined) {
         checked = true;
-        changed = applyTaiwanCwaRainfall(cwaResult.value) || changed;
+        applyTaiwanCwaRainfall(cwaResult.value);
       }
 
       if (!checked) throw rainResult.status === "rejected" ? rainResult.reason : new Error("Unable to refresh radar");
-      markLiveRefresh("radar", changed);
     } catch {
       // Keep the last successful radar frame visible.
     } finally {
@@ -2347,8 +2368,8 @@ export function App() {
   async function refreshWarningFeed() {
     if (!beginRefreshLock("warnings")) return;
     try {
-      setWarnings(await fetchGdacsAlerts());
-      markLiveRefresh("warnings");
+      const nextWarnings = await fetchGdacsAlerts();
+      setWarnings((current) => replaceDataCollection(current, nextWarnings));
     } catch {
       // Keep the last successful warning layer visible.
     } finally {
@@ -2359,8 +2380,8 @@ export function App() {
   async function refreshRiskFeed(force = false) {
     if (!beginRefreshLock("risk")) return;
     try {
-      setRiskEvents(await fetchRiskEvents(undefined, { freshMs: force ? 0 : LIVE_REFRESH_MS.risk }));
-      markLiveRefresh("risk");
+      const nextRiskEvents = await fetchRiskEvents(undefined, { freshMs: force ? 0 : LIVE_REFRESH_MS.risk });
+      setRiskEvents((current) => replaceDataCollection(current, nextRiskEvents));
     } catch {
       // Keep the last successful risk layer visible.
     } finally {
@@ -2373,9 +2394,12 @@ export function App() {
     const trackedPlanes = planes.filter((plane) => tracked.has(plane.id));
     if (trackedPlanes.length === 0) return;
     setTrackedAircraftSnapshots((snapshots) => {
-      const next = { ...snapshots };
+      let next = snapshots;
       trackedPlanes.forEach((plane) => {
-        next[plane.id] = { ...next[plane.id], ...plane };
+        const merged = { ...snapshots[plane.id], ...plane };
+        if (dataObjectsEqual(snapshots[plane.id], merged)) return;
+        if (next === snapshots) next = { ...snapshots };
+        next[plane.id] = merged;
       });
       return next;
     });
@@ -2397,7 +2421,7 @@ export function App() {
 
     const track = await fetchAircraftTrack(id, undefined, { freshMs: force ? 0 : TRACKED_AIRCRAFT_TRACK_RETRY_MS }).catch(() => undefined);
     if (!track) return;
-    setAircraftTracks((tracks) => ({ ...tracks, [id]: track }));
+    setAircraftTracks((tracks) => dataObjectsEqual(tracks[id], track) ? tracks : { ...tracks, [id]: track });
   }
 
   async function refreshAircraftFeed(force = false) {
@@ -2409,16 +2433,15 @@ export function App() {
     if (!force) {
       const cachedAircraft = getCachedAircraftStates(bounds);
       if (cachedAircraft.length) {
-        setAircraft(cachedAircraft);
+        setAircraft((current) => replaceDataCollection(current, cachedAircraft));
         rememberTrackedAircraft(cachedAircraft);
       }
     }
     try {
       const aircraft = await fetchAircraftStates(bounds, undefined, { freshMs: force ? 0 : LIVE_REFRESH_MS.aircraft });
-      setAircraft(aircraft);
+      setAircraft((current) => replaceDataCollection(current, aircraft));
       rememberTrackedAircraft(aircraft);
       void refreshTrackedAircraftFeed(force);
-      markLiveRefresh("aircraft");
     } catch {
       // Keep the last successful aircraft layer visible.
     } finally {
@@ -2433,8 +2456,8 @@ export function App() {
   async function refreshAviationIncidentFeed(force = false) {
     if (!beginRefreshLock("aviationIncidents")) return;
     try {
-      setAviationIncidents(await fetchAviationIncidents(undefined, { freshMs: force ? 0 : LIVE_REFRESH_MS.aviationIncidents }));
-      markLiveRefresh("aviation");
+      const nextIncidents = await fetchAviationIncidents(undefined, { freshMs: force ? 0 : LIVE_REFRESH_MS.aviationIncidents });
+      setAviationIncidents((current) => replaceDataCollection(current, nextIncidents));
     } catch {
       // Keep the last successful aviation incident layer visible.
     } finally {
@@ -2458,26 +2481,23 @@ export function App() {
       ]);
 
       if (quakeResult.status === "fulfilled") {
-        setEarthquakes(quakeResult.value);
-        markLiveRefresh("earthquakes");
+        setEarthquakes((current) => replaceDataCollection(current, quakeResult.value));
       }
       if (rainResult.status === "fulfilled") {
         const changed = rainViewerChanged(rainViewerRef.current, rainResult.value);
-        rainViewerRef.current = rainResult.value;
-        setRainViewer(rainResult.value);
-        markLiveRefresh("radar", changed);
+        if (changed) {
+          rainViewerRef.current = rainResult.value;
+          setRainViewer(rainResult.value);
+        }
       }
       if (gdacsResult.status === "fulfilled") {
-        setWarnings(gdacsResult.value);
-        markLiveRefresh("warnings");
+        setWarnings((current) => replaceDataCollection(current, gdacsResult.value));
       }
       if (riskResult.status === "fulfilled") {
-        setRiskEvents(riskResult.value);
-        markLiveRefresh("risk");
+        setRiskEvents((current) => replaceDataCollection(current, riskResult.value));
       }
       if (cwaRainResult.status === "fulfilled" && cwaRainResult.value !== undefined) {
-        const changed = applyTaiwanCwaRainfall(cwaRainResult.value);
-        if (rainResult.status !== "fulfilled") markLiveRefresh("radar", changed);
+        applyTaiwanCwaRainfall(cwaRainResult.value);
       }
 
       const failedFeeds = [quakeResult, rainResult, gdacsResult, riskResult].filter((result) => result.status === "rejected").length;
@@ -2559,10 +2579,10 @@ export function App() {
 
   useEffect(() => {
     refreshLatestDataNow();
-    const quakeInterval = window.setInterval(() => void refreshEarthquakeFeed(), LIVE_REFRESH_MS.earthquakes);
-    const radarInterval = window.setInterval(() => void refreshRadarFeed(), LIVE_REFRESH_MS.radar);
-    const warningInterval = window.setInterval(() => void refreshWarningFeed(), LIVE_REFRESH_MS.warnings);
-    const riskInterval = window.setInterval(() => void refreshRiskFeed(), LIVE_REFRESH_MS.risk);
+    const quakeInterval = setVisibleInterval(() => void refreshEarthquakeFeed(), LIVE_REFRESH_MS.earthquakes);
+    const radarInterval = setVisibleInterval(() => void refreshRadarFeed(), LIVE_REFRESH_MS.radar);
+    const warningInterval = setVisibleInterval(() => void refreshWarningFeed(), LIVE_REFRESH_MS.warnings);
+    const riskInterval = setVisibleInterval(() => void refreshRiskFeed(), LIVE_REFRESH_MS.risk);
 
     return () => {
       window.clearInterval(quakeInterval);
@@ -2649,39 +2669,47 @@ export function App() {
 
     if (needsWeatherGrid) {
       void refreshWeatherGrid(true);
-      timers.push(window.setInterval(() => void refreshWeatherGrid(true), LIVE_REFRESH_MS.focusedWeatherGrid));
+      timers.push(setVisibleInterval(() => void refreshWeatherGrid(true), LIVE_REFRESH_MS.focusedWeatherGrid));
     }
 
     if (needsRadar) {
       void refreshRadarFeed();
-      timers.push(window.setInterval(() => void refreshRadarFeed(), LIVE_REFRESH_MS.focusedRadar));
+      if (LIVE_REFRESH_MS.focusedRadar < LIVE_REFRESH_MS.radar) {
+        timers.push(setVisibleInterval(() => void refreshRadarFeed(), LIVE_REFRESH_MS.focusedRadar));
+      }
     }
 
     if (needsEarthquakes) {
       void refreshEarthquakeFeed();
-      timers.push(window.setInterval(() => void refreshEarthquakeFeed(), LIVE_REFRESH_MS.focusedEarthquakes));
+      if (LIVE_REFRESH_MS.focusedEarthquakes < LIVE_REFRESH_MS.earthquakes) {
+        timers.push(setVisibleInterval(() => void refreshEarthquakeFeed(), LIVE_REFRESH_MS.focusedEarthquakes));
+      }
     }
 
     if (needsWarnings) {
       void refreshWarningFeed();
-      timers.push(window.setInterval(() => void refreshWarningFeed(), LIVE_REFRESH_MS.focusedWarnings));
+      if (LIVE_REFRESH_MS.focusedWarnings < LIVE_REFRESH_MS.warnings) {
+        timers.push(setVisibleInterval(() => void refreshWarningFeed(), LIVE_REFRESH_MS.focusedWarnings));
+      }
     }
 
     if (needsRisk) {
       void refreshRiskFeed();
-      timers.push(window.setInterval(() => void refreshRiskFeed(), LIVE_REFRESH_MS.focusedRisk));
+      if (LIVE_REFRESH_MS.focusedRisk < LIVE_REFRESH_MS.risk) {
+        timers.push(setVisibleInterval(() => void refreshRiskFeed(), LIVE_REFRESH_MS.focusedRisk));
+      }
     }
 
     if (needsAircraft) {
       void refreshAircraftFeed();
       void refreshTrackedAircraftFeed();
-      timers.push(window.setInterval(() => void refreshAircraftFeed(), LIVE_REFRESH_MS.focusedAircraft));
-      timers.push(window.setInterval(() => void refreshTrackedAircraftFeed(), LIVE_REFRESH_MS.focusedAircraft));
+      timers.push(setVisibleInterval(() => void refreshAircraftFeed(), LIVE_REFRESH_MS.focusedAircraft));
+      timers.push(setVisibleInterval(() => void refreshTrackedAircraftFeed(), LIVE_REFRESH_MS.focusedAircraft));
     }
 
     if (needsAviationIncidents) {
       void refreshAviationIncidentFeed();
-      timers.push(window.setInterval(() => void refreshAviationIncidentFeed(), LIVE_REFRESH_MS.focusedAviationIncidents));
+      timers.push(setVisibleInterval(() => void refreshAviationIncidentFeed(), LIVE_REFRESH_MS.focusedAviationIncidents));
     }
 
     return () => {
@@ -2699,7 +2727,7 @@ export function App() {
     if (!showAircraftLocations && !showAircraftTrails) return;
     const cachedAircraft = getCachedAircraftStates(aviationBounds);
     if (cachedAircraft.length) {
-      setAircraft(cachedAircraft);
+      setAircraft((current) => replaceDataCollection(current, cachedAircraft));
       rememberTrackedAircraft(cachedAircraft);
     }
     const timer = window.setTimeout(() => void refreshAircraftFeed(false), 500);
@@ -2707,9 +2735,11 @@ export function App() {
   }, [aviationBounds, showAircraftLocations, showAircraftTrails]);
 
   useEffect(() => {
-    const timer = window.setInterval(() => setSolarTimestamp(Date.now()), LIVE_REFRESH_MS.dayNight);
+    if (!showDayNight) return;
+    setSolarTimestamp(Date.now());
+    const timer = setVisibleInterval(() => setSolarTimestamp(Date.now()), LIVE_REFRESH_MS.dayNight);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [showDayNight]);
 
   useEffect(() => {
     document.documentElement.lang = appLanguage;
@@ -2789,14 +2819,16 @@ export function App() {
   }, [trackedAircraftIds, trackedAircraftSnapshots, aircraftTracks, trackedDockOpen]);
 
   useEffect(() => {
+    if (!homeLocation) return;
     void refreshLocal(homeLocation, true);
-    const localInterval = window.setInterval(() => void refreshLocal(homeLocation), LIVE_REFRESH_MS.localWeather);
+    const localInterval = setVisibleInterval(() => void refreshLocal(homeLocation), LIVE_REFRESH_MS.localWeather);
     return () => window.clearInterval(localInterval);
   }, [homeLocation?.id, homeLocation?.latitude, homeLocation?.longitude]);
 
   useEffect(() => {
+    if (!inspectedLocation) return;
     void refreshInspected(inspectedLocation, true);
-    const inspectedInterval = window.setInterval(() => void refreshInspected(inspectedLocation), LIVE_REFRESH_MS.localWeather);
+    const inspectedInterval = setVisibleInterval(() => void refreshInspected(inspectedLocation), LIVE_REFRESH_MS.localWeather);
     return () => window.clearInterval(inspectedInterval);
   }, [inspectedLocation?.id, inspectedLocation?.latitude, inspectedLocation?.longitude]);
 
@@ -2972,6 +3004,7 @@ export function App() {
       void refreshTrackedAircraftFeed(true);
     }
   }
+  toggleTrackedAircraftRef.current = toggleTrackedAircraft;
 
   function removeTrackedAircraft(id: string) {
     setTrackedAircraftIds((ids) => ids.filter((trackedId) => trackedId !== id));
@@ -3200,36 +3233,10 @@ export function App() {
           homeFocusRequest={homeFocusRequest}
           inspectedFocusRequest={inspectedFocusRequest}
           aircraftFocusRequest={aircraftFocusRequest}
-          onViewportChange={setAviationBounds}
-          onToggleAircraftTrack={toggleTrackedAircraft}
-          selectedLocation={
-            homeLocation
-              ? {
-                  ...homeLocation,
-                  name: homeLocation.name,
-                  label: locationLabel(homeLocation, unitText.noCitySet),
-                  weather: localWeather?.current,
-                  airQuality: localWeather?.airQuality,
-                  fetchedAt: localWeather?.fetchedAt,
-                  weatherStatus: localWeatherStatus,
-                  popupLabel: copy.home
-                }
-              : undefined
-          }
-          inspectedLocation={
-            inspectedLocation
-              ? {
-                  ...inspectedLocation,
-                  name: inspectedLocation.name,
-                  label: locationLabel(inspectedLocation, unitText.noCitySet),
-                  weather: inspectedWeather?.current,
-                  airQuality: inspectedWeather?.airQuality,
-                  fetchedAt: inspectedWeather?.fetchedAt,
-                  weatherStatus: inspectedWeatherStatus,
-                  popupLabel: copy.location
-                }
-              : undefined
-          }
+          onViewportChange={handleViewportChange}
+          onToggleAircraftTrack={handleToggleAircraftTrack}
+          selectedLocation={selectedMapLocation}
+          inspectedLocation={inspectedMapLocation}
         />
 
         <div className={`update-checker ${updateCheck.status}`}>
